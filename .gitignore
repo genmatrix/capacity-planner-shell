@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+scenarios/
+holidays.json
+data_paths.json
+acd_maps.json
+field_maps.json
+Skill_Mapping.csv
