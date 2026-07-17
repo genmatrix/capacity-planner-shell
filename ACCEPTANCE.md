@@ -35,7 +35,8 @@ per member — a multiplier, never a divisor; 52 is fixed, never the horizon).
 ## 3. Supply walk
 
 - **S1.** A class of 10 with 10% training and 5% coaching attrition lands
-  **8.55** graduates in production on its graduation week.
+  **8.55** graduates in production on its graduation week (a one-decimal
+  display may show 8.5 or 8.6 — judge the engine value or headcount effect).
 - **S2.** 28%/yr attrition on 100 heads drips ~**0.538**/week; an entered
   actual REPLACES that week's drip; an entered **0 means nobody left**; a
   BLANK fully-elapsed week also means 0 (past weeks are facts, not model);
