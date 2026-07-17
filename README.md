@@ -33,6 +33,12 @@ edit lock, drafts) is created in a `scenarios/` folder on first use — put the
 app folder on a network share and the whole team plans against one version
 history.
 
+## Is an implementation faithful?
+
+`ACCEPTANCE.md` defines this app's behavior as 15 objective checks — every
+number hand-computable, every behavior demonstrable in a few clicks. Any
+rebuild or port can be scored against it.
+
 ## Docs
 
 `TEAM_SETUP.md` covers per-PC setup, offline installs, and troubleshooting.
