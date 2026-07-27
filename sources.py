@@ -84,7 +84,7 @@ def load_mapping(file, field_map: dict | None = None
         rep.errors.append(
             "Mapping file missing required field(s): "
             + ", ".join(f"{field_label(m)} ({m})" for m in missing)
-            + ". Map them to this file's columns in 🧩 Column mapping (🔌 Real Data).")
+            + ". Map them to this file's columns in Column mapping (Real Data).")
         return None, rep
     if auto:
         rep.notes.append("Auto-matched by alias: "
@@ -203,7 +203,7 @@ FIELDS = {
 }
 
 
-# Human labels for the canonical fields — what planners see in the 🧩 column
+# Human labels for the canonical fields — what planners see in the column
 # mapper and in import warnings (the canonical name rides along in parentheses
 # so warnings stay greppable). One home: UI and reports both read from here.
 FIELD_LABELS = {
@@ -302,8 +302,8 @@ def load_wfm(files, mapping: Mapping, field_map: dict | None = None
         rep.errors.append(
             "WFM export missing required field(s): "
             + ", ".join(f"{field_label(m)} ({m})" for m in missing)
-            + ". Map them to this file's columns in 🧩 Column mapping "
-              "(🔌 Real Data page) — any vendor's export works once mapped.")
+            + ". Map them to this file's columns in Column mapping "
+              "(Real Data page) — any vendor's export works once mapped.")
         return pd.DataFrame(), rep
     if auto:
         rep.notes.append("Auto-matched by alias: "
@@ -341,7 +341,7 @@ def load_wfm(files, mapping: Mapping, field_map: dict | None = None
         rep.warnings.append(
             f"{bad_dates:,} WFM row(s) have unreadable dates — EXCLUDED from "
             "weekly rollups (a date-format change in the export is the usual "
-            "cause; fix the export or the 🧩 column mapping).")
+            "cause; fix the export or the column mapping).")
         df = df[df["_date"].notna()].copy()
         if df.empty:
             rep.errors.append("Every WFM row had an unreadable date — import "
@@ -467,8 +467,8 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
         rep.errors.append(
             "ACD export missing required field(s): "
             + ", ".join(f"{field_label(m)} ({m})" for m in missing)
-            + ". Map them to this file's columns in 🧩 Column mapping "
-              "(🔌 Real Data page).")
+            + ". Map them to this file's columns in Column mapping "
+              "(Real Data page).")
         return pd.DataFrame(), rep
     if auto:
         rep.notes.append("Auto-matched by alias: "

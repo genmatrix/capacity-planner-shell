@@ -12,29 +12,80 @@ import altair as alt
 import streamlit as st
 
 # ---------------------------------------------------------------- palette
-BG = "#050814"
-SURFACE = "rgba(15, 23, 42, 0.72)"
-BORDER = "rgba(51, 65, 85, 0.75)"
-TEXT = "#f8fafc"
-BODY = "#cbd5e1"
-MUTED = "#94a3b8"
-CYAN = "#06b6d4"
-CYAN_LT = "#67e8f9"
-BLUE = "#3b82f6"
-VIOLET = "#8b5cf6"
-MAGENTA = "#d946ef"
-GREEN = "#10b981"
-TEAL = "#14b8a6"
-AMBER = "#f59e0b"
-AMBER_LT = "#fcd34d"
-PINK = "#ec4899"
+# "Member Hall" — the light palette, taken from the org's live public-site
+# stylesheet rather than from a screenshot, so each value keeps the job it does
+# there: RED is the masthead and nothing else, TEAL is every link and action,
+# deep navy is body copy, warm grays are the ground.
+#
+# (Deliberately no vendor/company name in this file — it ships to the PUBLIC
+# shell repo, whose publish gate rejects identifying terms. See the note in
+# scripts/publish_github.py.)
+#
+# Two values look like typos and are not:
+#   * SUPPLY is #0089a0, not the site's own #007c89. The site value sits just
+#     under the chroma floor and reads gray as a chart fill; TEAL keeps the true
+#     site value for UI chrome, where it is text and borders, not a data mark.
+#   * COVERED/TIGHT/SHORT are RESERVED status colors. Never reuse one as a
+#     series color — CATEGORICAL below deliberately avoids their hues.
+BG = "#f4f5f5"            # page ground
+SURFACE = "#ffffff"       # cards — solid; glass belongs to a dark ground
+BORDER = "#d5d7d9"
+BORDER_SOFT = "#e6e8e9"
+TEXT = "#192838"          # headings / primary ink
+BODY = "#4d5f69"          # secondary ink
+MUTED = "#5f6d76"         # captions, axis labels. Darker than the source
+                          # site's caption gray, which lands at 3.4:1 on this
+                          # ground — too low for 11px labels. This clears 4.5:1
+                          # on both the white card and the page gray.
 
-# Per-item accent gradients — assigned to LOBs cyclically (hue → adjacent hue).
+RED = "#d12a2e"           # masthead ONLY — never a data color
+TEAL = "#007c89"          # links, actions, the through-line
+TEAL_DK = "#00636e"
+
+# data marks
+DEMAND = "#3b4fc8"        # Required FTE
+SUPPLY = "#0089a0"        # Staffed FTE
+
+# reserved status colors
+COVERED = "#0f7f55"
+TIGHT = "#b5730f"
+SHORT = "#ab111a"
+NEUTRAL = "#e9ebec"       # diverging-scale midpoint
+
+# tints — pill and chip backgrounds on white
+COVERED_BG = "#e8f1ed"
+TIGHT_BG = "#f8f1e2"
+SHORT_BG = "#f9e9ea"
+TEAL_BG = "#e4f0f2"
+
+# Series hues that are NOT status colors — named so the categorical range and
+# the LOB accents share one definition instead of repeating hex literals.
+RUST = "#b44f00"
+INDIGO = "#4158bd"
+PLUM = "#a72e5a"
+
+# Scenario compare shows at most 4 series. Validated against the white card
+# surface: worst adjacent CVD ΔE 16.6, normal-vision ΔE 23.2, all ≥ 3:1.
+# Six well-separated hues are not achievable while also reserving red, amber
+# and green — which is why this is four, not six.
+CATEGORICAL = [SUPPLY, RUST, INDIGO, PLUM]
+
+# Legacy names, kept as aliases so the existing call sites in
+# capacity_planner.py keep working unchanged. Prefer the semantic names above
+# in new code; these can be retired in a follow-up pass.
+CYAN = SUPPLY
+VIOLET = DEMAND
+GREEN = COVERED
+AMBER = TIGHT
+AMBER_LT = "#8f5a0c"      # darker than AMBER: this one lands on white as text
+PINK = SHORT
+
+# Per-item accent gradients — assigned to LOBs cyclically.
 ACCENTS = [
-    (CYAN, BLUE),
-    (VIOLET, MAGENTA),
-    (GREEN, TEAL),
-    (AMBER, PINK),
+    (TEAL, DEMAND),
+    (DEMAND, INDIGO),
+    (COVERED, SUPPLY),
+    (TIGHT, RUST),
 ]
 
 
@@ -45,34 +96,26 @@ def accent_for(i: int) -> tuple[str, str]:
 # ---------------------------------------------------------------- CSS
 _CSS = f"""
 <style>
-/* ------- atmosphere: two fixed blurred glows behind everything ------- */
-.stApp::before, .stApp::after {{
-  content: ""; position: fixed; border-radius: 50%;
-  filter: blur(70px); pointer-events: none; z-index: 0;
-}}
+/* ------- the masthead rule: the one place brand red appears ------- */
 .stApp::before {{
-  width: 620px; height: 620px; top: -180px; left: 34%;
-  background: {CYAN}; opacity: .14;
-}}
-.stApp::after {{
-  width: 560px; height: 560px; bottom: -160px; right: -120px;
-  background: {VIOLET}; opacity: .16;
+  content: ""; position: fixed; top: 0; left: 0; right: 0; height: 4px;
+  background: {RED}; pointer-events: none; z-index: 999;
 }}
 
 /* ------- typography ------- */
 html, body, .stApp, [class*="css"] {{
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system,
-               BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Avenir Next", Avenir, Inter, ui-sans-serif, system-ui,
+               -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
-h1 {{ letter-spacing: -0.045em; }}
-h2, h3 {{ letter-spacing: -0.03em; }}
+h1 {{ letter-spacing: -0.035em; color: {TEXT}; }}
+h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
+.stApp {{ background: {BG}; }}
 
-/* ------- glassy metric cards (native st.metric, app-wide) ------- */
+/* ------- metric cards (native st.metric, app-wide) ------- */
 [data-testid="stMetric"] {{
   background: {SURFACE}; border: 1px solid {BORDER};
-  border-radius: 22px; padding: 14px 18px;
-  backdrop-filter: blur(14px);
-  box-shadow: 0 24px 80px rgba(0,0,0,0.28);
+  border-radius: 10px; padding: 14px 18px;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05);
 }}
 [data-testid="stMetricLabel"] {{
   text-transform: uppercase; letter-spacing: .08em;
@@ -80,34 +123,71 @@ h2, h3 {{ letter-spacing: -0.03em; }}
 }}
 [data-testid="stMetricLabel"] p {{ white-space: normal; overflow: visible; }}
 [data-testid="stMetricValue"] {{
-  font-weight: 800; letter-spacing: -0.02em; color: {TEXT};
+  font-weight: 700; letter-spacing: -0.02em; color: {TEXT};
   font-size: clamp(20px, 2.4vw, 34px) !important;
+  font-variant-numeric: tabular-nums;
 }}
 
-/* ------- sidebar: darker glass ------- */
+/* ------- sidebar: white, separated by a rule not a shadow ------- */
 [data-testid="stSidebar"] {{
-  background: rgba(8, 12, 26, 0.92);
+  background: {SURFACE};
   border-right: 1px solid {BORDER};
 }}
 
 /* ------- expanders / editors pick up the surface ------- */
 [data-testid="stExpander"] details {{
-  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 16px;
+  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 8px;
+}}
+
+/* ------- tabular figures wherever numbers line up ------- */
+[data-testid="stDataFrame"], [data-testid="stTable"] {{
+  font-variant-numeric: tabular-nums;
+}}
+
+/* ------- top navigation bar -------
+   Styles the horizontal nav radio (st.container(key="ccnav")) to read as site
+   nav. Degrades gracefully: if a selector stops matching after a Streamlit
+   upgrade you get a plain horizontal radio in a white bar, never a broken
+   layout. The widget stays a radio on purpose — see the note in
+   capacity_planner.py where it is built. */
+.st-key-ccnav {{
+  background: {SURFACE}; border: 1px solid {BORDER};
+  border-radius: 10px; padding: 4px 8px; margin-bottom: 18px;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05);
+}}
+.st-key-ccnav [role="radiogroup"] {{ gap: 2px; flex-wrap: wrap; }}
+.st-key-ccnav [role="radiogroup"] label > div:first-child {{ display: none; }}
+.st-key-ccnav [role="radiogroup"] label {{
+  padding: 7px 14px; margin: 0; border-radius: 7px 7px 0 0;
+  border-bottom: 2px solid transparent; transition: background .12s ease;
+}}
+.st-key-ccnav [role="radiogroup"] label p {{
+  font-size: 13.5px; font-weight: 600; color: {BODY}; margin: 0;
+}}
+.st-key-ccnav [role="radiogroup"] label:hover {{ background: {BG}; }}
+.st-key-ccnav [role="radiogroup"] label:has(input:checked) {{
+  background: {TEAL_BG}; border-bottom-color: {TEAL};
+}}
+.st-key-ccnav [role="radiogroup"] label:has(input:checked) p {{
+  color: {TEAL_DK};
+}}
+.st-key-ccnav [role="radiogroup"] label:focus-within {{
+  outline: 2px solid {TEAL}; outline-offset: -2px;
 }}
 
 /* ------- WFM components (emitted by brand.py helpers) ------- */
 .cc-header {{
   display: flex; align-items: center; justify-content: space-between;
-  margin: 0 0 18px 0; position: relative; z-index: 1;
+  margin: 0 0 10px 0; position: relative; z-index: 1;
 }}
 .cc-brand {{ display: flex; align-items: center; gap: 12px; }}
 .cc-tile {{
-  width: 42px; height: 42px; border-radius: 14px;
-  background: linear-gradient(135deg, {CYAN}, {BLUE});
+  width: 42px; height: 42px; border-radius: 8px;
+  background: {RED};
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-weight: 800; font-size: 16px; letter-spacing: -0.02em;
 }}
-.cc-word {{ color: {TEXT}; font-weight: 800; font-size: 19px; line-height: 1.05; }}
+.cc-word {{ color: {TEXT}; font-weight: 700; font-size: 19px; line-height: 1.05; }}
 .cc-sub {{
   color: {MUTED}; font-size: 10.5px; text-transform: uppercase;
   letter-spacing: .1em; margin-top: 2px;
@@ -116,83 +196,89 @@ h2, h3 {{ letter-spacing: -0.03em; }}
 .cc-meta b {{ color: {BODY}; display: block; font-size: 12.5px; }}
 
 .cc-hero {{
-  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 28px;
-  padding: 26px 30px; backdrop-filter: blur(14px);
-  box-shadow: 0 24px 80px rgba(0,0,0,0.28);
+  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px;
+  padding: 26px 30px;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05), 0 6px 20px rgba(25,40,56,.05);
   display: flex; justify-content: space-between; gap: 26px; align-items: center;
   position: relative; z-index: 1; margin-bottom: 16px;
 }}
 .cc-hero h1 {{
-  font-size: clamp(26px, 3.6vw, 40px); line-height: .98;
-  letter-spacing: -0.055em; color: {TEXT}; margin: 10px 0 10px 0;
+  font-size: clamp(26px, 3.6vw, 40px); line-height: 1.0;
+  letter-spacing: -0.04em; color: {TEXT}; margin: 10px 0 10px 0;
 }}
 .cc-hero p {{ color: {BODY}; font-size: 14.5px; line-height: 1.6; margin: 0; max-width: 62ch; }}
 .cc-box {{
-  border: 1px solid rgba(6,182,212,.45); background: rgba(6,182,212,.08);
-  border-radius: 22px; padding: 16px 26px; text-align: center; min-width: 170px;
+  border: 1px solid {TEAL}; background: {TEAL_BG};
+  border-radius: 10px; padding: 16px 26px; text-align: center; min-width: 170px;
 }}
 .cc-box .lbl {{
-  color: {CYAN_LT}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+  color: {TEAL_DK}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+  font-weight: 700;
 }}
-.cc-box .val {{ color: {TEXT}; font-size: 40px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.1; }}
+.cc-box .val {{
+  color: {TEXT}; font-size: 40px; font-weight: 700; letter-spacing: -0.03em;
+  line-height: 1.1; font-variant-numeric: tabular-nums;
+}}
 .cc-box .unit {{ color: {MUTED}; font-size: 12px; }}
-.cc-box.bad {{ border-color: rgba(236,72,153,.5); background: rgba(236,72,153,.08); }}
-.cc-box.bad .lbl {{ color: #f9a8d4; }}
-.cc-box.good {{ border-color: rgba(16,185,129,.5); background: rgba(16,185,129,.08); }}
-.cc-box.good .lbl {{ color: #6ee7b7; }}
+.cc-box.bad  {{ border-color: {SHORT};   background: {SHORT_BG}; }}
+.cc-box.bad .lbl  {{ color: {SHORT}; }}
+.cc-box.bad .val  {{ color: {SHORT}; }}
+.cc-box.good {{ border-color: {COVERED}; background: {COVERED_BG}; }}
+.cc-box.good .lbl {{ color: {COVERED}; }}
 
 .cc-pill {{
   display: inline-block; border-radius: 999px; padding: 3px 12px;
   font-size: 11.5px; font-weight: 600; letter-spacing: .02em;
-  border: 1px solid {BORDER}; color: {BODY}; background: rgba(51,65,85,.3);
+  border: 1px solid {BORDER}; color: {BODY}; background: {BG};
   margin-right: 6px;
 }}
-.cc-pill.blue  {{ color: {CYAN_LT};  border-color: rgba(6,182,212,.4);  background: rgba(6,182,212,.1); }}
-.cc-pill.green {{ color: #6ee7b7; border-color: rgba(16,185,129,.4); background: rgba(16,185,129,.1); }}
-.cc-pill.amber {{ color: {AMBER_LT}; border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.1); }}
-.cc-pill.pink  {{ color: #f9a8d4; border-color: rgba(236,72,153,.4); background: rgba(236,72,153,.1); }}
+.cc-pill.blue  {{ color: {TEAL_DK}; border-color: {TEAL};    background: {TEAL_BG}; }}
+.cc-pill.green {{ color: {COVERED}; border-color: {COVERED}; background: {COVERED_BG}; }}
+.cc-pill.amber {{ color: {AMBER_LT}; border-color: {TIGHT};  background: {TIGHT_BG}; }}
+.cc-pill.pink  {{ color: {SHORT};   border-color: {SHORT};   background: {SHORT_BG}; }}
 
 .cc-card {{
-  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 22px;
-  padding: 0 0 14px 0; backdrop-filter: blur(14px); overflow: hidden;
-  box-shadow: 0 24px 80px rgba(0,0,0,0.28); position: relative; z-index: 1;
+  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px;
+  padding: 0 0 14px 0; overflow: hidden;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05); position: relative; z-index: 1;
   margin-bottom: 12px;
 }}
-.cc-card .bar {{ height: 6px; }}
+.cc-card .bar {{ height: 4px; }}
 .cc-card .inner {{ padding: 14px 18px 0 18px; }}
 .cc-card .ttl {{ color: {TEXT}; font-weight: 700; font-size: 15.5px; }}
 .cc-card .sub {{ color: {MUTED}; font-size: 12px; margin-bottom: 8px; }}
 .cc-card .kv {{ color: {BODY}; font-size: 13px; line-height: 1.65; }}
-.cc-card .kv b {{ color: {TEXT}; }}
+.cc-card .kv b {{ color: {TEXT}; font-variant-numeric: tabular-nums; }}
 
 .cc-stats {{
   display: flex; gap: 12px; margin: 0 0 14px 0; position: relative; z-index: 1;
 }}
 .cc-stat {{
-  flex: 1; background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 22px;
-  padding: 14px 18px 10px 18px; backdrop-filter: blur(14px);
-  box-shadow: 0 24px 80px rgba(0,0,0,0.28); min-width: 0;
+  flex: 1; background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px;
+  padding: 14px 18px 10px 18px;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05); min-width: 0;
 }}
 .cc-stat .lbl {{
   color: {MUTED}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
 }}
 .cc-stat .valrow {{ display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }}
 .cc-stat .val {{
-  color: {TEXT}; font-weight: 800; letter-spacing: -0.02em;
-  font-size: clamp(20px, 2.2vw, 30px);
+  color: {TEXT}; font-weight: 700; letter-spacing: -0.02em;
+  font-size: clamp(20px, 2.2vw, 30px); font-variant-numeric: tabular-nums;
 }}
 .cc-stat .delta {{
   font-size: 11.5px; font-weight: 700; border-radius: 999px; padding: 2px 8px;
-  border: 1px solid {BORDER}; color: {BODY}; background: rgba(51,65,85,.3);
-  white-space: nowrap;
+  border: 1px solid {BORDER}; color: {BODY}; background: {BG};
+  white-space: nowrap; font-variant-numeric: tabular-nums;
 }}
-.cc-stat .delta.good {{ color: #6ee7b7; border-color: rgba(16,185,129,.4); background: rgba(16,185,129,.1); }}
-.cc-stat .delta.bad  {{ color: #f9a8d4; border-color: rgba(236,72,153,.4); background: rgba(236,72,153,.1); }}
-.cc-stat .spark {{ margin-top: 6px; opacity: .9; line-height: 0; }}
+.cc-stat .delta.good {{ color: {COVERED}; border-color: {COVERED}; background: {COVERED_BG}; }}
+.cc-stat .delta.bad  {{ color: {SHORT};   border-color: {SHORT};   background: {SHORT_BG}; }}
+.cc-stat .spark {{ margin-top: 6px; line-height: 0; }}
 
 .cc-band {{
-  background: linear-gradient(90deg, rgba(6,182,212,.10), rgba(59,130,246,.10));
-  border: 1px solid rgba(6,182,212,.35); border-radius: 22px;
+  background: {TEAL_BG};
+  border: 1px solid {BORDER_SOFT}; border-left: 3px solid {TEAL};
+  border-radius: 0 8px 8px 0;
   padding: 14px 20px; color: {BODY}; font-size: 13.5px; line-height: 1.6;
   position: relative; z-index: 1; margin-bottom: 14px;
 }}
@@ -204,8 +290,8 @@ h2, h3 {{ letter-spacing: -0.03em; }}
 }}
 .cc-foot .line {{
   flex: 1; height: 2px; margin: 0 18px;
-  background: linear-gradient(90deg, {CYAN}, {BLUE});
-  border-radius: 2px; opacity: .8;
+  background: linear-gradient(90deg, {TEAL}, {DEMAND});
+  border-radius: 2px; opacity: .5;
 }}
 </style>
 """
@@ -313,21 +399,21 @@ def footer(audience: str = "Prepared for leadership review"):
 
 # ---------------------------------------------------------------- altair theme
 def alt_theme() -> dict:
-    """Chart config matching the house style — transparent glass background,
-    muted axes, Inter, brand categorical range."""
+    """Chart config matching the house style — transparent background so the
+    white card shows through, recessive axes, brand categorical range."""
     return {
         "config": {
             "background": "transparent",
-            "font": "Inter, ui-sans-serif, system-ui, sans-serif",
+            "font": "Avenir Next, Avenir, Inter, ui-sans-serif, system-ui, sans-serif",
             "view": {"stroke": "transparent"},
             "axis": {
                 "labelColor": MUTED, "titleColor": MUTED,
-                "gridColor": "rgba(51,65,85,0.45)", "domainColor": BORDER,
+                "gridColor": BORDER_SOFT, "domainColor": BORDER,
                 "tickColor": BORDER, "labelFontSize": 11, "titleFontSize": 11,
             },
             "legend": {"labelColor": BODY, "titleColor": MUTED,
                        "labelFontSize": 11, "titleFontSize": 11},
-            "range": {"category": [CYAN, VIOLET, GREEN, AMBER, PINK, BLUE]},
+            "range": {"category": CATEGORICAL},
         }
     }
 

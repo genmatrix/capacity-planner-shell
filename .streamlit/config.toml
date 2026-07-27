@@ -1,9 +1,13 @@
-# WFM house theme — deep navy canvas, cyan→blue through-line.
-# Palette source: Recommendation_Format_Style_Guide.md (brand lock).
+# WFM house theme — "Member Hall": the light palette.
+# Palette source: the org's live public-site stylesheet (red = masthead only,
+# teal = links and actions, deep navy = ink, warm gray = ground). No company
+# name here on purpose — this file ships to the PUBLIC shell repo.
+# Keep in step with brand.py: this file drives Streamlit's native widget
+# chrome, brand.py drives everything the app draws itself.
 [theme]
-base = "dark"
-primaryColor = "#06b6d4"
-backgroundColor = "#050814"
-secondaryBackgroundColor = "#0f172a"
-textColor = "#f8fafc"
+base = "light"
+primaryColor = "#007c89"
+backgroundColor = "#f4f5f5"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#192838"
 font = "sans serif"
