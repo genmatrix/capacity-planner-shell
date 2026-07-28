@@ -2909,14 +2909,18 @@ _PLAN_COUNT_ROWS = frozenset({
 })
 # Hairlines that group the frame into demand / requirement / supply.
 _PLAN_RULES = frozenset({"Workload (hrs)", "Production HC", "Staffed FTE"})
+# CPM lives in its decimals — ~1.45 for the main line, and a drift worth acting
+# on is hundredths. At the table's default 1dp every plausible value prints
+# "1.4" or "1.5", which is not a readout.
+_PLAN_PRECISION = {"CPM (plan)": 2, "CPM (actual)": 2}
 
 
 def render_plan_grid(plan: pd.DataFrame, note: str):
     grid = plan.set_index("Week").T
     grid.columns = [c[5:] for c in grid.columns]
 
-    brand.data_table(grid, int_rows=_PLAN_COUNT_ROWS, shade_rows={"Net FTE"},
-                     rule_before=_PLAN_RULES)
+    brand.data_table(grid, int_rows=_PLAN_COUNT_ROWS, precision=_PLAN_PRECISION,
+                     shade_rows={"Net FTE"}, rule_before=_PLAN_RULES)
     st.caption(note)
 
     def shade_net(row):
@@ -2975,6 +2979,44 @@ def plan_chart_with_benchmarks(plan: pd.DataFrame, lob: str | None):
                    "required and actual FTE here.")
 
 
+def _model_members(lob: str | None, weeks) -> np.ndarray | None:
+    """The membership series the MODEL used, week by week: the org-wide
+    forecast spread with `Members (actual)` REPLACING it wherever a real figure
+    was entered — exactly the rule compute_plan applies.
+
+    Using the model's own series (rather than requiring actual membership, as
+    the aggregate measured_cpm() does) is what makes a per-week CPM readable
+    today: no team has entered actual membership yet, and a column that is
+    blank in every row teaches nobody anything. Membership is org-wide, so any
+    LOB's frame answers for all of them — that is what apply_global_members
+    guarantees — which is also why the consolidated view can use the first."""
+    lobs = st.session_state.get("lobs") or {}
+    d = lobs.get(lob) if lob else next(iter(lobs.values()), None)
+    if d is None:
+        return None
+    dem = d["demand"]
+    if len(dem) != len(weeks) or "Members" not in dem.columns:
+        return None
+    m = pd.to_numeric(dem["Members"], errors="coerce").to_numpy(dtype=float)
+    if "Members (actual)" in dem.columns:
+        ma = pd.to_numeric(dem["Members (actual)"], errors="coerce").to_numpy(dtype=float)
+        m = np.where(np.isnan(ma), m, ma)
+    return m
+
+
+def _planned_cpm(lob: str | None, weeks) -> np.ndarray | None:
+    """The CPM sitting in the demand grid, for the row above. Consolidated view
+    has no single CPM — each LOB applies its own to the shared member base —
+    so it returns None rather than an average that means nothing."""
+    lobs = st.session_state.get("lobs") or {}
+    if lob is None or lob not in lobs:
+        return None
+    dem = lobs[lob]["demand"]
+    if len(dem) != len(weeks) or "CPM" not in dem.columns:
+        return None
+    return pd.to_numeric(dem["CPM"], errors="coerce").to_numpy(dtype=float)
+
+
 def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataFrame:
     """Append WFM Forecast / Actual Offered rows (+ variance vs the plan
     forecast) for weeks that overlap the loaded WFM data. Rows are omitted
@@ -2992,11 +3034,27 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
         df["WFM Variance"] = (v.to_numpy() - fcst).round(0)
     a = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
     if a is not None:
-        df["Actual Offered"] = a.to_numpy()
-        df["Actual Variance"] = (a.to_numpy() - fcst).round(0)
+        av = a.to_numpy()
+        df["Actual Offered"] = av
+        df["Actual Variance"] = (av - fcst).round(0)
+
+        # Measured CPM per week, alongside the CPM that was planned. Derived,
+        # never entered: actual contacts × 52 ÷ the membership the model used
+        # that week. Same definition as measured_cpm(), just not aggregated —
+        # so it is a like-for-like check on the assumption sitting in the
+        # demand grid rather than a second, differently-defined number.
+        mem = _model_members(lob, weeks)
+        if mem is not None:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cpm_act = np.where(mem > 0, av * WEEKS_PER_YEAR / mem, np.nan)
+            df["CPM (actual)"] = np.round(cpm_act, 2)
+            planned = _planned_cpm(lob, weeks)
+            if planned is not None:
+                df["CPM (plan)"] = np.round(planned, 2)
 
     order = ["Week", "Model Forecast", "Forecast (final)",
              "WFM Forecast", "WFM Variance", "Actual Offered", "Actual Variance",
+             "CPM (plan)", "CPM (actual)",
              "Workload (hrs)", "Available Hrs/FTE", "Required FTE",
              "Workload Req FTE", "Erlang Req FTE",
              "Production HC", "Prod HC — FT", "Prod HC — PT",
@@ -4654,7 +4712,13 @@ else:
                 plan_with_demand_benchmarks(plan, view),
                 "Net FTE shaded red where understaffed. WFM Forecast / Actual Offered "
                 "rows (+ variance vs plan) appear when the loaded WFM weeks overlap the "
-                "plan horizon. In production this table is written to the shared database "
+                "plan horizon. **CPM (actual)** is derived, never entered: actual contacts "
+                "× 52 ÷ that week's membership (the actual figure where you have entered "
+                "one, the forecast spread otherwise) — compare it against **CPM (plan)** "
+                "directly above. It only reads true against **full-week** exports: a week "
+                "holding a single day of contacts divides a day's calls into a year, so it "
+                "lands near a sixth of the real figure. "
+                "In production this table is written to the shared database "
                 "by the scheduled engine.")
 
         with brand.section("recon", "Actuals & variance"):

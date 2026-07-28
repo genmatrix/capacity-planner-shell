@@ -553,7 +553,7 @@ def _blank(v) -> bool:
         return False
 
 
-def data_table(grid, *, int_rows=(), shade_rows=(), tone_rows=(),
+def data_table(grid, *, int_rows=(), precision=None, shade_rows=(), tone_rows=(),
                rule_before=(), na_rep: str = "—"):
     """Render a metrics-down / periods-across frame as the compact house table.
 
@@ -562,6 +562,9 @@ def data_table(grid, *, int_rows=(), shade_rows=(), tone_rows=(),
 
       int_rows    printed with thousands separators and no decimals (counts —
                   "43,269" beats "43,269.0" for contacts and volume capacity)
+      precision   {row: decimals} overriding the default 1dp, for rows whose
+                  meaning lives in the decimals — CPM at 1dp is "1.5" for
+                  every plausible value, which is not a readout
       shade_rows  tinted background + saturated ink by sign (Net FTE: a red
                   cell in this app always means short)
       tone_rows   ink only, no tint, by sign (variance rows, where a tint on
@@ -586,7 +589,10 @@ def data_table(grid, *, int_rows=(), shade_rows=(), tone_rows=(),
             except (TypeError, ValueError):
                 cells.append(f"<td>{_esc(v)}</td>")
                 continue
-            txt = f"{num:,.0f}" if name in int_rows else f"{num:,.1f}"
+            dp = (precision or {}).get(name)
+            if dp is None:
+                dp = 0 if name in int_rows else 1
+            txt = f"{num:,.{dp}f}"
             cls = ""
             if name in shade_rows:
                 cls = ' class="neg"' if num < 0 else ' class="pos"'
