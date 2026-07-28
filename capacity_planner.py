@@ -13,8 +13,12 @@ import sources as sx
 import collab
 import brand
 
+# Tab title follows the local wordmark. brand.identity() reads a plain file and
+# never raises, so it is safe this early — set_page_config must be the first
+# Streamlit call and cannot be retried.
 pd.set_option("mode.string_storage", "python")
-st.set_page_config(page_title="WFM Capacity Command Center", layout="wide")
+st.set_page_config(page_title=f"{brand.identity()['word']} Capacity Planner",
+                   layout="wide")
 brand.inject()
 
 # Where the shared team plan lives. Point this at the WFM network share so all
@@ -489,7 +493,7 @@ def stable_editor(state_df: pd.DataFrame, *, state_key: str, **editor_kwargs
     garbage-collects the editor's client-side edit state — the diffs that
     re-apply the planner's edits over the stale base. Returning with the old
     base would ERASE the stored edits (an added NH class vanished after a trip
-    to the Command Center; AHT/Transfers/Actual-cell edits reverted the same
+    to the Executive View; AHT/Transfers/Actual-cell edits reverted the same
     way — only forward-fill columns survived, because their mutation forced a
     refresh). Liveness is tracked with the module's per-run sequence counter
     (`_run_seq`, ticked once at the top of every script run): an editor that
@@ -1860,13 +1864,13 @@ def _rollups_from_raw(vraw, sraw) -> tuple:
 
 
 def autoload_feeds():
-    """Boot-time feed load (user 2026-07-15): the Command Center must open
+    """Boot-time feed load (user 2026-07-15): the Executive View must open
     with actuals — visiting Real Data was a hidden per-session toll booth.
     Loads exactly what that page would auto-load; the parse is cached per
     process so a fresh session against unchanged 100 MB exports is instant.
     Perf lands in _feed_perf (MB, parse seconds, wall seconds) so the slow
     share's cost is measured, not guessed; import errors land in _feed_errors
-    and surface on the Command Center's data-health band."""
+    and surface on the Executive View's data-health band."""
     if "wfm_weekly" in st.session_state:
         return
     st.session_state["wfm_weekly"] = None
@@ -2488,6 +2492,28 @@ def render_publish_panel(mode: str):
             "- Your edits **auto-save as a personal draft** — if you close the "
             "browser before publishing, you'll be offered them back next time.")
 
+    with st.expander("Branding"):
+        _ident = brand.identity()
+        st.caption("The wordmark in the masthead. Everyone launching from this "
+                   "folder sees it.")
+        _m = st.text_input("Mark (1–4 characters)", _ident["mark"],
+                           max_chars=4, key="brand_mark")
+        _w = st.text_input("Wordmark", _ident["word"], max_chars=40, key="brand_word")
+        _s = st.text_input("Strapline", _ident["sub"], max_chars=60, key="brand_sub")
+        _bc1, _bc2 = st.columns(2)
+        if _bc1.button("Save branding", key="brand_save"):
+            brand.save_identity(_m, _w, _s)
+            st.rerun()
+        if _bc2.button("Reset to default", key="brand_reset"):
+            brand.reset_identity()
+            # Same reason _purge_assumption_widgets() exists: these inputs are
+            # keyed, so their session values survive the rerun and the boxes
+            # would still show the old wordmark after the file is gone. Drop
+            # the keys and let them re-seed from brand.identity().
+            for _k in ("brand_mark", "brand_word", "brand_sub"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
     mine = collab.personal_snapshots(SCENARIO_DIR, user)
     if mine:
         with st.expander("My what-ifs"):
@@ -2511,15 +2537,15 @@ if "lobs" not in st.session_state:
         init_state(52)                    # else start from the mapped-LOB default
         st.session_state.loaded_version = None
     _startup_draft_check()
-# Feeds load at boot (cached parse) so the Command Center opens with actuals —
+# Feeds load at boot (cached parse) so the Executive View opens with actuals —
 # visiting Real Data must never be a per-session prerequisite (2026-07-15).
 autoload_feeds()
 
-PAGES = ["Command Center", "Capacity Plan", "Hiring Advisor",
+PAGES = ["Executive View", "Capacity Plan", "Hiring Advisor",
          "Budget", "Real Data", "ACD Shrinkage", "Guide"]
 
 # Site masthead — wordmark, then nav, then content: traditional site order, and
-# it now renders on EVERY page (it used to live inside the Command Center, so
+# it now renders on EVERY page (it used to live inside the Executive View, so
 # six of seven pages had no header at all).
 #
 # It READS `nav_page` and never writes it. On a rerun the key already holds the
@@ -2528,7 +2554,7 @@ PAGES = ["Command Center", "Capacity Plan", "Hiring Advisor",
 #
 # Only facts that are settled THIS EARLY belong in the meta line. LOB count and
 # horizon are set by sidebar widgets hundreds of lines further down, so they
-# would render one run stale — they stay on the Command Center instead.
+# would render one run stale — they stay on the Executive View instead.
 brand.header(st.session_state.get("nav_page", PAGES[0]),
              f"Plan year {plan_year()} · {datetime.now():%b %d, %Y}")
 
@@ -2873,9 +2899,25 @@ with st.sidebar:
     render_publish_panel(mode)
 
 
+# Count rows print as whole numbers with thousands separators; everything else
+# is FTE and keeps a decimal. "43,269" is a contact volume you can read at a
+# glance; "43,269.0" is the same number pretending to a precision the forecast
+# does not have.
+_PLAN_COUNT_ROWS = frozenset({
+    "Model Forecast", "Forecast (final)", "WFM Forecast", "WFM Variance",
+    "Actual Offered", "Actual Variance", "Volume Capacity",
+})
+# Hairlines that group the frame into demand / requirement / supply.
+_PLAN_RULES = frozenset({"Workload (hrs)", "Production HC", "Staffed FTE"})
+
+
 def render_plan_grid(plan: pd.DataFrame, note: str):
     grid = plan.set_index("Week").T
     grid.columns = [c[5:] for c in grid.columns]
+
+    brand.data_table(grid, int_rows=_PLAN_COUNT_ROWS, shade_rows={"Net FTE"},
+                     rule_before=_PLAN_RULES)
+    st.caption(note)
 
     def shade_net(row):
         if row.name != "Net FTE":
@@ -2887,9 +2929,13 @@ def render_plan_grid(plan: pd.DataFrame, note: str):
                 f"background-color:{brand.COVERED_BG};color:{brand.COVERED};font-weight:600"
                 for v in row]
 
-    st.dataframe(grid.style.apply(shade_net, axis=1).format("{:,.1f}", na_rep="—"),
-                 width="stretch")
-    st.caption(note)
+    # The compact table above is the reading surface; this is the same frame as
+    # a real grid, for sorting, resizing and copying out to Excel. Kept rather
+    # than replaced — losing copy-to-clipboard would be a downgrade dressed as
+    # a restyle, and the diagnostic checks read the plan through here.
+    with st.expander("Open as a sortable grid — sort, resize, copy to Excel"):
+        st.dataframe(grid.style.apply(shade_net, axis=1).format("{:,.1f}", na_rep="—"),
+                     width="stretch")
 
 
 def req_bench_col() -> str:
@@ -3027,19 +3073,28 @@ def render_reconciliation(df: pd.DataFrame):
     grid = df.copy()
     grid.columns = [str(c)[5:] for c in grid.columns]  # strip the year, show MM-DD
 
+    # Variance rows get coloured ink but NO tint: a Plan/Actual/Var triple means
+    # every third row would be shaded, which reads as stripes rather than as
+    # meaning. Net FTE keeps the tint precisely because it is the one row where
+    # the colour IS the verdict.
+    var_rows = {r for r in grid.index if str(r).endswith("Var")}
+    rules = {r for r in grid.index if str(r).endswith("— Plan")}
+    brand.data_table(grid, tone_rows=var_rows, rule_before=rules)
+
     def shade_var(row):
         if not str(row.name).endswith("Var"):
             return [""] * len(row)
         return [f"color:{brand.SHORT}" if (pd.notna(v) and v < 0)
                 else (f"color:{brand.COVERED}" if pd.notna(v) else "") for v in row]
 
-    st.dataframe(grid.style.apply(shade_var, axis=1).format("{:,.1f}", na_rep="—"),
-                 width="stretch")
+    with st.expander("Open as a sortable grid — sort, resize, copy to Excel"):
+        st.dataframe(grid.style.apply(shade_var, axis=1).format("{:,.1f}", na_rep="—"),
+                     width="stretch")
 
 
 def _reference_metrics() -> dict | None:
     """Consolidated headline metrics of the last PUBLISHED version — the
-    baseline for the Command Center's Δ chips ("what changed since we last
+    baseline for the Executive View's Δ chips ("what changed since we last
     published"). Cached per active version; recomputed only when the pointer
     moves. None when nothing is published yet."""
     act = collab.read_active(SCENARIO_DIR)
@@ -3067,14 +3122,91 @@ def _reference_metrics() -> dict | None:
         req = sum(pl["Required FTE"].to_numpy() for pl in plans)
         stf = sum(pl["Staffed FTE"].to_numpy() for pl in plans)
         net = stf - req
+        # Forecast volume and the headcount walk get Δ chips too. The MEASURED
+        # metrics (actual volume, actual AHT, actual attrition) deliberately do
+        # not: a published plan has no actuals to be a baseline for, so a Δ
+        # there would be comparing a measurement to a forecast and calling it
+        # a change.
+        fcst = sum(pl["Forecast (final)"].to_numpy() for pl in plans)
+        hc = sum(pl["Production HC"].to_numpy() for pl in plans)
         cache = {"file": act["file"], "version": act["version"],
                  "avg_req": float(req.mean()), "avg_stf": float(stf.mean()),
                  "coverage": float((net >= 0).mean() * 100),
-                 "weeks_short": int((net < 0).sum())}
+                 "weeks_short": int((net < 0).sum()),
+                 "fcst_total": float(fcst.sum()), "hc": [float(x) for x in hc]}
     except Exception:   # a malformed old snapshot must never break the page
         cache = None
     st.session_state["_ref_metrics"] = cache
     return cache
+
+
+def _org_actual_aht(lobs: list[str], weeks: list[str]) -> tuple[float, int] | None:
+    """(org-wide actual AHT in seconds, weeks covered), CONTACT-WEIGHTED.
+
+    Weighted, not averaged. A plain mean over LOBs would let Wires — a few
+    hundred contacts a week — pull the org number as hard as Customer Support at
+    forty thousand, and the result would not be the AHT of any real call.
+    `_bench_series` sums its column, which is right for contacts and nonsense
+    for a rate, so the per-LOB series are combined here instead of asking it
+    for a consolidated one. Partial feed weeks are already excluded inside it.
+    """
+    num = den = 0.0
+    covered: set = set()
+    for lob in lobs:
+        a = _bench_series("wfm_weekly", "Actual AHT (sec)", lob, weeks)
+        c = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+        if a is None or c is None:
+            continue
+        a = pd.to_numeric(a, errors="coerce")
+        c = pd.to_numeric(c, errors="coerce")
+        m = a.notna() & c.notna() & (c > 0)
+        if not m.any():
+            continue
+        num += float((a[m] * c[m]).sum())
+        den += float(c[m].sum())
+        covered |= set(a.index[m])
+    return (num / den, len(covered)) if den > 0 else None
+
+
+def _org_measured_attrition(plans: dict) -> tuple[float, int] | None:
+    """(annualized %, weeks recorded) across every LOB, from the weeks a planner
+    actually entered an Attrition (actual) figure.
+
+    Aggregated from the numerator and denominator — Σ departures ÷ Σ
+    headcount-at-risk × 52 — NOT by averaging the per-LOB percentages, which
+    would weigh a 12-person specialty line the same as the main group.
+    Deliberately counts ENTERED weeks only, the same discipline as
+    measured_attrition_pct: a week nobody recorded is missing data, and letting
+    it read as zero departures would teach the org a falsely low rate.
+    Caller must respect ATTR_MIN_WEEKS before presenting it as fact."""
+    dep = risk = 0.0
+    weeks_recorded = 0
+    for name, d in st.session_state.lobs.items():
+        ros = d["roster"]
+        if "Attrition (actual)" not in ros.columns or name not in plans:
+            continue
+        act = pd.to_numeric(ros["Attrition (actual)"], errors="coerce").to_numpy(dtype=float)
+        m = ~np.isnan(act)
+        if not m.any():
+            continue
+        hc = plans[name]["Production HC"].to_numpy(dtype=float)
+        start = np.concatenate(([float(d["assumptions"]["starting_hc"])], hc[:-1]))
+        dep += float(act[m].sum())
+        risk += float(start[m].sum())
+        weeks_recorded = max(weeks_recorded, int(m.sum()))
+    if risk <= 0:
+        return None
+    return float(dep / risk * 52 * 100), weeks_recorded
+
+
+def _compact(v: float) -> str:
+    """2,175,004 → "2.18M". Contact volumes run to seven digits and five tiles
+    across is not seven digits of room; the exact figure goes in the sub line."""
+    if abs(v) >= 1_000_000:
+        return f"{v / 1_000_000:,.2f}M"
+    if abs(v) >= 10_000:
+        return f"{v / 1_000:,.1f}k"
+    return f"{v:,.0f}"
 
 
 def _month_axis() -> "alt.Axis":
@@ -3104,7 +3236,7 @@ def _today_rule(weeks: list[str]):
     return rule + txt
 
 
-def render_command_center():
+def render_executive_view():
     """The verdict-first landing page: capacity health in layers — headline
     verdict → stat row → who/when heatmap → demand-vs-supply walk → per-LOB
     health cards → supply engine → data-health band. WFM house style."""
@@ -3158,13 +3290,68 @@ def render_command_center():
         verdict = ("Coverage holds across the horizon" if weeks_under == 0
                    else f"Coverage breaks in {weeks_under} week(s) — deepest "
                         f"{worst_net:+.1f} FTE (week of {wk_lbl[worst_i]})")
-    brand.hero(
-        pills, verdict,
-        "One org-wide member base drives per-LOB demand (Members × CPM ÷ 52 × "
-        "seasonality); supply walks headcount through attrition, hiring and LOA. "
-        "FTE is not fungible across skills — a consolidated surplus can hide an "
-        "LOB shortfall, so the verdict checks every line of business.",
-        box[0], box[1], box[2], box_tone=box[3])
+    # The verdict used to be a hero block. It is now a pill, so the page still
+    # opens with the answer — a consolidated surplus can hide an LOB shortfall,
+    # and that check is the reason this page exists — while the cards below
+    # carry the operational numbers.
+    _vtone = "pink" if (short_lobs or weeks_under) else "green"
+    pills.append((verdict, _vtone))
+    pills.append((f"{box[0]} {box[1]} · {box[2]}", _vtone))
+    brand.pill_row(pills)
+
+    # ---- headline cards: what we forecast, what actually happened -----
+    ref_ = _reference_metrics()
+    cons_fcst = sum(p["Forecast (final)"].to_numpy() for p in plans.values())
+    cons_hc = sum(p["Production HC"].to_numpy() for p in plans.values())
+
+    # "Now" is the week we are in: the first that has not fully elapsed.
+    _passed = int(_weeks_passed(weeks).sum())
+    now_i = min(_passed, len(weeks) - 1)
+
+    fcst_total = float(cons_fcst.sum())
+    _fd = (fcst_total - ref_["fcst_total"]) if (ref_ and ref_.get("fcst_total")) else None
+    hc_now = float(cons_hc[now_i])
+    _ref_hc = (ref_.get("hc") if ref_ else None)
+    _hd = (hc_now - _ref_hc[now_i]) if (_ref_hc and len(_ref_hc) == len(weeks)) else None
+
+    act_vol = _bench_series("wfm_weekly", "Actual Contacts", None, weeks)
+    if act_vol is not None:
+        _av = pd.to_numeric(act_vol, errors="coerce").dropna()
+        act_vol = (float(_av.sum()), int(len(_av))) if len(_av) else None
+    aht = _org_actual_aht(lobs, weeks)
+    attr = _org_measured_attrition(plans)
+
+    _no_feed = "no WFM actuals loaded"
+    tiles = [
+        {"label": "Forecast Volume", "value": _compact(fcst_total),
+         "sub": f"{fcst_total:,.0f} contacts · {len(weeks)} wks",
+         "delta": (f"{_fd / 1000:+,.0f}k" if _fd is not None and abs(_fd) >= 500
+                   else ("· 0" if _fd is not None else None)),
+         "delta_tone": "",
+         "spark": list(cons_fcst), "spark_color": brand.DEMAND},
+        {"label": "Actual Volume",
+         "value": _compact(act_vol[0]) if act_vol else "—",
+         "sub": (f"{act_vol[0]:,.0f} contacts · {act_vol[1]} wk(s) measured"
+                 if act_vol else _no_feed),
+         "sub_warn": act_vol is None},
+        {"label": "Actual AHT", "value": f"{aht[0]:,.0f}s" if aht else "—",
+         "sub": (f"contact-weighted · {aht[1]} wk(s)" if aht else _no_feed),
+         "sub_warn": aht is None},
+        {"label": "Production HC", "value": f"{hc_now:,.1f}",
+         "sub": f"week of {wk_lbl[now_i]} · all LOBs",
+         "delta": (f"{_hd:+.1f}" if _hd is not None and abs(_hd) >= 0.05
+                   else ("· 0" if _hd is not None else None)),
+         "delta_tone": ("good" if (_hd or 0) > 0 else "bad") if _hd else "",
+         "spark": list(cons_hc), "spark_color": brand.SUPPLY},
+        {"label": "Attrition (actual)",
+         "value": f"{attr[0]:.1f}%" if attr else "—",
+         "sub": (("%d wk(s) recorded" % attr[1]
+                  + ("" if attr[1] >= ATTR_MIN_WEEKS
+                     else f" — under {ATTR_MIN_WEEKS}, treat as noise"))
+                 if attr else "no departures recorded yet"),
+         "sub_warn": attr is None or attr[1] < ATTR_MIN_WEEKS},
+    ]
+    brand.stat_row(tiles)
 
     # ---- stat row: branded tiles, sparklines, Δ vs last published ------
     ref = _reference_metrics()
@@ -3375,7 +3562,7 @@ def render_command_center():
     bits.append(f"Member base <b>{ms:,.0f} → {me:,.0f}</b>")
     with st.expander("Help with this page"):
         by_title = dict(GUIDE_SECTIONS)
-        for t in PAGE_HELP["Command Center"]:
+        for t in PAGE_HELP["Executive View"]:
             if t in by_title:
                 st.markdown(f"**{t}**")
                 st.markdown(by_title[t])
@@ -3386,7 +3573,6 @@ def render_command_center():
     brand.band("<b>Data health</b> — " + " · ".join(bits)
                + ". A plan reconciled against nothing is a guess — load actuals "
                  "on the Real Data page.")
-    brand.footer()
 
 
 
@@ -3395,7 +3581,7 @@ def render_command_center():
 DEMO_TOUR_MD = """
 This demo ships with a half-year of synthetic data telling one story: **Customer Support is slowly losing the staffing race.** Follow it:
 
-1. **Command Center** — the verdict flags the shortfall; watch the heatmap turn red for Customer Support through Q2, with the dashed *today* line marking where actuals end.
+1. **Executive View** — the verdict flags the shortfall; watch the heatmap turn red for Customer Support through Q2, with the dashed *today* line marking where actuals end.
 2. **Real Data** — the actuals agree: service level slides from ~88% to the 50s in exactly the weeks occupancy pins near 90% and abandons climb. Try the *requirement benchmark* toggle while you're there.
 3. **Capacity Plan** — open Customer Support: the reconciliation table shows plan vs actual per week. Press *Derive from actuals* to build a seasonality curve from 26 weeks of history.
 4. **Hiring Advisor** — the payoff: it recommends the exact classes (lead-time and ramp aware) that would have prevented the June hole.
@@ -3416,7 +3602,7 @@ GUIDE_SECTIONS = [
 4. Adjust what the actuals justify: edit **CPM** where volume trended (it
    carries forward to later weeks on its own), use **Fcst Override** for
    one-off known events, update **AHT** if it has genuinely moved.
-5. Check **Command Center** — the verdict line and heatmap tell you if the
+5. Check **Executive View** — the verdict line and heatmap tell you if the
    changes created or closed any shortfall.
 6. **Publish** (sidebar) with a one-line note about what changed. That saves
    a new version everyone sees; nothing is ever overwritten.
@@ -3477,7 +3663,7 @@ from Customer Support. The app prices this honestly:
 - **Restore** (editors only) makes an old version the team plan again — as a
   *new* version, so history stays complete.
 """),
-    ("Reading the Command Center", """
+    ("Reading the Executive View", """
 - **The verdict** (big box) is the worst week's Net FTE — checked per LOB,
   because a surplus in one line can't cover a shortage in another.
 - **Stat tiles**: the little curve is the year's shape; the **Δ chip** is the
@@ -3566,13 +3752,13 @@ CPM or weekly Members (actual).
 # Which Guide recipes belong on which page. The recipes themselves live ONCE
 # in GUIDE_SECTIONS — page help surfaces them in place, it never copies them.
 PAGE_HELP = {
-    "Command Center": ["Reading the Command Center", "Five things worth knowing"],
+    "Executive View": ["Reading the Executive View", "Five things worth knowing"],
     "Capacity Plan": ["Every week — the plan review", "Someone goes on LOA",
                          "Trying a what-if safely", "Pasting from Excel"],
     "Hiring Advisor": ["Covering a specialty shortfall with an interim",
                           "Planning hiring classes"],
     # Only recipes for the task you do ON this page — pairing Budget with the
-    # Command Center's reading guide was an authoring slip, not a design.
+    # Executive View's reading guide was an authoring slip, not a design.
     "Budget": ["Building next year's budget", "Once a year — rolling into the new year"],
     "Real Data": ["Every week — the plan review", "Data health warnings"],
     "ACD Shrinkage": ["Data health warnings"],
@@ -3586,7 +3772,7 @@ RECIPE_PAGE = {
     "Someone goes on LOA": "Capacity Plan",
     "Covering a specialty shortfall with an interim": "Hiring Advisor",
     "Planning hiring classes": "Hiring Advisor",
-    "Reading the Command Center": "Command Center",
+    "Reading the Executive View": "Executive View",
     "Data health warnings": "Real Data",
     "Pasting from Excel": "Capacity Plan",
 }
@@ -4080,7 +4266,6 @@ def render_budget_page():
     st.caption("Every figure is derived from the published plan's drivers — nothing "
                "here is entered separately, so the budget cannot drift from the plan.")
     render_scenario_compare(grain, metric)
-    brand.footer()
 
 
 def render_guide_page():
@@ -4238,8 +4423,8 @@ def render_advisor_page(ro: bool):
 # scenarios, or horizon changes) before anything computes.
 apply_global_members()
 
-if page == "Command Center":
-    render_command_center()
+if page == "Executive View":
+    render_executive_view()
 elif page == "Hiring Advisor":
     render_advisor_page(RO)
 elif page == "Budget":
@@ -4272,186 +4457,189 @@ else:
     tab_plan, tab_inputs, tab_nh = st.tabs(["Plan", "Weekly Inputs", "New-Hire Classes"])
 
     with tab_inputs:
-        st.caption(
-            f"Editing **{view}**. Edit cells directly — the plan recalculates live. "
-            "**Members** is the shared org-wide base (set in the sidebar, same for every "
-            "LOB). Expected weekly calls = **Members × CPM ÷ 52** (CPM = annual "
-            "**Calls Per Member**), so this LOB's **CPM** sizes its demand. "
-            "Editing a week's **CPM carries "
-            "forward** to later weeks until you edit a later week. "
-            "**Seasonality** is a weekly index (1.0 = average, 1.15 = +15%) that "
-            "reshapes the year but keeps the annual total fixed — peaks pull volume "
-            "from the quiet weeks. "
-            "**Fcst Override** replaces the model forecast when filled; blank = model."
-        )
-        prev_demand = lob["demand"]
-        edited_demand = stable_editor(
-            prev_demand, state_key=f"demand_{view}", width="stretch", num_rows="fixed",
-            disabled=["Week", "Members"], hide_index=True,
-            column_config={
-                "Seasonality": st.column_config.NumberColumn(
-                    format="%.2f", min_value=0.0,
-                    help="1.0 = average week. Reshapes the year; annual total is preserved."),
-                "Members": st.column_config.NumberColumn(
-                    format="localized",
-                    help="Org-wide FORECAST membership (sidebar start → year-end). "
-                         "Read-only here — the same series for every LOB."),
-                "Members (actual)": st.column_config.NumberColumn(
-                    format="localized", min_value=0.0,
-                    help="Measured membership that week. Blank = use the forecast. "
-                         "Org-wide: enter it once and every LOB sees it. Filled "
-                         "weeks drive the model AND the measured-CPM readout."),
-                "Fcst Override": st.column_config.NumberColumn(format="localized"),
-                "AHT (sec)": st.column_config.NumberColumn(format="localized"),
-            })
-        cpm_filled = forward_fill_step(prev_demand, edited_demand, "CPM")
-        members_changed = capture_members_actual(edited_demand)
-        lob["demand"] = edited_demand
-        if cpm_filled or members_changed:
-            st.rerun()  # redraw: carried-forward CPM, and actuals mirrored org-wide
-
-        # Measured CPM — the entered CPM checked against reality.
-        _mc = measured_cpm(view)
-        if _mc is not None:
-            _cpm_act, _cpm_wks = _mc
-            _cpm_now = float(pd.to_numeric(edited_demand["CPM"],
-                                           errors="coerce").iloc[-1] or 0)
-            _enough = _cpm_wks >= CPM_MIN_WEEKS
+        with brand.section("demand", "Demand — weekly drivers"):
             st.caption(
-                f"**Measured CPM** (actual contacts × 52 ÷ actual members, "
-                f"{_cpm_wks} week(s)): **{_cpm_act:.2f}** vs entered "
-                f"**{_cpm_now:.2f}** ({_cpm_act - _cpm_now:+.2f})"
-                + ("" if _enough else
-                   f" — ⚠️ fewer than {CPM_MIN_WEEKS} weeks; treat as directional"))
-            if st.button("Adopt measured CPM (all weeks)", disabled=RO or not _enough,
-                         key=f"adopt_cpm_{view}",
-                         help=f"Set every week's CPM to the measured rate. Enabled at "
-                              f"{CPM_MIN_WEEKS}+ weeks with both actual members and "
-                              f"actual contacts."):
-                lob["demand"]["CPM"] = round(float(_cpm_act), 2)
-                st.rerun()
-        elif st.session_state.get("wfm_weekly") is None:
-            st.caption("Measured CPM needs actual contacts — load the WFM feed on "
-                       "the Real Data page (and enter **Members (actual)**).")
-        else:
-            st.caption("Measured CPM needs **Members (actual)** weeks that overlap "
-                       "the loaded actual contacts.")
+                f"Editing **{view}**. Edit cells directly — the plan recalculates live. "
+                "**Members** is the shared org-wide base (set in the sidebar, same for every "
+                "LOB). Expected weekly calls = **Members × CPM ÷ 52** (CPM = annual "
+                "**Calls Per Member**), so this LOB's **CPM** sizes its demand. "
+                "Editing a week's **CPM carries "
+                "forward** to later weeks until you edit a later week. "
+                "**Seasonality** is a weekly index (1.0 = average, 1.15 = +15%) that "
+                "reshapes the year but keeps the annual total fixed — peaks pull volume "
+                "from the quiet weeks. "
+                "**Fcst Override** replaces the model forecast when filled; blank = model."
+            )
+            prev_demand = lob["demand"]
+            edited_demand = stable_editor(
+                prev_demand, state_key=f"demand_{view}", width="stretch", num_rows="fixed",
+                disabled=["Week", "Members"], hide_index=True,
+                column_config={
+                    "Seasonality": st.column_config.NumberColumn(
+                        format="%.2f", min_value=0.0,
+                        help="1.0 = average week. Reshapes the year; annual total is preserved."),
+                    "Members": st.column_config.NumberColumn(
+                        format="localized",
+                        help="Org-wide FORECAST membership (sidebar start → year-end). "
+                             "Read-only here — the same series for every LOB."),
+                    "Members (actual)": st.column_config.NumberColumn(
+                        format="localized", min_value=0.0,
+                        help="Measured membership that week. Blank = use the forecast. "
+                             "Org-wide: enter it once and every LOB sees it. Filled "
+                             "weeks drive the model AND the measured-CPM readout."),
+                    "Fcst Override": st.column_config.NumberColumn(format="localized"),
+                    "AHT (sec)": st.column_config.NumberColumn(format="localized"),
+                })
+            cpm_filled = forward_fill_step(prev_demand, edited_demand, "CPM")
+            members_changed = capture_members_actual(edited_demand)
+            lob["demand"] = edited_demand
+            if cpm_filled or members_changed:
+                st.rerun()  # redraw: carried-forward CPM, and actuals mirrored org-wide
 
-        # Live readout so the planner sees the reshape is total-preserving.
-        _seas = pd.to_numeric(edited_demand["Seasonality"], errors="coerce").fillna(1.0)
-        if float(_seas.min()) != 1.0 or float(_seas.max()) != 1.0:
-            _p = compute_plan(lob)["Model Forecast"]
-            st.caption(
-                f"Seasonality active — peak week **{int(_p.max()):,}**, "
-                f"trough **{int(_p.min()):,}**, annual model total "
-                f"**{int(_p.sum()):,}** (unchanged by the index; only its shape moves).")
+            # Measured CPM — the entered CPM checked against reality.
+            _mc = measured_cpm(view)
+            if _mc is not None:
+                _cpm_act, _cpm_wks = _mc
+                _cpm_now = float(pd.to_numeric(edited_demand["CPM"],
+                                               errors="coerce").iloc[-1] or 0)
+                _enough = _cpm_wks >= CPM_MIN_WEEKS
+                st.caption(
+                    f"**Measured CPM** (actual contacts × 52 ÷ actual members, "
+                    f"{_cpm_wks} week(s)): **{_cpm_act:.2f}** vs entered "
+                    f"**{_cpm_now:.2f}** ({_cpm_act - _cpm_now:+.2f})"
+                    + ("" if _enough else
+                       f" — ⚠️ fewer than {CPM_MIN_WEEKS} weeks; treat as directional"))
+                if st.button("Adopt measured CPM (all weeks)", disabled=RO or not _enough,
+                             key=f"adopt_cpm_{view}",
+                             help=f"Set every week's CPM to the measured rate. Enabled at "
+                                  f"{CPM_MIN_WEEKS}+ weeks with both actual members and "
+                                  f"actual contacts."):
+                    lob["demand"]["CPM"] = round(float(_cpm_act), 2)
+                    st.rerun()
+            elif st.session_state.get("wfm_weekly") is None:
+                st.caption("Measured CPM needs actual contacts — load the WFM feed on "
+                           "the Real Data page (and enter **Members (actual)**).")
+            else:
+                st.caption("Measured CPM needs **Members (actual)** weeks that overlap "
+                           "the loaded actual contacts.")
 
-        with st.expander("Week-of-month seasonality profile"):
-            st.caption(
-                "First week of the month runs hot? Set a relative uplift per "
-                "week-of-month position — this **generates the Seasonality column** "
-                "for you. Annual total is preserved (the index is normalized), so "
-                "these are relative lifts. Hand-tweak individual holiday weeks in the "
-                "grid afterward — regenerating overwrites the whole column.")
-            wcols = st.columns(5)
-            uplift = {}
-            for i, c in enumerate(wcols, start=1):
-                uplift[i] = c.number_input(
-                    f"WoM {i} %", -50.0, 100.0, 0.0, 1.0,
-                    key=f"wom_{view}_{i}", disabled=RO)
-            all_lobs = st.checkbox("Apply to all LOBs", value=False,
-                                   key=f"wom_all_{view}", disabled=RO)
-            if st.button("Generate Seasonality column", disabled=RO,
-                         key=f"wom_apply_{view}"):
-                targets = st.session_state.lobs.values() if all_lobs else [lob]
-                for d in targets:
-                    d["demand"]["Seasonality"] = wom_seasonality(
-                        d["demand"]["Week"].tolist(), uplift)
-                st.success("Seasonality column generated"
-                           + (" for all LOBs." if all_lobs else f" for {view}."))
-                st.rerun()
+            # Live readout so the planner sees the reshape is total-preserving.
+            _seas = pd.to_numeric(edited_demand["Seasonality"], errors="coerce").fillna(1.0)
+            if float(_seas.min()) != 1.0 or float(_seas.max()) != 1.0:
+                _p = compute_plan(lob)["Model Forecast"]
+                st.caption(
+                    f"Seasonality active — peak week **{int(_p.max()):,}**, "
+                    f"trough **{int(_p.min()):,}**, annual model total "
+                    f"**{int(_p.sum()):,}** (unchanged by the index; only its shape moves).")
 
-            st.divider()
-            st.caption(
-                "**Or derive it from history:** each week's WFM actual volume ÷ "
-                "the average week = its index, averaged by week-of-year across the "
-                "loaded history. Self-maintaining once you export full-year actuals — "
-                "partial weeks are ignored.")
-            if st.button("Derive from WFM actuals", disabled=RO,
-                         key=f"seas_hist_{view}"):
-                idx, msg = derive_seasonality_from_history(
-                    st.session_state.get("wfm_weekly"), view,
-                    lob["demand"]["Week"].tolist())
-                if idx is None:
-                    st.warning(msg)
-                else:
-                    lob["demand"]["Seasonality"] = idx
-                    st.success(msg)
+            with st.expander("Week-of-month seasonality profile"):
+                st.caption(
+                    "First week of the month runs hot? Set a relative uplift per "
+                    "week-of-month position — this **generates the Seasonality column** "
+                    "for you. Annual total is preserved (the index is normalized), so "
+                    "these are relative lifts. Hand-tweak individual holiday weeks in the "
+                    "grid afterward — regenerating overwrites the whole column.")
+                wcols = st.columns(5)
+                uplift = {}
+                for i, c in enumerate(wcols, start=1):
+                    uplift[i] = c.number_input(
+                        f"WoM {i} %", -50.0, 100.0, 0.0, 1.0,
+                        key=f"wom_{view}_{i}", disabled=RO)
+                all_lobs = st.checkbox("Apply to all LOBs", value=False,
+                                       key=f"wom_all_{view}", disabled=RO)
+                if st.button("Generate Seasonality column", disabled=RO,
+                             key=f"wom_apply_{view}"):
+                    targets = st.session_state.lobs.values() if all_lobs else [lob]
+                    for d in targets:
+                        d["demand"]["Seasonality"] = wom_seasonality(
+                            d["demand"]["Week"].tolist(), uplift)
+                    st.success("Seasonality column generated"
+                               + (" for all LOBs." if all_lobs else f" for {view}."))
                     st.rerun()
 
-        st.caption(
-            "Roster adjustments (weekly): LOA headcount, net transfers in/out, "
-            "**Attrition (actual)** — people who actually left that week (blank = "
-            "use the modelled rate; a filled cell **replaces** it, so past weeks "
-            "become truth and the walk self-corrects) — and support staff. "
-            "**LOA, Supervisors and Leads/Project carry forward** "
-            "from the week you edit until you edit a later week (a sup added in Q3 "
-            "is entered once). **Transfers** are one-time events and do not carry "
-            "forward. Support staff are informational — the plan computes their "
-            "ratio rows against walking agent headcount; they never affect Net FTE.")
-        prev_roster = lob["roster"]
-        edited_roster = stable_editor(
-            prev_roster, state_key=f"roster_{view}", width="stretch", num_rows="fixed",
-            disabled=["Week"], hide_index=True)
-        filled = [forward_fill_step(prev_roster, edited_roster, c)
-                  for c in ("LOA", "Supervisors", "Leads/Project")]
-        lob["roster"] = edited_roster
-        if any(filled):
-            st.rerun()  # redraw so the carried-forward cells show
+                st.divider()
+                st.caption(
+                    "**Or derive it from history:** each week's WFM actual volume ÷ "
+                    "the average week = its index, averaged by week-of-year across the "
+                    "loaded history. Self-maintaining once you export full-year actuals — "
+                    "partial weeks are ignored.")
+                if st.button("Derive from WFM actuals", disabled=RO,
+                             key=f"seas_hist_{view}"):
+                    idx, msg = derive_seasonality_from_history(
+                        st.session_state.get("wfm_weekly"), view,
+                        lob["demand"]["Week"].tolist())
+                    if idx is None:
+                        st.warning(msg)
+                    else:
+                        lob["demand"]["Seasonality"] = idx
+                        st.success(msg)
+                        st.rerun()
+
+        with brand.section("roster", "Roster — LOA, transfers, attrition, support"):
+            st.caption(
+                "Roster adjustments (weekly): LOA headcount, net transfers in/out, "
+                "**Attrition (actual)** — people who actually left that week (blank = "
+                "use the modelled rate; a filled cell **replaces** it, so past weeks "
+                "become truth and the walk self-corrects) — and support staff. "
+                "**LOA, Supervisors and Leads/Project carry forward** "
+                "from the week you edit until you edit a later week (a sup added in Q3 "
+                "is entered once). **Transfers** are one-time events and do not carry "
+                "forward. Support staff are informational — the plan computes their "
+                "ratio rows against walking agent headcount; they never affect Net FTE.")
+            prev_roster = lob["roster"]
+            edited_roster = stable_editor(
+                prev_roster, state_key=f"roster_{view}", width="stretch", num_rows="fixed",
+                disabled=["Week"], hide_index=True)
+            filled = [forward_fill_step(prev_roster, edited_roster, c)
+                      for c in ("LOA", "Supervisors", "Leads/Project")]
+            lob["roster"] = edited_roster
+            if any(filled):
+                st.rerun()  # redraw so the carried-forward cells show
 
     with tab_nh:
-        st.caption(
-            "Classes walk Training → Coaching Lab → Production with stage attrition. "
-            "**Actual Grads** records what really came out of a class — a filled cell "
-            "**replaces** the modelled survivor calculation (started 10, graduated 7 → "
-            "7 land in production, whatever the attrition % predicted). Leave blank for "
-            "classes that haven't graduated yet. To add a class, type into the empty "
-            "bottom row; to remove one, select the row (left edge) and press "
-            "Delete — or the trash icon.")
-        lob["nh"] = stable_editor(
-            lob["nh"], state_key=f"nh_{view}", width="stretch", num_rows="dynamic",
-            hide_index=True,
-            column_config={
-                "Class Start Week": st.column_config.SelectboxColumn(
-                    options=lob["demand"]["Week"].tolist()),
-                "Class Size": st.column_config.NumberColumn(
-                    min_value=0.0, format="%.0f",
-                    help="How many people start the class. A row with no size is "
-                         "ignored until you fill it in."),
-                "Training Wks": st.column_config.NumberColumn(
-                    min_value=0.0, format="%.0f", help="Weeks in training."),
-                "Coaching Wks": st.column_config.NumberColumn(
-                    min_value=0.0, format="%.0f", help="Weeks in the coaching lab."),
-                "Training Attr %": st.column_config.NumberColumn(
-                    min_value=0.0, max_value=100.0, format="%.1f",
-                    help="Share of the class lost during training."),
-                "Coaching Attr %": st.column_config.NumberColumn(
-                    min_value=0.0, max_value=100.0, format="%.1f",
-                    help="Share of the survivors lost during coaching."),
-                "Actual Grads": st.column_config.NumberColumn(
-                    min_value=0.0, format="%.1f",
-                    help="People who actually reached production from this class. "
-                         "Blank = use the Training/Coaching attrition %."),
-            })
-        _wash = measured_nh_washout(lob["nh"])
-        if _wash is not None:
-            _act, _plan, _cls, _size = _wash
+        with brand.section("nh", "New-hire classes"):
             st.caption(
-                f"Measured washout across **{_cls}** graduated class(es) "
-                f"({_size:.0f} hired): **{_act:.1f}%** vs **{_plan:.1f}%** planned "
-                f"({_act - _plan:+.1f} pts). Adjust Training/Coaching Attr % on future "
-                "classes if this keeps diverging — the app can't tell which stage lost "
-                "them, only the total.")
+                "Classes walk Training → Coaching Lab → Production with stage attrition. "
+                "**Actual Grads** records what really came out of a class — a filled cell "
+                "**replaces** the modelled survivor calculation (started 10, graduated 7 → "
+                "7 land in production, whatever the attrition % predicted). Leave blank for "
+                "classes that haven't graduated yet. To add a class, type into the empty "
+                "bottom row; to remove one, select the row (left edge) and press "
+                "Delete — or the trash icon.")
+            lob["nh"] = stable_editor(
+                lob["nh"], state_key=f"nh_{view}", width="stretch", num_rows="dynamic",
+                hide_index=True,
+                column_config={
+                    "Class Start Week": st.column_config.SelectboxColumn(
+                        options=lob["demand"]["Week"].tolist()),
+                    "Class Size": st.column_config.NumberColumn(
+                        min_value=0.0, format="%.0f",
+                        help="How many people start the class. A row with no size is "
+                             "ignored until you fill it in."),
+                    "Training Wks": st.column_config.NumberColumn(
+                        min_value=0.0, format="%.0f", help="Weeks in training."),
+                    "Coaching Wks": st.column_config.NumberColumn(
+                        min_value=0.0, format="%.0f", help="Weeks in the coaching lab."),
+                    "Training Attr %": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=100.0, format="%.1f",
+                        help="Share of the class lost during training."),
+                    "Coaching Attr %": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=100.0, format="%.1f",
+                        help="Share of the survivors lost during coaching."),
+                    "Actual Grads": st.column_config.NumberColumn(
+                        min_value=0.0, format="%.1f",
+                        help="People who actually reached production from this class. "
+                             "Blank = use the Training/Coaching attrition %."),
+                })
+            _wash = measured_nh_washout(lob["nh"])
+            if _wash is not None:
+                _act, _plan, _cls, _size = _wash
+                st.caption(
+                    f"Measured washout across **{_cls}** graduated class(es) "
+                    f"({_size:.0f} hired): **{_act:.1f}%** vs **{_plan:.1f}%** planned "
+                    f"({_act - _plan:+.1f} pts). Adjust Training/Coaching Attr % on future "
+                    "classes if this keeps diverging — the app can't tell which stage lost "
+                    "them, only the total.")
 
     plan = compute_plan(lob)
     with tab_plan:
@@ -4461,26 +4649,27 @@ else:
         c3.metric("Worst-Week Net FTE", f"{plan['Net FTE'].min():+.1f}")
         c4.metric("Weeks Understaffed", int((plan["Net FTE"] < 0).sum()))
         plan_chart_with_benchmarks(plan, view)
-        render_plan_grid(
-            plan_with_demand_benchmarks(plan, view),
-            "Net FTE shaded red where understaffed. WFM Forecast / Actual Offered "
-            "rows (+ variance vs plan) appear when the loaded WFM weeks overlap the "
-            "plan horizon. In production this table is written to the shared database "
-            "by the scheduled engine.")
+        with brand.section("plan", "Plan — weeks across, metrics down"):
+            render_plan_grid(
+                plan_with_demand_benchmarks(plan, view),
+                "Net FTE shaded red where understaffed. WFM Forecast / Actual Offered "
+                "rows (+ variance vs plan) appear when the loaded WFM weeks overlap the "
+                "plan horizon. In production this table is written to the shared database "
+                "by the scheduled engine.")
 
-        st.subheader("Actuals & Variance")
-        recon = build_reconciliation(plan, lob, view)
-        if recon is not None:
-            render_reconciliation(recon)
-            st.caption(
-                "Plan vs. measured actuals, for weeks that overlap loaded WFM/ACD "
-                "data. **Variance = Actual − Plan** (red = actual below plan). Shrink % "
-                "compares plan *total* shrinkage to measured *in-office* only — layer OOO "
-                "on before treating them as like-for-like.")
-            _partial_note(view)
-        else:
-            st.caption(
-                "Load WFM/ACD on the Real Data page to reconcile plan vs. actuals "
-                "here — one Plan / Actual / Variance row per metric.")
+        with brand.section("recon", "Actuals & variance"):
+            recon = build_reconciliation(plan, lob, view)
+            if recon is not None:
+                render_reconciliation(recon)
+                st.caption(
+                    "Plan vs. measured actuals, for weeks that overlap loaded WFM/ACD "
+                    "data. **Variance = Actual − Plan** (red = actual below plan). Shrink % "
+                    "compares plan *total* shrinkage to measured *in-office* only — layer OOO "
+                    "on before treating them as like-for-like.")
+                _partial_note(view)
+            else:
+                st.caption(
+                    "Load WFM/ACD on the Real Data page to reconcile plan vs. actuals "
+                    "here — one Plan / Actual / Variance row per metric.")
 
 _autosave_draft()

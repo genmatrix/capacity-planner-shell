@@ -8,8 +8,77 @@ chart theme so health graphs read as part of the same system.
 Everything is inline CSS / HTML (no external assets, no internet dependency)
 — same rule as the brief format.
 """
+import json
+import os
+from pathlib import Path
+
 import altair as alt
 import streamlit as st
+
+# ---------------------------------------------------------------- identity
+# The wordmark is a LOCAL setting, not part of the code.
+#
+# Why it works this way: the work copy has to carry the real organisation's
+# name, and nothing carrying that name may ever reach the public shell. So the
+# name lives in a file that is NOT in the distribution — not in publish
+# ALLOWLIST, not in git — and the code ships only these generic defaults. Three
+# consequences worth knowing:
+#
+#   * Re-extracting a shell ZIP over the app folder does NOT clobber it. A ZIP
+#     adds and overwrites what it contains; branding.json is not in it, so a
+#     work-side update keeps the organisation's branding without re-entering.
+#   * It sits beside the app, so on the share every planner sees the same
+#     wordmark — same pattern as data_paths.json and holidays.json.
+#   * DEFAULT_MARK and DEFAULT_WORD must stay STRING LITERALS. The publish
+#     pipeline rewrites them by exact text match ("WFM" -> "WFM"), and the
+#     banned-term scan rejects the untransformed value — so computing them, or
+#     moving them into the JSON file as the source of truth, would silently
+#     take the scrubbing off the public build.
+IDENTITY_FILE = Path(__file__).resolve().parent / "branding.json"
+DEFAULT_MARK = "WFM"
+DEFAULT_WORD = "WFM"
+DEFAULT_SUB = "Workforce Management"
+
+
+def identity() -> dict:
+    """{mark, word, sub} — the local override if there is one, else the
+    shipped defaults. Never raises: a missing, unreadable or half-written file
+    just means defaults, because a branding file is not worth a broken app."""
+    data = {}
+    try:
+        data = json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        pass
+
+    def pick(key, default, limit):
+        v = data.get(key)
+        v = v.strip() if isinstance(v, str) else ""
+        return (v or default)[:limit]
+
+    return {"mark": pick("mark", DEFAULT_MARK, 4),
+            "word": pick("word", DEFAULT_WORD, 40),
+            "sub": pick("sub", DEFAULT_SUB, 60)}
+
+
+def save_identity(mark: str, word: str, sub: str) -> None:
+    """Write the override beside the app, atomically (temp + replace) so a
+    planner never reads a half-written file off the share."""
+    payload = {"mark": (mark or "").strip()[:4],
+               "word": (word or "").strip()[:40],
+               "sub": (sub or "").strip()[:60]}
+    tmp = IDENTITY_FILE.with_suffix(f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, IDENTITY_FILE)
+
+
+def reset_identity() -> None:
+    """Back to the shipped defaults — the state the public shell must be in."""
+    try:
+        IDENTITY_FILE.unlink()
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------- palette
 # "Member Hall" — the light palette, taken from the org's live public-site
@@ -96,11 +165,18 @@ def accent_for(i: int) -> tuple[str, str]:
 # ---------------------------------------------------------------- CSS
 _CSS = f"""
 <style>
-/* ------- the masthead rule: the one place brand red appears ------- */
-.stApp::before {{
-  content: ""; position: fixed; top: 0; left: 0; right: 0; height: 4px;
-  background: {RED}; pointer-events: none; z-index: 999;
-}}
+/* Content gutter. The masthead band bleeds to the edges of the content column
+   by cancelling this with a negative margin, so the two must stay in step —
+   that is why it is a custom property rather than two hard-coded numbers.
+
+   --cc-topclear is the space reserved above the masthead. Streamlit's toolbar
+   is `position: fixed`, so it reserves NO space of its own: any padding-top
+   smaller than the toolbar puts content underneath it, which is what clipped
+   the masthead's top half on 2026-07-28. With the toolbar collapsed to zero
+   height (below) nothing needs clearing and this is 0 — but it stays a named
+   property because the moment the toolbar is restored, this is the number that
+   has to come back with it. */
+:root {{ --cc-gutter: 2.2rem; --cc-topclear: 0rem; }}
 
 /* ------- typography ------- */
 html, body, .stApp, [class*="css"] {{
@@ -176,9 +252,28 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
 }}
 
 /* ------- WFM components (emitted by brand.py helpers) ------- */
+/* The masthead is a BAND, not a floating wordmark: white ground, the brand
+   rule along its top edge, a hairline along the bottom, bleeding to the edges
+   of the content column. The red used to be a fixed hairline pinned to the
+   viewport, which left it stranded above the Streamlit toolbar with the
+   wordmark floating far below it. Carrying it on the band puts the rule back
+   where it belongs and still spends brand red exactly once — it is chrome, and
+   a red cell in this app always means understaffed. */
 .cc-header {{
   display: flex; align-items: center; justify-content: space-between;
-  margin: 0 0 10px 0; position: relative; z-index: 1;
+  background: {SURFACE};
+  border-top: 4px solid {RED};
+  border-bottom: 1px solid {BORDER};
+  margin: 0 calc(-1 * var(--cc-gutter)) 16px;
+  /* The extra LEFT padding is the lane the re-homed sidebar chevron sits in
+     (see the toolbar block above). Left, not right, because the control that
+     collapses the sidebar lives inside stSidebarHeader — on the left — so an
+     expand button anywhere else makes the toggle jump across the screen
+     between clicks. Reserved unconditionally: the chevron only exists while
+     the sidebar is collapsed, and a band whose wordmark shifts sideways when
+     you collapse the rail is worse than 34px of white space. */
+  padding: 12px var(--cc-gutter) 11px calc(var(--cc-gutter) + 34px);
+  position: relative; z-index: 1;
 }}
 .cc-brand {{ display: flex; align-items: center; gap: 12px; }}
 .cc-tile {{
@@ -273,7 +368,14 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
 }}
 .cc-stat .delta.good {{ color: {COVERED}; border-color: {COVERED}; background: {COVERED_BG}; }}
 .cc-stat .delta.bad  {{ color: {SHORT};   border-color: {SHORT};   background: {SHORT_BG}; }}
+.cc-stat .sub {{
+  color: {MUTED}; font-size: 11px; line-height: 1.35; margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}}
+.cc-stat .sub.warn {{ color: {AMBER_LT}; font-weight: 600; }}
 .cc-stat .spark {{ margin-top: 6px; line-height: 0; }}
+/* Five tiles across is tight; let the value shrink rather than overflow. */
+.cc-stats.five .cc-stat .val {{ font-size: clamp(18px, 1.8vw, 26px); }}
 
 .cc-band {{
   background: {TEAL_BG};
@@ -284,15 +386,117 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
 }}
 .cc-band b {{ color: {TEXT}; }}
 
-.cc-foot {{
-  display: flex; align-items: center; justify-content: space-between;
-  color: {MUTED}; font-size: 12px; margin-top: 26px; position: relative; z-index: 1;
+/* ------- density -------
+   Streamlit's defaults are laid out for demos; a planner works down a rail of
+   ~20 controls and across 52 weeks, so vertical space is the scarce resource.
+   These pull label and gap sizes to the proportions the R build used. All of
+   it is cosmetic: if a selector stops matching after a Streamlit upgrade the
+   app is merely roomier again, never broken. */
+.block-container, [data-testid="stMainBlockContainer"] {{
+  padding-top: var(--cc-topclear) !important;
+  padding-left: var(--cc-gutter); padding-right: var(--cc-gutter);
+  padding-bottom: 3rem;
 }}
-.cc-foot .line {{
-  flex: 1; height: 2px; margin: 0 18px;
-  background: linear-gradient(90deg, {TEAL}, {DEMAND});
-  border-radius: 2px; opacity: .5;
+/* ------- the Streamlit toolbar -------
+   Collapsed to nothing so the masthead is the first thing on the page.
+
+   The usual recipe for this is `[data-testid="stHeader"] {{ display: none }}`.
+   DO NOT do that here. The chevron that reopens a COLLAPSED SIDEBAR lives
+   inside it:
+
+       stHeader > stToolbar > [ stExpandSidebarButton, stStatusWidget,
+                                stAppDeployButton, stMainMenu ]
+
+   Hiding the parent takes the chevron with it, and a planner who collapses the
+   rail then has no way back short of reloading the page. So the header is
+   zero-height and click-through, its disposable contents are hidden
+   individually, and the chevron is re-homed into the masthead's right edge —
+   where .cc-header reserves a lane for it. It only renders while the sidebar
+   is collapsed; the lane is empty the rest of the time.
+
+   If a Streamlit upgrade renames these test ids the failure is visible and
+   safe: the toolbar reappears at full height, overlapping the masthead until
+   --cc-topclear is set back to ~4.5rem.
+
+   It is re-homed LEFT rather than right because its counterpart — the control
+   that collapses the sidebar — is inside stSidebarHeader, on the left. Putting
+   expand on the right made the toggle jump from one side of the screen to the
+   other between clicks. Both now sit at the left edge, next to the rail they
+   act on. `position: fixed` is measured from the viewport, which lines up with
+   the content column only because the app is layout="wide"; a centered layout
+   would need this anchored differently. */
+[data-testid="stHeader"] {{
+  background: transparent; height: 0; min-height: 0; pointer-events: none;
 }}
+[data-testid="stToolbar"] {{ padding: 0; pointer-events: none; }}
+[data-testid="stStatusWidget"],
+[data-testid="stAppDeployButton"],
+[data-testid="stMainMenu"] {{ display: none; }}
+[data-testid="stExpandSidebarButton"] {{
+  pointer-events: auto; position: fixed; z-index: 1000;
+  top: 12px; left: calc(var(--cc-gutter) - 8px); right: auto;
+}}
+[data-testid="stSidebarUserContent"] {{ padding-top: 1.2rem; }}
+[data-testid="stVerticalBlock"] {{ gap: 0.7rem; }}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap: 0.45rem; }}
+[data-testid="stWidgetLabel"] p {{
+  font-size: 12px !important; font-weight: 600 !important; color: {BODY} !important;
+  margin-bottom: 2px !important;
+}}
+[data-testid="stCaptionContainer"] p {{ font-size: 12px; color: {MUTED}; }}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{ font-size: 15px; }}
+
+/* ------- section cards -------
+   st.container(key="ccsec_...") becomes a bordered card, so a grid and the
+   note that explains it read as one object instead of loose page furniture.
+   Same .st-key-* hook the nav bar uses. */
+[class*="st-key-ccsec_"] {{
+  background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px;
+  padding: 14px 18px 8px; margin-bottom: 12px;
+  box-shadow: 0 1px 2px rgba(25,40,56,.05);
+}}
+.cc-sec-ttl {{
+  color: {MUTED}; font-size: 10.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .12em; margin-bottom: 2px;
+}}
+.cc-sec-note {{ color: {BODY}; font-size: 12.5px; line-height: 1.55; margin-bottom: 10px; }}
+
+/* ------- the compact plan table -------
+   Weeks across, metrics down, at a density you can actually scan a year in.
+   The Week column and the header row both stick, because a number 40 columns
+   from its label is not information. Scrolls inside its own box so the page
+   body never scrolls sideways. */
+.cc-tablewrap {{
+  overflow: auto; max-height: 560px;
+  border: 1px solid {BORDER}; border-radius: 10px; background: {SURFACE};
+}}
+table.cc-table {{
+  border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%;
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}}
+table.cc-table th {{
+  position: sticky; top: 0; z-index: 2; background: {SURFACE};
+  text-align: right; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: {MUTED}; font-weight: 700; padding: 9px 10px 7px;
+  border-bottom: 1px solid {BORDER}; white-space: nowrap;
+}}
+table.cc-table th:first-child, table.cc-table td:first-child {{
+  position: sticky; left: 0; text-align: left; white-space: nowrap;
+  background: {SURFACE}; font-weight: 600; color: {TEXT};
+  box-shadow: 1px 0 0 {BORDER_SOFT};
+}}
+table.cc-table th:first-child {{ z-index: 3; }}
+table.cc-table td {{
+  padding: 4px 10px; text-align: right; white-space: nowrap; color: {BODY};
+  border-bottom: 1px solid {BORDER_SOFT};
+}}
+table.cc-table tr:last-child td {{ border-bottom: none; }}
+table.cc-table tr:hover td {{ background: {BG}; }}
+table.cc-table td.neg {{ color: {SHORT}; background: {SHORT_BG}; font-weight: 700; }}
+table.cc-table td.pos {{ color: {COVERED}; background: {COVERED_BG}; }}
+table.cc-table td.tone-neg {{ color: {SHORT}; font-weight: 600; }}
+table.cc-table td.tone-pos {{ color: {COVERED}; font-weight: 600; }}
+table.cc-table tr.rule td {{ border-top: 1px solid {BORDER}; }}
 </style>
 """
 
@@ -303,15 +507,98 @@ def inject():
 
 # ---------------------------------------------------------------- components
 def header(doc_type: str, meta: str):
+    ident = identity()
+    # The tile is a fixed square, so the mark has to shrink to fit rather than
+    # overflow it — "CC" and a four-letter mark cannot share one font size.
+    tile_px = {1: 18, 2: 16, 3: 13}.get(len(ident["mark"]), 11)
     st.markdown(f"""
 <div class="cc-header">
   <div class="cc-brand">
-    <div class="cc-tile" style="font-size:11px">WFM</div>
-    <div><div class="cc-word">WFM</div>
-         <div class="cc-sub">Workforce Management</div></div>
+    <div class="cc-tile" style="font-size:{tile_px}px">{_esc(ident["mark"])}</div>
+    <div><div class="cc-word">{_esc(ident["word"])}</div>
+         <div class="cc-sub">{_esc(ident["sub"])}</div></div>
   </div>
   <div class="cc-meta"><b>{doc_type}</b>{meta}</div>
 </div>""", unsafe_allow_html=True)
+
+
+def section(key: str, title: str = "", note: str = ""):
+    """A bordered card you put widgets inside:
+
+        with brand.section("plan", "Plan", "Weeks across, metrics down."):
+            ...
+
+    The key drives the `.st-key-ccsec_*` CSS hook, so it must be unique on the
+    page and stable across reruns — it is a widget key in every sense that
+    matters to Streamlit."""
+    box = st.container(key=f"ccsec_{key}")
+    if title or note:
+        with box:
+            st.markdown(
+                (f'<div class="cc-sec-ttl">{_esc(title)}</div>' if title else "")
+                + (f'<div class="cc-sec-note">{note}</div>' if note else ""),
+                unsafe_allow_html=True)
+    return box
+
+
+def _esc(v) -> str:
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _blank(v) -> bool:
+    """True for None and NaN, without importing pandas into the brand layer."""
+    try:
+        return v is None or v != v
+    except Exception:                                    # pragma: no cover
+        return False
+
+
+def data_table(grid, *, int_rows=(), shade_rows=(), tone_rows=(),
+               rule_before=(), na_rep: str = "—"):
+    """Render a metrics-down / periods-across frame as the compact house table.
+
+    `grid` is a DataFrame whose INDEX is the row labels and whose columns are
+    already the labels to print. Rows are classified, not cells:
+
+      int_rows    printed with thousands separators and no decimals (counts —
+                  "43,269" beats "43,269.0" for contacts and volume capacity)
+      shade_rows  tinted background + saturated ink by sign (Net FTE: a red
+                  cell in this app always means short)
+      tone_rows   ink only, no tint, by sign (variance rows, where a tint on
+                  every second row would fight the table)
+      rule_before a hairline above the row, for grouping
+
+    Deliberately not st.dataframe: this is the reading surface, and the grid
+    affordances (sort, resize, copy) are kept alongside it rather than
+    replaced — see render_plan_grid.
+    """
+    head = "".join(f"<th>{_esc(c)}</th>" for c in grid.columns)
+    rows = []
+    for name, row in grid.iterrows():
+        tr = ' class="rule"' if name in rule_before else ""
+        cells = []
+        for v in row:
+            if _blank(v):
+                cells.append(f"<td>{na_rep}</td>")
+                continue
+            try:
+                num = float(v)
+            except (TypeError, ValueError):
+                cells.append(f"<td>{_esc(v)}</td>")
+                continue
+            txt = f"{num:,.0f}" if name in int_rows else f"{num:,.1f}"
+            cls = ""
+            if name in shade_rows:
+                cls = ' class="neg"' if num < 0 else ' class="pos"'
+            elif name in tone_rows:
+                cls = ' class="tone-neg"' if num < 0 else ' class="tone-pos"'
+            cells.append(f"<td{cls}>{txt}</td>")
+        rows.append(f"<tr{tr}><td>{_esc(name)}</td>{''.join(cells)}</tr>")
+    st.markdown(
+        f'<div class="cc-tablewrap"><table class="cc-table">'
+        f"<thead><tr><th></th>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>",
+        unsafe_allow_html=True)
 
 
 def hero(pills: list[tuple[str, str]], title: str, framing: str,
@@ -369,10 +656,26 @@ def _spark_svg(points, color: str = CYAN, w: int = 130, h: int = 34) -> str:
             f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="{color}"/></svg>')
 
 
+def pill_row(pills: list[tuple[str, str]]):
+    """A bare row of status pills — the hero's pill strip, usable without the
+    hero. Same (text, tone) pairs: "", blue, green, amber, pink."""
+    st.markdown(
+        '<div style="margin-bottom:10px">'
+        + "".join(f'<span class="cc-pill {tone}">{_esc(txt)}</span>'
+                  for txt, tone in pills)
+        + "</div>", unsafe_allow_html=True)
+
+
 def stat_row(tiles: list[dict]):
     """Branded stat tiles: label, value, optional delta chip (tone good/bad/'' =
-    neutral), optional sparkline series. Replaces bare st.metric rows so the
-    stat band reads as part of the same system as the hero and cards."""
+    neutral), optional `sub` context line, optional sparkline series. Replaces
+    bare st.metric rows so the stat band reads as part of the same system as
+    the cards.
+
+    `sub` exists because a measured metric has to be able to say how much data
+    is behind it. A tile reading "—" with no explanation is indistinguishable
+    from a broken one, and a tile reading "26.4%" off two recorded weeks is
+    worse than one that says so."""
     cells = []
     for t in tiles:
         d = t.get("delta")
@@ -380,21 +683,22 @@ def stat_row(tiles: list[dict]):
                  if d else "")
         spark = (_spark_svg(t["spark"], t.get("spark_color", CYAN))
                  if t.get("spark") is not None else "")
+        sub = t.get("sub")
+        subhtml = (f'<div class="sub{" warn" if t.get("sub_warn") else ""}">'
+                   f'{_esc(sub)}</div>') if sub else ""
         cells.append(
             f'<div class="cc-stat"><div class="lbl">{t["label"]}</div>'
             f'<div class="valrow"><span class="val">{t["value"]}</span>{dhtml}</div>'
-            f'<div class="spark">{spark}</div></div>')
-    st.markdown(f'<div class="cc-stats">{"".join(cells)}</div>',
+            f'{subhtml}<div class="spark">{spark}</div></div>')
+    wide = " five" if len(tiles) >= 5 else ""
+    st.markdown(f'<div class="cc-stats{wide}">{"".join(cells)}</div>',
                 unsafe_allow_html=True)
 
 
-def footer(audience: str = "Prepared for leadership review"):
-    st.markdown(f"""
-<div class="cc-foot">
-  <span>WFM · Workforce Management</span>
-  <span class="line"></span>
-  <span>{audience}</span>
-</div>""", unsafe_allow_html=True)
+# `footer()` lived here until 2026-07-28. It signed each page off with
+# "Prepared for leadership review" — correct for the printed recommendation
+# brief this house style was ported from, wrong for a tool a planner works in
+# all day. Removed with its .cc-foot CSS rather than left dead.
 
 
 # ---------------------------------------------------------------- altair theme
