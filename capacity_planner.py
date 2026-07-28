@@ -1925,7 +1925,7 @@ def _feed_perf_line():
                            else f"{e['parse_s']:.1f}s"))
     if not bits:
         return None
-    return ("" + " · ".join(bits)
+    return (" · ".join(bits)
             + f" · boot load {perf.get('total_s', 0):.1f}s")
 
 

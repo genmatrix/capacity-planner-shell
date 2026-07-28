@@ -47,6 +47,17 @@ if defined NEEDS_INSTALL (
   copy /y requirements.txt "%VENVROOT%\requirements.installed" >nul
 )
 
+rem On a machine that has never run Streamlit, it asks for an email address in
+rem the console on first launch and waits. Planners double-clicking this would
+rem just see a stalled window. Seeding an empty credentials file skips it.
+rem (Done here, not via server.headless in config.toml — headless would also
+rem stop the browser opening by itself.)
+if not exist "%USERPROFILE%\.streamlit\credentials.toml" (
+  if not exist "%USERPROFILE%\.streamlit" mkdir "%USERPROFILE%\.streamlit"
+  > "%USERPROFILE%\.streamlit\credentials.toml" echo [general]
+  >>"%USERPROFILE%\.streamlit\credentials.toml" echo email = ""
+)
+
 "%PYEXE%" -m streamlit run capacity_planner.py
 popd
 pause

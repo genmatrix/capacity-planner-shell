@@ -4,6 +4,22 @@
 # name here on purpose — this file ships to the PUBLIC shell repo.
 # Keep in step with brand.py: this file drives Streamlit's native widget
 # chrome, brand.py drives everything the app draws itself.
+[server]
+# Loopback only. Streamlit's default is 0.0.0.0 — every interface — so each
+# planner's PC was serving the plan to anyone on the LAN who knew the port, and
+# tripping a Windows Firewall prompt on first launch. Nothing here needs to be
+# reachable off the machine: the browser is local, the SHARING happens through
+# the share's scenarios/ files, not over HTTP.
+# NB deliberately NOT server.headless — that would suppress the first-run email
+# prompt but ALSO stop the browser opening by itself, which TEAM_SETUP promises
+# and the double-click flow depends on. The launcher seeds credentials.toml
+# instead. The demo container overrides this with --server.address=0.0.0.0.
+address = "127.0.0.1"
+
+[browser]
+# Internal tool on a credit-union network — no usage telemetry off-site.
+gatherUsageStats = false
+
 [theme]
 base = "light"
 primaryColor = "#007c89"
