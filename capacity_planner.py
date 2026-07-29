@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from io import StringIO
@@ -2541,8 +2542,31 @@ if "lobs" not in st.session_state:
 # visiting Real Data must never be a per-session prerequisite (2026-07-15).
 autoload_feeds()
 
-PAGES = ["Executive View", "Capacity Plan", "Hiring Advisor",
-         "Budget", "Real Data", "ACD Shrinkage", "Guide"]
+ALL_PAGES = ["Executive View", "Capacity Plan", "Hiring Advisor",
+             "Budget", "Real Data", "ACD Shrinkage", "Guide"]
+
+# ---- Decommissioned pages: hidden from the product, kept in the code --------
+# Phased rollout (user decision 2026-07-29): show the plan first and land the
+# solver as a LATER delivery, rather than presenting everything at once.
+#
+# HIDE, never delete. `render_advisor_page`, `recommend_classes`,
+# `shortfall_windows` and `donor_after_pull` are untouched, so reviving the page
+# is emptying this set — nothing to rebuild, no migration.
+#
+# Hiding a page is not just dropping it from the nav. Anything that POINTS at it
+# has to go too, or the app grows exactly the dead surfaces this app is careful
+# not to have: Guide recipes whose "Go to" button targets a page that no longer
+# exists, a checklist telling you to open it, and the four sidebar cadence
+# controls that only `recommend_classes` ever reads. Each is gated below on this
+# same set — grep HIDDEN_PAGES to find every one.
+#
+# CP_SHOW_ALL_PAGES=1 unhides everything. `hiring_cadence_check.py` drives the
+# real page through the nav radio, and a hidden feature whose proof was deleted
+# is a feature that rots quietly until the day you try to bring it back.
+HIDDEN_PAGES = (frozenset() if os.environ.get("CP_SHOW_ALL_PAGES")
+                else frozenset({"Hiring Advisor"}))
+
+PAGES = [p for p in ALL_PAGES if p not in HIDDEN_PAGES]
 
 # Site masthead — wordmark, then nav, then content: traditional site order, and
 # it now renders on EVERY page (it used to live inside the Executive View, so
@@ -2852,49 +2876,55 @@ with st.sidebar:
                     "Transfer ramp — starting productivity %", 10.0, 100.0,
                     float(a.get("transfer_ramp_start_pct", 75.0)), 5.0, disabled=RO,
                     key=f"as_tramps_{view}")
-            a["class_gap_weeks"] = st.number_input(
-                "Hiring cadence — min weeks between class starts", 0, 13,
-                int(a.get("class_gap_weeks", 4) or 0), 1, disabled=RO,
-                key=f"as_cgap_{view}",
-                help="Trainer/facilitator reality: classes run in monthly-ish cohorts, "
-                     "not one every week. The Hiring Advisor spaces recommended class "
-                     "starts at least this far apart (per LOB — external-hire pipelines "
-                     "like Customer Support vs short internal ramp-ups differ) and sizes "
-                     "each class to carry every red week until the next slot can land "
-                     "grads. 0 = unconstrained.")
-            a["one_class_at_a_time"] = st.checkbox(
-                "Only one class in the pipeline at a time",
-                value=bool(a.get("one_class_at_a_time", False)), disabled=RO,
-                key=f"as_1caat_{view}",
-                help="Single training team: a new class cannot start until the "
-                     "previous one has fully graduated (training + nesting). Spaces "
-                     "recommended starts by the class's whole pipeline length — a "
-                     "longer curriculum automatically stretches the calendar. "
-                     "Combines with the min-weeks gap above (the stricter wins).")
-            a["class_min_size"] = st.number_input(
-                "Hiring cadence — min class size (seats)", 1, 50,
-                int(a.get("class_min_size", 1) or 1), 1, disabled=RO,
-                key=f"as_cmin_{view}",
-                help="Smallest cohort worth a facilitator and a classroom. Below this, "
-                     "the Hiring Advisor folds the need into the previous recommended "
-                     "class when the max allows; otherwise it reports the stretch for "
-                     "OT/interims and recommends a class only once the accumulated "
-                     "need justifies one. 1 = off. Per LOB — cross-training 1–2 agents "
-                     "pulled onto a specialty line is a normal 'class' there.\n\n"
-                     "⚠️ Set too high relative to *max class size*, this starves the "
-                     "plan: needs stay below the bar, nothing can fold, and the "
-                     "advisor reports a long run of below-minimum weeks instead of "
-                     "classes. That list is the signal to lower this, raise the max, "
-                     "or accept OT — never a hidden problem.")
-            a["class_max_size"] = st.number_input(
-                "Hiring cadence — max class size (seats)", 1, 100,
-                int(a.get("class_max_size", 12) or 12), 1, disabled=RO,
-                key=f"as_cmax_{view}",
-                help="Largest cohort one class can absorb (classroom seats / "
-                     "facilitator span — e.g. 20 on the external-hire line). The "
-                     "Hiring Advisor caps every recommended class here; a deeper "
-                     "need spills to the next calendar slot or is reported for "
-                     "OT/interims.")
+            # The four cadence controls exist ONLY for recommend_classes — nothing
+            # in compute_plan reads them. With the Hiring Advisor hidden they would
+            # be four knobs that visibly do nothing, which is the specific kind of
+            # dead surface this app is careful not to ship. Stored values are left
+            # untouched, so unhiding restores each planner's settings.
+            if "Hiring Advisor" not in HIDDEN_PAGES:
+                a["class_gap_weeks"] = st.number_input(
+                    "Hiring cadence — min weeks between class starts", 0, 13,
+                    int(a.get("class_gap_weeks", 4) or 0), 1, disabled=RO,
+                    key=f"as_cgap_{view}",
+                    help="Trainer/facilitator reality: classes run in monthly-ish cohorts, "
+                         "not one every week. The Hiring Advisor spaces recommended class "
+                         "starts at least this far apart (per LOB — external-hire pipelines "
+                         "like Customer Support vs short internal ramp-ups differ) and sizes "
+                         "each class to carry every red week until the next slot can land "
+                         "grads. 0 = unconstrained.")
+                a["one_class_at_a_time"] = st.checkbox(
+                    "Only one class in the pipeline at a time",
+                    value=bool(a.get("one_class_at_a_time", False)), disabled=RO,
+                    key=f"as_1caat_{view}",
+                    help="Single training team: a new class cannot start until the "
+                         "previous one has fully graduated (training + nesting). Spaces "
+                         "recommended starts by the class's whole pipeline length — a "
+                         "longer curriculum automatically stretches the calendar. "
+                         "Combines with the min-weeks gap above (the stricter wins).")
+                a["class_min_size"] = st.number_input(
+                    "Hiring cadence — min class size (seats)", 1, 50,
+                    int(a.get("class_min_size", 1) or 1), 1, disabled=RO,
+                    key=f"as_cmin_{view}",
+                    help="Smallest cohort worth a facilitator and a classroom. Below this, "
+                         "the Hiring Advisor folds the need into the previous recommended "
+                         "class when the max allows; otherwise it reports the stretch for "
+                         "OT/interims and recommends a class only once the accumulated "
+                         "need justifies one. 1 = off. Per LOB — cross-training 1–2 agents "
+                         "pulled onto a specialty line is a normal 'class' there.\n\n"
+                         "⚠️ Set too high relative to *max class size*, this starves the "
+                         "plan: needs stay below the bar, nothing can fold, and the "
+                         "advisor reports a long run of below-minimum weeks instead of "
+                         "classes. That list is the signal to lower this, raise the max, "
+                         "or accept OT — never a hidden problem.")
+                a["class_max_size"] = st.number_input(
+                    "Hiring cadence — max class size (seats)", 1, 100,
+                    int(a.get("class_max_size", 12) or 12), 1, disabled=RO,
+                    key=f"as_cmax_{view}",
+                    help="Largest cohort one class can absorb (classroom seats / "
+                         "facilitator span — e.g. 20 on the external-hire line). The "
+                         "Hiring Advisor caps every recommended class here; a deeper "
+                         "need spills to the next calendar slot or is reported for "
+                         "OT/interims.")
 
     render_publish_panel(mode)
 
@@ -3840,6 +3870,16 @@ RECIPE_PAGE = {
 }
 
 
+def visible_recipes():
+    """GUIDE_SECTIONS minus recipes whose page is hidden (see HIDDEN_PAGES).
+
+    A recipe for a decommissioned page is worse than no recipe: it walks the
+    planner through steps on a page they cannot open, and its deep-link button
+    would stage a `nav_page` value the radio has no option for."""
+    return [(t, md) for t, md in GUIDE_SECTIONS
+            if RECIPE_PAGE.get(t) not in HIDDEN_PAGES]
+
+
 def _goto(page: str, key: str):
     """Deep link — jump to the page the recipe is about. Stages the target; the
     top-of-script block applies it before the nav radio instantiates (writing a
@@ -3857,7 +3897,7 @@ def page_help(page: str):
     titles = PAGE_HELP.get(page, [])
     if not titles:
         return
-    by_title = dict(GUIDE_SECTIONS)
+    by_title = dict(visible_recipes())
     with st.expander("Help with this page"):
         for t in titles:
             if t in by_title:
@@ -3903,8 +3943,13 @@ def weekly_checklist():
         items.append(("⬜", "**No demand entered yet** — set Members (sidebar) and "
                             "CPM per LOB on Capacity Plan"))
     elif short:
+        # The fix used to be "see Hiring Advisor". With that page hidden the
+        # honest instruction is the one the planner can actually follow.
+        fix = ("— see Hiring Advisor for the fix"
+               if "Hiring Advisor" not in HIDDEN_PAGES
+               else "— add hiring classes or transfers on Capacity Plan")
         items.append(("⚠️", f"**{len(short)} LOB(s) run short**: {', '.join(short)} "
-                            "— see Hiring Advisor for the fix"))
+                            f"{fix}"))
     else:
         items.append(("✅", "Every LOB covered across the horizon"))
 
@@ -4344,7 +4389,7 @@ def render_guide_page():
     st.divider()
 
     st.subheader("Task recipes")
-    for i, (title, md) in enumerate(GUIDE_SECTIONS):
+    for i, (title, md) in enumerate(visible_recipes()):
         with st.expander(title):
             st.markdown(md)
             target = RECIPE_PAGE.get(title)
