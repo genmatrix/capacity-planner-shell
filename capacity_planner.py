@@ -3447,46 +3447,50 @@ def render_executive_view():
                    f"**v{ref['version']}**. Sparklines show the {len(weeks)}-week shape.")
 
     # ---- heatmap: who is short, and when ------------------------------
-    st.subheader("Net FTE heat — who & when")
-    hm_long = pd.concat([
-        pd.DataFrame({"Week": weeks, "LOB": l, "Net FTE": p["Net FTE"]})
-        for l, p in plans.items()])
-    brand.chart(
-        alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
-            x=alt.X("Week:O", sort=None, axis=_month_axis()),
-            y=alt.Y("LOB:N", sort=lobs, title=None),
-            color=alt.Color("Net FTE:Q",
-                            scale=alt.Scale(domainMid=0,
-                                            range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
-                            legend=alt.Legend(title="Net FTE")),
-            tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f")]),
-        height=32 * len(lobs) + 60)
+    with brand.section("heat", "Net FTE heat — who & when"):
+        hm_long = pd.concat([
+            pd.DataFrame({"Week": weeks, "LOB": l, "Net FTE": p["Net FTE"]})
+            for l, p in plans.items()])
+        brand.chart(
+            alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
+                x=alt.X("Week:O", sort=None, axis=_month_axis()),
+                y=alt.Y("LOB:N", sort=lobs, title=None),
+                color=alt.Color("Net FTE:Q",
+                                scale=alt.Scale(domainMid=0,
+                                                range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
+                                legend=alt.Legend(title="Net FTE")),
+                tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f")]),
+            height=32 * len(lobs) + 60)
 
     # ---- demand vs supply walk ----------------------------------------
-    st.subheader("Demand vs. supply — consolidated")
-    ln = pd.DataFrame({"Week": weeks, "Required": cons_req, "Staffed": cons_stf}) \
-        .melt("Week", var_name="Series", value_name="FTE")
-    ln_chart = alt.Chart(ln).mark_line(strokeWidth=2.5).encode(
-        x=alt.X("Week:O", sort=None, axis=_month_axis()),
-        y=alt.Y("FTE:Q", title="FTE"),
-        color=alt.Color("Series:N",
-                        scale=alt.Scale(domain=["Required", "Staffed"],
-                                        range=[brand.DEMAND, brand.SUPPLY]),
-                        legend=alt.Legend(title=None, orient="top")),
-        tooltip=["Week", "Series", alt.Tooltip("FTE:Q", format=".1f")])
-    _tr = _today_rule(weeks)
-    brand.chart(ln_chart + _tr if _tr is not None else ln_chart, height=240)
-    nf = pd.DataFrame({"Week": weeks, "Net": cons_net})
-    nf_chart = alt.Chart(nf).mark_bar(opacity=.85, cornerRadius=2).encode(
-        x=alt.X("Week:O", sort=None, axis=_month_axis()),
-        y=alt.Y("Net:Q", title="Net FTE"),
-        color=alt.condition(alt.datum.Net < 0,
-                            alt.value(brand.PINK), alt.value(brand.GREEN)),
-        tooltip=["Week", alt.Tooltip("Net:Q", format="+.1f")])
-    brand.chart(nf_chart + _tr if _tr is not None else nf_chart, height=140)
+    with brand.section("walk", "Demand vs. supply — consolidated"):
+        ln = pd.DataFrame({"Week": weeks, "Required": cons_req, "Staffed": cons_stf}) \
+            .melt("Week", var_name="Series", value_name="FTE")
+        ln_chart = alt.Chart(ln).mark_line(strokeWidth=2.5).encode(
+            x=alt.X("Week:O", sort=None, axis=_month_axis()),
+            y=alt.Y("FTE:Q", title="FTE"),
+            color=alt.Color("Series:N",
+                            scale=alt.Scale(domain=["Required", "Staffed"],
+                                            range=[brand.DEMAND, brand.SUPPLY]),
+                            legend=alt.Legend(title=None, orient="top")),
+            tooltip=["Week", "Series", alt.Tooltip("FTE:Q", format=".1f")])
+        _tr = _today_rule(weeks)
+        brand.chart(ln_chart + _tr if _tr is not None else ln_chart, height=240)
+        nf = pd.DataFrame({"Week": weeks, "Net": cons_net})
+        nf_chart = alt.Chart(nf).mark_bar(opacity=.85, cornerRadius=2).encode(
+            x=alt.X("Week:O", sort=None, axis=_month_axis()),
+            y=alt.Y("Net:Q", title="Net FTE"),
+            color=alt.condition(alt.datum.Net < 0,
+                                alt.value(brand.PINK), alt.value(brand.GREEN)),
+            tooltip=["Week", alt.Tooltip("Net:Q", format="+.1f")])
+        brand.chart(nf_chart + _tr if _tr is not None else nf_chart, height=140)
 
     # ---- per-LOB health cards -----------------------------------------
-    st.subheader("LOB health")
+    # A label, not a card: lob_card() draws its own, and a card of cards reads
+    # as a mistake. Micro-label so it sits at the same level as the section
+    # titles around it.
+    st.markdown('<div class="cc-sec-ttl" style="margin:2px 0 8px">LOB health</div>',
+                unsafe_allow_html=True)
     cols = st.columns(3)
     for i, (l, p) in enumerate(plans.items()):
         req, net = p["Required FTE"], p["Net FTE"]
@@ -3515,80 +3519,80 @@ def render_executive_view():
                            pill, tone, body, brand.accent_for(i))
 
     # ---- supply engine: is hiring keeping up with attrition? ----------
-    st.subheader("Supply engine — attrition out vs. new-hire grads in")
-    sup = pd.DataFrame({
-        "Week": weeks,
-        "NH Grads": sum(p["NH Grads"].to_numpy() for p in plans.values()),
-        "Attrition": -sum(p["Attrition"].to_numpy() for p in plans.values()),
-    }).melt("Week", var_name="Flow", value_name="FTE")
-    sup_chart = alt.Chart(sup).mark_bar(opacity=.9, cornerRadius=2).encode(
-        x=alt.X("Week:O", sort=None, axis=_month_axis()),
-        y=alt.Y("FTE:Q", title="FTE / week"),
-        color=alt.Color("Flow:N",
-                        scale=alt.Scale(domain=["NH Grads", "Attrition"],
-                                        range=[brand.COVERED, brand.SHORT]),
-                        legend=alt.Legend(title=None, orient="top")),
-        tooltip=["Week", "Flow", alt.Tooltip("FTE:Q", format="+.2f")])
-    brand.chart(sup_chart + _tr if _tr is not None else sup_chart, height=180)
+    with brand.section("supply", "Supply engine — attrition out vs. new-hire grads in"):
+        sup = pd.DataFrame({
+            "Week": weeks,
+            "NH Grads": sum(p["NH Grads"].to_numpy() for p in plans.values()),
+            "Attrition": -sum(p["Attrition"].to_numpy() for p in plans.values()),
+        }).melt("Week", var_name="Flow", value_name="FTE")
+        sup_chart = alt.Chart(sup).mark_bar(opacity=.9, cornerRadius=2).encode(
+            x=alt.X("Week:O", sort=None, axis=_month_axis()),
+            y=alt.Y("FTE:Q", title="FTE / week"),
+            color=alt.Color("Flow:N",
+                            scale=alt.Scale(domain=["NH Grads", "Attrition"],
+                                            range=[brand.COVERED, brand.SHORT]),
+                            legend=alt.Legend(title=None, orient="top")),
+            tooltip=["Week", "Flow", alt.Tooltip("FTE:Q", format="+.2f")])
+        brand.chart(sup_chart + _tr if _tr is not None else sup_chart, height=180)
 
     # ---- service actuals vs forecast (WFM) --------------------------
     vw = st.session_state.get("wfm_weekly")
     if vw is not None and not vw.empty and "Actual SL %" in vw.columns:
-        st.subheader("Service level & AHT — actuals vs. WFM forecast")
-        svc_rows = []
-        for l, g in vw.groupby("LOB"):
-            def wavg(col, wcol):
-                v, w = g[col], g[wcol].fillna(0)
-                m = v.notna() & (w > 0)
-                return float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else np.nan
-            svc_rows.append({
-                "LOB": l,
-                # min_count=1 + float: an all-missing week must SHOW missing
-                # (int(sum()) re-zeroed it — audit#2 2026-07-14; int(NaN) would crash)
-                "Contacts (act)": float(g["Actual Contacts"].sum(min_count=1)),
-                "SL% Target": wavg("SL Target %", "Actual Contacts")
-                              if "SL Target %" in g else np.nan,
-                "SL% Fcst": wavg("Forecast SL %", "Forecast Contacts"),
-                "SL% Actual": wavg("Actual SL %", "Actual Contacts"),
-                "AHT Fcst (sec)": wavg("Forecast AHT (sec)", "Forecast Contacts"),
-                "AHT Actual (sec)": wavg("Actual AHT (sec)", "Actual Contacts"),
-            })
-        svc = pd.DataFrame(svc_rows).set_index("LOB")
-        svc["SL Δ"] = svc["SL% Actual"] - svc["SL% Fcst"]
-        svc["AHT Δ"] = svc["AHT Actual (sec)"] - svc["AHT Fcst (sec)"]
-        svc = svc[["Contacts (act)", "SL% Target", "SL% Fcst", "SL% Actual", "SL Δ",
-                   "AHT Fcst (sec)", "AHT Actual (sec)", "AHT Δ"]]
+        with brand.section("svc", "Service level & AHT — actuals vs. WFM forecast"):
+            svc_rows = []
+            for l, g in vw.groupby("LOB"):
+                def wavg(col, wcol):
+                    v, w = g[col], g[wcol].fillna(0)
+                    m = v.notna() & (w > 0)
+                    return float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else np.nan
+                svc_rows.append({
+                    "LOB": l,
+                    # min_count=1 + float: an all-missing week must SHOW missing
+                    # (int(sum()) re-zeroed it — audit#2 2026-07-14; int(NaN) would crash)
+                    "Contacts (act)": float(g["Actual Contacts"].sum(min_count=1)),
+                    "SL% Target": wavg("SL Target %", "Actual Contacts")
+                                  if "SL Target %" in g else np.nan,
+                    "SL% Fcst": wavg("Forecast SL %", "Forecast Contacts"),
+                    "SL% Actual": wavg("Actual SL %", "Actual Contacts"),
+                    "AHT Fcst (sec)": wavg("Forecast AHT (sec)", "Forecast Contacts"),
+                    "AHT Actual (sec)": wavg("Actual AHT (sec)", "Actual Contacts"),
+                })
+            svc = pd.DataFrame(svc_rows).set_index("LOB")
+            svc["SL Δ"] = svc["SL% Actual"] - svc["SL% Fcst"]
+            svc["AHT Δ"] = svc["AHT Actual (sec)"] - svc["AHT Fcst (sec)"]
+            svc = svc[["Contacts (act)", "SL% Target", "SL% Fcst", "SL% Actual", "SL Δ",
+                       "AHT Fcst (sec)", "AHT Actual (sec)", "AHT Δ"]]
 
-        def shade_delta(col):
-            if col.name == "SL% Actual":       # judged against the queue's target
-                tgt = svc["SL% Target"]
-                return ["" if (pd.isna(v) or pd.isna(t))
-                        else f"color:{brand.PINK}" if v < t
-                        else f"color:{brand.GREEN}" for v, t in zip(col, tgt)]
-            if col.name not in ("SL Δ", "AHT Δ"):
-                return [""] * len(col)
-            bad_if_pos = col.name == "AHT Δ"   # heavier-than-forecast AHT is bad
-            return ["" if pd.isna(v)
-                    else f"color:{brand.PINK}" if (v > 0) == bad_if_pos
-                    else f"color:{brand.GREEN}" for v in col]
+            def shade_delta(col):
+                if col.name == "SL% Actual":       # judged against the queue's target
+                    tgt = svc["SL% Target"]
+                    return ["" if (pd.isna(v) or pd.isna(t))
+                            else f"color:{brand.PINK}" if v < t
+                            else f"color:{brand.GREEN}" for v, t in zip(col, tgt)]
+                if col.name not in ("SL Δ", "AHT Δ"):
+                    return [""] * len(col)
+                bad_if_pos = col.name == "AHT Δ"   # heavier-than-forecast AHT is bad
+                return ["" if pd.isna(v)
+                        else f"color:{brand.PINK}" if (v > 0) == bad_if_pos
+                        else f"color:{brand.GREEN}" for v in col]
 
-        st.dataframe(svc.style.apply(shade_delta, axis=0)
-                     .format("{:,.1f}", na_rep="—")
-                     .format("{:,.0f}", subset=["Contacts (act)"], na_rep="—"),
-                     width="stretch")
-        if "Days Covered" in vw:   # full = the queue's MODAL norm, never 7
-            _n = (vw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
-                  - _holiday_allowance(vw["Week"]))
-            partial = int((vw["Days Covered"] < _n).sum())
-        else:
-            partial = 0
-        cap = (f"Contact-weighted across {vw['Week'].nunique()} loaded WFM week(s). "
-               "SL% = calls answered within threshold ÷ offered (WFM PCA); "
-               "AHT includes hold time.")
-        if partial:
-            cap += (f" ⚠️ {partial} LOB-week(s) cover fewer days than their "
-                    "queue's normal week — treat these figures as directional.")
-        st.caption(cap)
+            st.dataframe(svc.style.apply(shade_delta, axis=0)
+                         .format("{:,.1f}", na_rep="—")
+                         .format("{:,.0f}", subset=["Contacts (act)"], na_rep="—"),
+                         width="stretch")
+            if "Days Covered" in vw:   # full = the queue's MODAL norm, never 7
+                _n = (vw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
+                      - _holiday_allowance(vw["Week"]))
+                partial = int((vw["Days Covered"] < _n).sum())
+            else:
+                partial = 0
+            cap = (f"Contact-weighted across {vw['Week'].nunique()} loaded WFM week(s). "
+                   "SL% = calls answered within threshold ÷ offered (WFM PCA); "
+                   "AHT includes hold time.")
+            if partial:
+                cap += (f" ⚠️ {partial} LOB-week(s) cover fewer days than their "
+                        "queue's normal week — treat these figures as directional.")
+            st.caption(cap)
 
     # ---- data health band ---------------------------------------------
     vw, sw = st.session_state.get("wfm_weekly"), st.session_state.get("acd_weekly")
