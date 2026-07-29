@@ -1,6 +1,21 @@
-streamlit==1.59.1
+# The stack the app is VERIFIED green on — not the newest available.
+#
+# Every version here has been run through the full check suite on BOTH
+# (comment redacted — described the development environment)
+# (comment redacted — described the development environment)
+#
+# numpy sets the floor: 2.5.x publishes no cp311 wheel, so pinning it made a
+# 3.11 install impossible — `pip install -r` failed before it ever reached the
+# app. 2.4.6 is the newest numpy with a cp311 build.
+#
+# Pin what you have actually tested. This file previously carried
+# streamlit 1.59.1 / numpy 2.5.1 / altair 6.2.2 / pyarrow 25.0.0, none of which
+# (comment redacted — described the development environment)
+# (comment redacted — described the development environment)
+# version here that nothing verified is a version nobody tested.
+streamlit==1.57.0
 pandas==3.0.3
-numpy==2.5.1
-altair==6.2.2
+numpy==2.4.6
+altair==6.1.0
 openpyxl==3.1.5
-pyarrow==25.0.0
+pyarrow==24.0.0

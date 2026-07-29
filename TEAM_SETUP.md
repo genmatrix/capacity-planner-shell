@@ -8,7 +8,10 @@ automatically by the launcher.
 
 ## One-time, per person
 
-1. **Install Python (3.14 recommended; 3.12 or 3.13 also fine — NOT 3.11)** — Software Center if IT offers it, else python.org. (The pinned numpy no longer supports 3.11.)
+1. **Install Python — 3.11.4 or newer** (3.11, 3.12, 3.13 and 3.14 all work) —
+   Software Center if IT offers it, else python.org. Whatever your IT has
+   approved is fine; **3.11.4 is verified**, so there is no need to chase a
+   newer version through an approval process.
    On the installer's first screen, **tick "Add python.exe to PATH"**, then use
    the default install (per-user — needs **no admin rights**, and it includes
    the `py` launcher our start script relies on). The PATH tick isn't required
@@ -28,14 +31,18 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
   pip-installs straight from `requirements.txt`.
 - **Without internet** (no firewall exception needed by ANYONE): the launcher
   installs from the share's `wheels\` folder — fully offline. **This folder
-  ships pre-populated** with Windows wheels for **Python 3.12–3.14**
-  (~250 MB), so install any of those versions and it just works.
-  **Recommended: 3.14** — it matches the development environment exactly;
-  standardize the whole team on one version either way.
+  ships pre-populated** with Windows wheels for **Python 3.11–3.14**
+  (~330 MB), so install any of those versions and it just works.
+  Standardize the whole team on ONE version — mixed versions mean the
+  `wheels\` folder has to carry every one of them.
   To refresh it later (e.g. after requirements.txt changes), from any machine
   with internet — Windows or Mac — run per Python version in use:
 
-      python3 -m pip download -r requirements.txt -d wheels --platform win_amd64 --python-version 312 --only-binary=:all:
+      python3 -m pip download -r requirements.txt -d wheels --platform win_amd64 --python-version 311 --only-binary=:all:
+
+  Change `311` to match the Python your team installed. If that command can't
+  find a wheel, the pinned version has no build for that Python — the answer is
+  to adjust the pin, never to install a different Python than IT approved.
 
 ## Updates
 
