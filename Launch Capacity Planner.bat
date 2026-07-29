@@ -36,12 +36,20 @@ if defined NEEDS_INSTALL (
   if exist wheels (
     rem Offline install from the share's wheels\ folder — no internet needed.
     "%PYEXE%" -m pip install --no-index --find-links wheels -r requirements.txt
+    rem ...but a wheels\ folder missing THIS Python's wheels was fatal even on a
+    rem machine with internet, because --no-index cannot reach PyPI to fill the
+    rem gap. Our machines DO have PyPI access, so fall back instead of failing.
+    if errorlevel 1 (
+      echo Offline wheels do not cover this Python version — trying PyPI...
+      "%PYEXE%" -m pip install -r requirements.txt
+    )
   ) else (
     "%PYEXE%" -m pip install -r requirements.txt
   )
   if errorlevel 1 (
     echo Package install failed. If this machine has no internet access,
-    echo ask for the wheels\ folder to be populated ^(see TEAM_SETUP.md^).
+    echo ask for the wheels\ folder to be populated for your Python version
+    echo ^(see TEAM_SETUP.md^).
     pause & exit /b 1
   )
   copy /y requirements.txt "%VENVROOT%\requirements.installed" >nul

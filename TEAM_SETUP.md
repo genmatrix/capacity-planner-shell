@@ -29,20 +29,25 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
 
 - **With internet/proxy access to PyPI** (the firewall ticket): the launcher
   pip-installs straight from `requirements.txt`.
-- **Without internet** (no firewall exception needed by ANYONE): the launcher
-  installs from the share's `wheels\` folder — fully offline. **This folder
-  ships pre-populated** with Windows wheels for **Python 3.11–3.14**
-  (~330 MB), so install any of those versions and it just works.
-  Standardize the whole team on ONE version — mixed versions mean the
-  `wheels\` folder has to carry every one of them.
-  To refresh it later (e.g. after requirements.txt changes), from any machine
-  with internet — Windows or Mac — run per Python version in use:
+  **This is the mode our machines use** — they reach PyPI, so nothing else is
+  needed and there is no `wheels\` folder on the share.
+- **Without internet** — only if that ever changes: put a `wheels\` folder next
+  to the app and the launcher installs from it instead. It is **not** part of
+  the download; you build it yourself, from any machine with internet:
 
       python3 -m pip download -r requirements.txt -d wheels --platform win_amd64 --python-version 311 --only-binary=:all:
 
-  Change `311` to match the Python your team installed. If that command can't
-  find a wheel, the pinned version has no build for that Python — the answer is
-  to adjust the pin, never to install a different Python than IT approved.
+  Change `311` to match the Python the team installed, and re-run it whenever
+  `requirements.txt` changes. If it can't find a wheel, the pinned version has
+  no build for that Python — adjust the pin, never install a Python IT hasn't
+  approved.
+
+  ⚠️ **A `wheels\` folder that exists but is missing your Python's wheels breaks
+  the launch even on a machine with internet**: the offline branch runs pip with
+  `--no-index`, so it cannot reach PyPI to fill the gap. Either keep the folder
+  complete for the version everyone runs, or don't have one. Standardize the
+  team on ONE Python version — a mixed team means the folder must carry every
+  version in use.
 
 ## Updates
 
