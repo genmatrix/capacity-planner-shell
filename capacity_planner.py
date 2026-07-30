@@ -765,13 +765,21 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                    else np.full(n, np.nan))
     attr_actual = np.where(_weeks_passed(weeks) & np.isnan(attr_actual),
                            0.0, attr_actual)
+    # Roster columns are planner-typed: a cell left blank is "none", not
+    # "unknown". Transfers has always been coerced this way; LOA and the walk's
+    # own transfer read were not, so ONE blank LOA cell produced a NaN week in
+    # Staffed FTE (field report 2026-07-30). Same rule as the half-typed
+    # new-hire rows: never read a grid cell raw.
+    loa_arr = pd.to_numeric(roster["LOA"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    xfer_arr = pd.to_numeric(roster["Transfers +/-"], errors="coerce") \
+                 .fillna(0).to_numpy(dtype=float)
     hc = np.zeros(n)
     attrition = np.zeros(n)
-    prev = a["starting_hc"]
+    prev = float(a["starting_hc"] or 0)
     for i in range(n):
         attrition[i] = (float(attr_actual[i]) if not np.isnan(attr_actual[i])
                         else prev * wk_attr_rate)
-        prev = prev - attrition[i] + float(roster["Transfers +/-"].iloc[i]) + adds[i]
+        prev = prev - attrition[i] + xfer_arr[i] + adds[i]
         hc[i] = prev
 
     # NH ramp: grads count as bodies (hc, attrition) but deliver partial FTE
@@ -800,8 +808,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     t_ramp_w = int(a.get("transfer_ramp_weeks", 2) or 0)
     t_start = float(a.get("transfer_ramp_start_pct", 75.0))
     if t_ramp_w > 0:
-        tr_arr = pd.to_numeric(roster["Transfers +/-"], errors="coerce") \
-                   .fillna(0).to_numpy(dtype=float)
+        tr_arr = xfer_arr
         out_bal = 0.0
         for j in range(n):
             if tr_arr[j] < 0:
@@ -812,7 +819,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                 if fresh > 0:
                     _ramp_cohort(j, fresh, t_ramp_w, t_start)
 
-    staffed = hc - roster["LOA"].to_numpy() - ramp_discount
+    staffed = hc - loa_arr - ramp_discount
     net = staffed - required_fte
     capacity_calls = staffed * prod_hrs_per_fte * 3600 / d["AHT (sec)"]
 
@@ -856,7 +863,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Attrition (actual)": np.round(attr_actual, 2),   # blank where modelled
             "NH Grads": adds.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
-            "LOA": roster["LOA"].to_numpy(),
+            "LOA": loa_arr,
             "Staffed FTE": staffed.round(1),
             "Net FTE": net.round(1),
             "Volume Capacity": capacity_calls.round(0),
@@ -3637,11 +3644,31 @@ def render_executive_view():
     d2 = _delta(float(cons_stf.mean()), ref and ref["avg_stf"], "up")
     d3 = _delta(coverage, ref and ref["coverage"], "up", "{:+.0f}pt")
     d4 = _delta(float(weeks_under), ref and ref["weeks_short"], "down", "{:+.0f}")
+    # These are numpy sums across LOBs, and numpy's mean does NOT skip NaN — so
+    # ONE missing week in ONE line blanks an org-wide tile while that line's own
+    # page still reads fine (pandas .mean() skips). The blank-cell sources are
+    # coerced at the walk now; this keeps a future one from printing the literal
+    # string "nan" at a planner, without hiding it either: the tile says how
+    # many weeks are missing.
+    def _stat(arr, fmt="{:.1f}"):
+        a = np.asarray(arr, dtype=float)
+        bad = int(np.isnan(a).sum())
+        if bad == len(a):
+            return "—", "no weeks with data", True
+        if bad:
+            return (fmt.format(np.nanmean(a)),
+                    f"{bad} week(s) missing — excluded", True)
+        return fmt.format(a.mean()), "", False
+
+    _sv_req, _sub_req, _w_req = _stat(cons_req)
+    _sv_stf, _sub_stf, _w_stf = _stat(cons_stf)
     brand.stat_row([
-        {"label": "Avg Required", "value": f"{cons_req.mean():.1f}",
+        {"label": "Avg Required", "value": _sv_req,
+         "sub": _sub_req, "sub_warn": _w_req,
          "delta": d1[0], "delta_tone": d1[1],
          "spark": list(cons_req), "spark_color": brand.VIOLET},
-        {"label": "Avg Staffed", "value": f"{cons_stf.mean():.1f}",
+        {"label": "Avg Staffed", "value": _sv_stf,
+         "sub": _sub_stf, "sub_warn": _w_stf,
          "delta": d2[0], "delta_tone": d2[1],
          "spark": list(cons_stf), "spark_color": brand.CYAN},
         {"label": "Coverage", "value": f"{coverage:.0f}%",
