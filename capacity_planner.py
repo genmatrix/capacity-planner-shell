@@ -2263,9 +2263,29 @@ def render_real_data_page():
     # 3 — Combined benchmark ---------------------------------------------
     st.subheader("3 · Demand vs. actual staffing")
     if vw is not None and sw is not None:
-        comb = vw.merge(sw, on=["LOB", "Week", "Days Covered"], how="outer")
+        # Join on LOB + Week ONLY. "Days Covered" used to be a join key too,
+        # which assumed both feeds always cover the same days of a week. They
+        # are different systems with independently-computed coverage, so the
+        # moment one exported 6 days and the other 5, the key missed and the
+        # OUTER join emitted TWO rows for that LOB+week — one carrying
+        # contacts, one carrying staffed FTE, on separate lines with different
+        # Days Covered (reported from the field 2026-07-30).
+        comb = vw.merge(sw, on=["LOB", "Week"], how="outer",
+                        suffixes=("", " · staffing feed"))
+        _dc_b = "Days Covered · staffing feed"
+        if _dc_b in comb.columns:
+            _a = pd.to_numeric(comb["Days Covered"], errors="coerce")
+            _b = pd.to_numeric(comb[_dc_b], errors="coerce")
+            # A week is only as complete as the THINNER feed: taking the larger
+            # would let a week read "full" while half its staffing is missing.
+            comb["Days Covered"] = np.fmin(_a.fillna(_b), _b.fillna(_a))
+            _mismatch = int(((_a.notna() & _b.notna()) & (_a != _b)).sum())
+            comb = comb.drop(columns=[_dc_b])
+        else:
+            _mismatch = 0
     else:
         comb = vw if vw is not None else sw
+        _mismatch = 0
     if comb is None or comb.empty:
         st.warning("No rows to show after mapping.")
         return
@@ -2277,9 +2297,20 @@ def render_real_data_page():
         st.warning(
             "⚠️ Some weeks are **truncated** — fewer days than that queue normally "
             "operates (see *Days Covered*; a 5-day queue's complete week is 5). "
-            "Totals for those weeks reflect only the days present. Comparisons "
-            "*within* a week (WFM vs. actual) are still valid because both "
-            "use the same days.")
+            "Totals for those weeks reflect only the days present.")
+
+    # The old caption promised that within-week comparisons were always valid
+    # "because both use the same days". That was only true while Days Covered
+    # was a join key — which is what produced the duplicate rows. Say when it
+    # actually holds, and name the weeks where it does not.
+    if _mismatch:
+        st.warning(
+            f"⚠️ {_mismatch} week(s) have **different coverage in the two feeds** "
+            "— the demand export and the staffing export span a different number "
+            "of days. *Days Covered* shows the thinner of the two, and for those "
+            "weeks a within-week comparison (required vs. staffed) is not "
+            "like-for-like: one side counts a day the other is missing. Re-export "
+            "the shorter feed for those weeks before drawing conclusions.")
 
     if vw is not None:
         pick = st.radio(
