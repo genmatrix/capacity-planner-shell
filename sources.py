@@ -91,18 +91,46 @@ def load_mapping(file, field_map: dict | None = None
                          + ", ".join(f"{field_label(c)} ← {resolved[c]}"
                                      for c in auto))
 
+    # A split or queue may name exactly ONE line of business. These are plain
+    # dicts, so a key repeated on two rows with DIFFERENT LOBs used to let the
+    # last row win silently — every one of that split's contacts landed under
+    # one LOB and the other looked short, with nothing said. Reported from the
+    # field 2026-07-30 against a mapping carrying both "<group>" and
+    # "<group> (NH)". Splitting a new-hire queue out of its parent group is
+    # exactly when this happens, and it is invisible in the totals.
+    #
+    # A key repeated with the SAME LOB is fine and common (one queue listed on
+    # several rows) — only a genuine conflict is worth a warning.
     split_to_lob, queue_to_lob = {}, {}
+    conflicts: dict[str, set] = {}
+
+    def _claim(store, key, lob, label):
+        prev = store.get(key)
+        if prev is not None and prev != lob:
+            conflicts.setdefault(f"{label} {key!r}", {prev}).add(lob)
+        store[key] = lob
+
     for _, r in m.iterrows():
         lob = str(r["Line_of_Business"]).strip()
         if not lob or lob.lower() == "nan":
             continue
         if pd.notna(r["Skill_ID"]):
             try:
-                split_to_lob[int(r["Skill_ID"])] = lob
+                _claim(split_to_lob, int(r["Skill_ID"]), lob, "Split")
             except (TypeError, ValueError):
                 pass
         if pd.notna(r["Queue_Name"]) and str(r["Queue_Name"]).strip():
-            queue_to_lob[str(r["Queue_Name"]).strip()] = lob
+            _claim(queue_to_lob, str(r["Queue_Name"]).strip(), lob, "Queue")
+
+    if conflicts:
+        rep.warnings.append(
+            f"{len(conflicts)} split/queue key(s) are mapped to MORE THAN ONE "
+            "line of business — the last row in the file wins, so those "
+            "contacts all land under one LOB and the other reads short. Fix "
+            "the mapping file: "
+            + "; ".join(f"{k} → {' / '.join(sorted(v))}"
+                        for k, v in sorted(conflicts.items())[:8])
+            + ("; …" if len(conflicts) > 8 else ""))
 
     lobs = sorted(set(split_to_lob.values()) | set(queue_to_lob.values()))
     if not lobs:
