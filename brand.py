@@ -232,7 +232,21 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
   box-shadow: 0 1px 2px rgba(25,40,56,.05);
 }}
 .st-key-ccnav [role="radiogroup"] {{ gap: 2px; flex-wrap: wrap; }}
-.st-key-ccnav [role="radiogroup"] label > div:first-child {{ display: none; }}
+/* Hide the radio circle. BaseWeb draws it as RadioMarkOuter/RadioMarkInner
+   with emotion-generated class names — no testid, no data-baseweb attribute —
+   so there is nothing stable to target and position is the only handle.
+   `:first-child` alone was too literal: it matches only when the mark div is
+   the FIRST node in the label, so a build that emits the hidden <input> before
+   it matches nothing and the circle appears (2026-07-30: circles visible in
+   Edge on one setup, absent in Safari on another). `:first-of-type`
+   means "first div among the divs" and does not care where the input sits.
+   Both are kept: whichever does not apply is a harmless no-op, and the text
+   lives in a LATER div either way, so neither can hide the label. */
+.st-key-ccnav [role="radiogroup"] label > div:first-child,
+.st-key-ccnav [role="radiogroup"] label > div:first-of-type {{ display: none; }}
+/* The input is already visually hidden by BaseWeb; belt and braces in case a
+   future build stops doing that and leaves a native control in the bar. */
+.st-key-ccnav [role="radiogroup"] label > input[type="radio"] {{ display: none; }}
 .st-key-ccnav [role="radiogroup"] label {{
   padding: 7px 14px; margin: 0; border-radius: 7px 7px 0 0;
   border-bottom: 2px solid transparent; transition: background .12s ease;
