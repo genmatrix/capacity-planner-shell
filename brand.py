@@ -483,6 +483,54 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
   background: #00646e; border-color: #00646e; color: {SURFACE};
 }}
 
+/* ------- input fields have to LOOK like fields -------
+   config.toml sets secondaryBackgroundColor to #ffffff, which is also the card
+   ground — so a number or text input sitting in a section card was white on
+   white, with nothing but Streamlit's hairline to say it was editable. The
+   week-of-month seasonality row read as five loose numbers and no hit target.
+
+   Fill with the PAGE ground instead: on a white card the field reads as a well
+   you can click into, and on the grey page ground the 1px border still defines
+   it. Focus borrows the buttons' teal so "this is live" is one language.
+
+   Explicit testids, not `data-baseweb` — Streamlit 1.57 stopped emitting that
+   attribute (grepping the bundle for it returns nothing), while
+   stNumberInputContainer / stTextInputRootElement / stTextAreaRootElement are
+   right there. !important is unavoidable: BaseWeb's emotion classes carry
+   higher specificity than anything injectable from here. */
+[data-testid="stNumberInputContainer"],
+[data-testid="stTextInputRootElement"],
+[data-testid="stTextAreaRootElement"],
+[data-testid="stDateInputField"],
+[data-testid="stSelectbox"] > div,
+[data-testid="stMultiSelect"] > div {{
+  background: {BG} !important;
+  border: 1px solid {BORDER} !important;
+  border-radius: 8px !important;
+}}
+[data-testid="stNumberInputContainer"]:focus-within,
+[data-testid="stTextInputRootElement"]:focus-within,
+[data-testid="stTextAreaRootElement"]:focus-within,
+[data-testid="stDateInputField"]:focus-within,
+[data-testid="stSelectbox"] > div:focus-within,
+[data-testid="stMultiSelect"] > div:focus-within {{
+  border-color: {TEAL} !important;
+  box-shadow: 0 0 0 3px {TEAL_BG} !important;
+}}
+/* the actual <input> must not paint its own white back over the well */
+[data-testid="stNumberInputField"],
+[data-testid="stTextInputRootElement"] input,
+[data-testid="stTextAreaRootElement"] textarea {{
+  background: transparent !important;
+}}
+/* steppers are actions: teal, and only obviously so on hover */
+[data-testid="stNumberInputStepUp"],
+[data-testid="stNumberInputStepDown"] {{
+  color: {TEAL} !important; background: transparent !important;
+}}
+[data-testid="stNumberInputStepUp"]:hover,
+[data-testid="stNumberInputStepDown"]:hover {{ background: {TEAL_BG} !important; }}
+
 /* ------- section cards -------
    st.container(key="ccsec_...") becomes a bordered card, so a grid and the
    note that explains it read as one object instead of loose page furniture.

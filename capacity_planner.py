@@ -124,8 +124,31 @@ def _apply_payload(p: dict):
             st.session_state.members_end = float(m.iloc[-1])
 
 
-def _draft_path() -> Path:
-    return SCENARIO_DIR / "drafts" / f"{st.session_state.user}.json"
+def _plan_year() -> int:
+    """The plan year this session is working in.
+
+    Every pointer and lock is scoped to a year (collab.active_path /
+    lock_path), so this is what all collab calls must be given. Defaults
+    defensively: the draft helpers run before init_state has necessarily
+    written plan_year."""
+    return int(st.session_state.get("plan_year", DEFAULT_PLAN_YEAR))
+
+
+def _draft_path(year=None) -> Path:
+    y = _plan_year() if year is None else int(year)
+    return SCENARIO_DIR / "drafts" / f"{st.session_state.user}-{y}.json"
+
+
+def _live_draft_path() -> Path:
+    """The draft file to READ. Falls back to the pre-per-year name (no year
+    suffix) for the legacy year, so the first launch after the update still
+    offers a resume instead of silently abandoning someone's work."""
+    p = _draft_path()
+    if not p.exists() and _plan_year() == DEFAULT_PLAN_YEAR:
+        legacy = SCENARIO_DIR / "drafts" / f"{st.session_state.user}.json"
+        if legacy.exists():
+            return legacy
+    return p
 
 
 def _autosave_draft():
@@ -158,7 +181,8 @@ def _startup_draft_check():
     plan, offer Resume/Discard (sidebar banner). A draft matching the loaded
     plan means everything was published — silently clean it up."""
     try:
-        d = json.loads(_draft_path().read_text(encoding="utf-8"))
+        src = _live_draft_path()
+        d = json.loads(src.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
     payload = d.get("payload", {})
@@ -167,7 +191,7 @@ def _startup_draft_check():
     # both draft and snapshot were written from live frames, so they're
     # string-comparable; frames reloaded from JSON re-serialize with dtype
     # drift and would false-positive every boot.
-    act = collab.read_active(SCENARIO_DIR)
+    act = collab.read_active(SCENARIO_DIR, _plan_year())
     snap = collab.load_snapshot(SCENARIO_DIR, act["file"]) if act else None
     if snap is not None:
         ref = {k: snap.get(k) for k in keys if k in snap}
@@ -175,9 +199,10 @@ def _startup_draft_check():
         ref = {k: v for k, v in _serialize_lobs().items() if k in keys}
     mine = {k: payload.get(k) for k in keys if k in payload}
     if json.dumps(mine, sort_keys=True, default=str) == json.dumps(ref, sort_keys=True, default=str):
-        _draft_path().unlink(missing_ok=True)   # everything was published — clean up
+        src.unlink(missing_ok=True)   # everything was published — clean up
         return
     st.session_state["_draft_pending"] = d
+    st.session_state["_draft_file"] = str(src)   # discard must delete what we READ
 
 
 def _purge_assumption_widgets():
@@ -193,9 +218,51 @@ def _purge_assumption_widgets():
             del st.session_state[k]
 
 
+def _available_years() -> list[int]:
+    """Plan years this session can switch between.
+
+    Every year with a published version, plus the year the working plan is on,
+    plus any year this user has an auto-saved draft for. That last one matters:
+    roll into 2027, don't publish yet, switch to 2026 to answer a question —
+    without it 2027 would vanish from the list and the only way back to that
+    work would be the resume prompt on the next boot."""
+    yrs = {int(j.get("plan_year", DEFAULT_PLAN_YEAR))
+           for j in collab.changelog(SCENARIO_DIR)}
+    yrs.add(_plan_year())
+    try:
+        user = st.session_state.user
+        for p in (SCENARIO_DIR / "drafts").glob(f"{user}-*.json"):
+            tail = p.stem.rsplit("-", 1)[-1]
+            if tail.isdigit():
+                yrs.add(int(tail))
+    except OSError:
+        pass
+    return sorted(yrs)
+
+
+def _switch_year(year: int) -> None:
+    """Move this session to another plan year.
+
+    Nothing is at risk: drafts are per-year, so the year you leave keeps its own
+    auto-saved draft and offers to resume it when you come back.
+
+    The lock token is NOT dropped. Tokens are stored per year
+    (`lock_token_<year>`) precisely so this session can hold 2026 and 2027 at
+    once — dropping a single shared token on every switch meant returning to a
+    year you had locked left you tokenless, `owns_lock` failed, and the app
+    announced that you had been "taken over by" yourself (reported 2026-07-29)."""
+    st.session_state.plan_year = int(year)
+    _purge_assumption_widgets()
+    if not _load_active_into_session():
+        # Nothing published for that year yet (a fresh rollover). Keep the
+        # frames on screen — they ARE that year's working plan.
+        st.session_state.loaded_version = None
+    st.rerun()
+
+
 def _load_active_into_session():
     """Point the working plan at the current shared active version (if any)."""
-    act = collab.read_active(SCENARIO_DIR)
+    act = collab.read_active(SCENARIO_DIR, _plan_year())
     snap = collab.load_snapshot(SCENARIO_DIR, act["file"]) if act else None
     if snap:
         _apply_payload(snap)
@@ -2323,27 +2390,78 @@ def render_team_status() -> tuple[bool, str]:
     mode is 'editor' | 'sandbox' | 'viewer'."""
     user = st.session_state.user
     st.caption(f"{user}")
-    lock = collab.read_lock(SCENARIO_DIR)
-    act = collab.read_active(SCENARIO_DIR)
-    _corrupt = sorted(Path(SCENARIO_DIR).glob("edit.lock.corrupt-*"))
+
+    # --- which plan year am I working in? -----------------------------
+    # Only a control when there is a choice; a one-year team gets a caption
+    # instead of a dropdown that does nothing. Seeding `year_pick` BEFORE the
+    # widget instantiates is the allowed pattern (same as `_nav_goto` staging
+    # `nav_page`); passing a written-back value as `index=` is what causes the
+    # two-clicks bug, so it is never passed.
+    _years = _available_years()
+    if len(_years) > 1:
+        # plan_year changes from BOTH directions and the two must not fight:
+        # the planner picks it here, but `roll_over_plan` sets it to yr+1 and
+        # `_apply_payload` takes it from any snapshot or resumed draft. Guarding
+        # only on "value not in the list" let the widget's stale value win, so
+        # rolling into 2027 was yanked straight back to 2026 on the next run.
+        # Remembering the plan_year we last rendered with separates the cases:
+        # if it moved underneath us, follow it; otherwise the widget is truth.
+        if st.session_state.get("_year_seen") != _plan_year():
+            st.session_state["year_pick"] = _plan_year()
+            st.session_state["_year_seen"] = _plan_year()
+        _picked = st.selectbox("Plan year", _years, key="year_pick",
+                               format_func=str,
+                               help="Each year is its own plan with its own "
+                                    "published versions and its own edit lock — "
+                                    "editing one never locks the other.")
+        if int(_picked) != _plan_year():
+            _switch_year(int(_picked))
+    else:
+        st.caption(f"Plan year **{_plan_year()}**")
+
+    year = _plan_year()
+    # Edit control belongs to ONE year, so remembering "I was the editor" has
+    # to as well — a single flag fired a spurious takeover warning the moment
+    # you switched years.
+    _we_key = f"was_editor_{year}"
+    lock = collab.read_lock(SCENARIO_DIR, year)
+    act = collab.read_active(SCENARIO_DIR, year)
+    # both spellings: edit.lock.corrupt-* (pre-per-year) and edit-<year>.lock.corrupt-*
+    _corrupt = sorted(Path(SCENARIO_DIR).glob("edit*.lock.corrupt-*"))
     if _corrupt:
         st.caption(f"⚠️ A corrupted lock file was set aside as "
                    f"`{_corrupt[-1].name}` (crash/share hiccup mid-write). "
                    "Editing works normally; delete the file after a look.")
     # Ownership is SESSION-level (user + acquisition token, audit 2026-07-14):
     # user alone let two tabs of the same Windows login both edit silently.
-    tok = st.session_state.get("lock_token")
+    tok = st.session_state.get(f"lock_token_{year}")
     i_edit = collab.owns_lock(lock, user, tok)
 
+    # Holding two years at once is ALLOWED — they are different plans, so it is
+    # not a write conflict — but it is not free: everyone else is read-only on
+    # every year you hold. Not forbidden, made visible; the same reasoning as
+    # every other warning here (an honest notice beats a silent guess, and
+    # auto-releasing a year just because you glanced at another would be a
+    # surprise that costs someone their edit rights mid-thought).
+    _also = [y for y in _years if y != year and collab.owns_lock(
+        collab.read_lock(SCENARIO_DIR, y), user,
+        st.session_state.get(f"lock_token_{y}"))]
+    if _also:
+        st.caption("You also hold edit control of "
+                   + ", ".join(str(y) for y in _also)
+                   + " — switch there and release it if someone else needs "
+                     "that year.")
+
     # We thought we were editing but the lock moved → someone took over.
-    if st.session_state.get("was_editor") and not i_edit and not st.session_state.sandbox:
+    if st.session_state.get(_we_key) and not i_edit and not st.session_state.sandbox:
         st.warning(
-            f"⚠️ Edit control was taken over by **{lock.get('user') if lock else '—'}**. "
+            f"⚠️ Edit control for **{year}** was taken over by "
+            f"**{lock.get('user') if lock else '—'}**. "
             "Your unsaved changes are still in this session — switch to Sandbox and "
             "save them as a personal what-if to keep them.")
-        st.session_state.was_editor = False
+        st.session_state[_we_key] = False
 
-    st.markdown("**Active plan:** "
+    st.markdown(f"**{year} plan:** "
                 + (f"v{act['version']} · {act['name']}" if act else "_none published yet_"))
     if act:
         st.caption(f"by {act['author']} · {_hm(act['published_at'])}"
@@ -2352,7 +2470,7 @@ def render_team_status() -> tuple[bool, str]:
     # Drift: a newer version was published than the one we're viewing.
     lv = st.session_state.get("loaded_version")
     if act and lv is not None and act["version"] > lv and not st.session_state.sandbox and not i_edit:
-        st.info(f"Active advanced to v{act['version']} (you're on v{lv}).")
+        st.info(f"The {year} plan advanced to v{act['version']} (you're on v{lv}).")
         if st.button("Reload active plan", width="stretch", key="reload_active"):
             _load_active_into_session()
             st.rerun()
@@ -2372,39 +2490,42 @@ def render_team_status() -> tuple[bool, str]:
 
     # --- We hold edit control ----------------------------------------
     if i_edit:
-        if not collab.heartbeat(SCENARIO_DIR, user, tok):
-            st.session_state.was_editor = False   # lost it between read & now
+        if not collab.heartbeat(SCENARIO_DIR, year, user, tok):
+            st.session_state[_we_key] = False   # lost it between read & now
             st.rerun()
-        st.session_state.was_editor = True
-        st.success(f"You have **edit control** (since {_hm(lock.get('acquired_at',''))}).")
+        st.session_state[_we_key] = True
+        st.success(f"You have **edit control of {year}** "
+                   f"(since {_hm(lock.get('acquired_at',''))}).")
         if st.button("Release edit control", width="stretch"):
-            collab.release_lock(SCENARIO_DIR, user, tok)
-            st.session_state.pop("lock_token", None)
-            st.session_state.was_editor = False
+            collab.release_lock(SCENARIO_DIR, year, user, tok)
+            st.session_state.pop(f"lock_token_{year}", None)
+            st.session_state[_we_key] = False
             st.rerun()
         return True, "editor"
 
     # --- Someone else holds it (fresh) -------------------------------
     if lock and not collab.lock_is_stale(lock):
         if lock.get("user") == user:
-            st.warning("Your edit lock belongs to **another session/tab** "
-                       "(or a previous run). Take control to edit HERE — the "
-                       "other session becomes read-only.")
+            st.warning(f"Your edit lock on **{year}** belongs to **another "
+                       "session/tab** (or a previous run). Take control to edit "
+                       "HERE — the other session becomes read-only.")
         else:
-            st.warning(f"**{lock.get('user')}** is editing (since {_hm(lock.get('acquired_at',''))}, "
-                       f"active {int(collab.age_min(lock.get('heartbeat','')))}m ago). You're read-only.")
+            st.warning(f"**{lock.get('user')}** is editing **{year}** "
+                       f"(since {_hm(lock.get('acquired_at',''))}, "
+                       f"active {int(collab.age_min(lock.get('heartbeat','')))}m ago). "
+                       "You're read-only.")
     elif lock:
-        st.caption(f"Stale lock from {lock.get('user')} — free to take.")
+        st.caption(f"Stale lock on {year} from {lock.get('user')} — free to take.")
     else:
-        st.caption("Plan is unlocked.")
+        st.caption(f"The {year} plan is unlocked.")
 
     c1, c2 = st.columns(2)
     take_label = "Take over" if (lock and not collab.lock_is_stale(lock)) else "Take control"
     if c1.button(take_label, width="stretch"):
-        ok, info = collab.acquire_lock(SCENARIO_DIR, user, force=True)
-        st.session_state["lock_token"] = (info or {}).get("token")
+        ok, info = collab.acquire_lock(SCENARIO_DIR, year, user, force=True)
+        st.session_state[f"lock_token_{year}"] = (info or {}).get("token")
         _load_active_into_session()  # edit from the current truth (no-op if none)
-        st.session_state.was_editor = True
+        st.session_state[_we_key] = True
         st.rerun()
     if c2.button("Sandbox", width="stretch"):
         st.session_state.sandbox = True
@@ -2418,25 +2539,27 @@ def render_publish_panel(mode: str):
     user = st.session_state.user
     if mode == "editor":
         st.subheader("Publish")
-        default_name = (collab.read_active(SCENARIO_DIR) or {}).get("name", "Current Outlook")
+        default_name = (collab.read_active(SCENARIO_DIR, _plan_year())
+                        or {}).get("name", "Current Outlook")
         name = st.text_input("Plan name", value=default_name, key="pub_name")
         note = st.text_input("What changed? (note)", key="pub_note")
         parent = st.session_state.get("loaded_version")
         c1, c2 = st.columns(2)
         for label, col, release in [("Publish", c1, False), ("Publish & release", c2, True)]:
             if col.button(label, width="stretch", key=f"pub_{label}"):
-                if not collab.holds_lock(SCENARIO_DIR, user,
-                                         st.session_state.get("lock_token")):
+                if not collab.holds_lock(SCENARIO_DIR, _plan_year(), user,
+                                         st.session_state.get(f"lock_token_{_plan_year()}")):
                     st.error("You no longer hold edit control — can't publish.")
                 else:
                     meta, _ = collab.publish(SCENARIO_DIR, _serialize_lobs(),
                                              name, user, parent, note)
                     st.session_state.loaded_version = meta["version"]
                     if release:
-                        collab.release_lock(SCENARIO_DIR, user,
-                                            st.session_state.get("lock_token"))
-                        st.session_state.pop("lock_token", None)
-                        st.session_state.was_editor = False
+                        collab.release_lock(
+                            SCENARIO_DIR, _plan_year(), user,
+                            st.session_state.get(f"lock_token_{_plan_year()}"))
+                        st.session_state.pop(f"lock_token_{_plan_year()}", None)
+                        st.session_state[f"was_editor_{_plan_year()}"] = False
                     st.success(f"Published v{meta['version']}.")
                     st.rerun()
     elif mode == "sandbox":
@@ -2446,10 +2569,17 @@ def render_publish_panel(mode: str):
             _, f = collab.save_personal(SCENARIO_DIR, _serialize_lobs(), name, user)
             st.success(f"Saved → {f}")
 
-    with st.expander("Version history"):
-        log = collab.changelog(SCENARIO_DIR)
+    _yr = _plan_year()
+    with st.expander(f"Version history — {_yr}"):
+        # Scoped to the selected year on purpose. Restore republishes, and
+        # publish() takes its year from the payload — so restoring a 2027 entry
+        # while you are looking at 2026 would advance the 2027 pointer. Correct,
+        # but nobody would predict it from a list that mixed the years together.
+        # Sandbox any year's version from its own year; the button below still
+        # opens it privately without moving anything.
+        log = collab.changelog(SCENARIO_DIR, _yr)
         if not log:
-            st.caption("No versions published yet.")
+            st.caption(f"No {_yr} versions published yet.")
         for j in log[:15]:
             cols = st.columns([3, 1, 1])
             cols[0].caption(f"**v{j['version']}** · {j.get('plan_year', DEFAULT_PLAN_YEAR)}"
@@ -2477,14 +2607,21 @@ def render_publish_panel(mode: str):
 
     with st.expander("How the team plan works"):
         st.markdown(
-            "- There is **one shared plan** — what you see is the latest published "
-            "version.\n"
-            "- Edit control is **best-effort single-writer**: conflicts are "
-            "detected and warned (takeovers, second tabs), not made physically "
+            "- **Each plan year is its own plan** — its own published versions "
+            "and its own edit lock. What you see is the latest published version "
+            "of the year picked at the top of this rail.\n"
+            "- So someone can build **next year** while this year stays the "
+            "operating plan. Editing one year never locks the other, and "
+            "publishing one never touches the other's versions.\n"
+            "- Edit control is **best-effort single-writer**, per year: conflicts "
+            "are detected and warned (takeovers, second tabs), not made physically "
             "impossible — publish deliberately and heed the warnings.\n"
-            "- To change it: **Take control** (so two people can't edit at once), "
-            "make your edits, then **Publish** — that saves a new version everyone "
-            "sees.\n"
+            "- To change a year: **Take control** (so two people can't edit the "
+            "same year at once), make your edits, then **Publish** — that saves a "
+            "new version everyone sees.\n"
+            "- You *can* hold two years at once; the rail tells you when you do. "
+            "Release a year you're done with, or everyone else stays read-only "
+            "on it.\n"
             "- **Sandbox** is your private copy. Experiment freely — nothing is "
             "shared unless you publish it.\n"
             "- **Version history** keeps every published version forever. Open any "
@@ -2532,7 +2669,8 @@ def render_publish_panel(mode: str):
 if "user" not in st.session_state:
     st.session_state.user = collab.who()
     st.session_state.sandbox = False
-    st.session_state.was_editor = False
+    # was_editor is per-year (was_editor_<year>) — nothing to seed, the reads
+    # go through .get() and a missing key is correctly "I was not editing".
 if "lobs" not in st.session_state:
     if not _load_active_into_session():   # adopt the shared active plan if one exists
         init_state(52)                    # else start from the mapped-LOB default
@@ -2619,7 +2757,11 @@ with st.sidebar:
             st.session_state["_draft_pending"] = None
             st.rerun()
         if _c2.button("Discard", width="stretch", key="draft_discard"):
-            _draft_path().unlink(missing_ok=True)
+            # Delete the file the check actually READ — which may be the
+            # pre-per-year name, in which case deleting _draft_path() would
+            # leave the legacy draft to be offered again on every boot.
+            Path(st.session_state.get("_draft_file")
+                 or _draft_path()).unlink(missing_ok=True)
             st.session_state["_draft_pending"] = None
             st.rerun()
         st.divider()
@@ -3185,7 +3327,7 @@ def _reference_metrics() -> dict | None:
     baseline for the Executive View's Δ chips ("what changed since we last
     published"). Cached per active version; recomputed only when the pointer
     moves. None when nothing is published yet."""
-    act = collab.read_active(SCENARIO_DIR)
+    act = collab.read_active(SCENARIO_DIR, _plan_year())
     if not act:
         return None
     cache = st.session_state.get("_ref_metrics")
@@ -3344,8 +3486,8 @@ def render_executive_view():
     weeks_under = int((cons_net < 0).sum())
     coverage = float((cons_net >= 0).mean() * 100)
 
-    act = collab.read_active(SCENARIO_DIR)
-    lock = collab.read_lock(SCENARIO_DIR)
+    act = collab.read_active(SCENARIO_DIR, _plan_year())
+    lock = collab.read_lock(SCENARIO_DIR, _plan_year())
 
     # ---- hero verdict -------------------------------------------------
     # The brand header is now global (above the nav bar). What stays here is
@@ -3750,8 +3892,8 @@ from Customer Support. The app prices this honestly:
   team sees is touched until *you* publish. Save it as a personal what-if to
   keep it.
 - To look at (or tinker with) an **older version**, open Version history
-  and press **Sandbox** on that version — it opens privately, the team plan
-  stays put.
+  (it lists the year you have selected) and press **Sandbox** on that version —
+  it opens privately, the team plan stays put.
 - **Restore** (editors only) makes an old version the team plan again — as a
   *new* version, so history stays complete.
 """),
@@ -3784,8 +3926,27 @@ from Customer Support. The app prices this honestly:
    starting headcount, year-end members become the new starting members, CPM
    and AHT carry, the seasonality shape copies, people on LOA stay out, and
    classes still in training graduate into the new year.
-3. Enter the new year-end member forecast, review, then publish. Every prior
-   year's versions stay in history — open them in Sandbox any time.
+3. Enter the new year-end member forecast, review, then publish.
+4. **This year keeps running.** Each year is its own plan with its own versions
+   and its own edit lock, so publishing next year does not disturb this one —
+   and someone else can carry on editing this year while you build next.
+   Switch between them with **Plan year** at the top of the sidebar.
+5. Nothing published is ever lost. Every prior year's versions stay in that
+   year's history — open one in Sandbox any time.
+"""),
+    ("Working on next year while this year runs", """
+Two years can be live at once, each with its own published versions and its own
+edit lock.
+
+1. **Plan year** (top of the sidebar) picks the year you are working in. It only
+   appears once more than one year exists — roll over to create the next one.
+2. Take control of the year you want to change. That leaves the other year
+   untouched: a colleague can be editing it at the same time.
+3. Your unpublished work is kept **per year**, so switching away and back offers
+   your draft for that year — you cannot lose one year's edits by looking at
+   another.
+4. You can hold both years at once and the sidebar will say so. Release a year
+   when you are done with it, otherwise everyone else is read-only on it.
 """),
     ("Building next year's budget", """
 The budget answers two questions for leadership: **how many contacts** next year,
@@ -3828,9 +3989,11 @@ CPM or weekly Members (actual).
    (2026-01-05) — format Excel date cells as text before copying.
 """),
     ("Five things worth knowing", """
-1. There is **one shared plan**; what you see is the latest published version.
-2. **Publish = save & share.** Take control first so two people can't edit
-   at once; read-only just means someone else has it.
+1. **Each plan year is its own shared plan**; what you see is the latest
+   published version of the year picked at the top of the sidebar. Next year
+   can be built while this year keeps running.
+2. **Publish = save & share.** Take control first so two people can't edit the
+   same year at once; read-only just means someone else has that year.
 3. **Nothing can be lost.** Every published version is permanent; drafts
    auto-save your unsaved edits and offer them back next session.
 4. **Step-change columns carry forward** on edit: CPM, LOA, Supervisors,
@@ -3851,7 +4014,8 @@ PAGE_HELP = {
                           "Planning hiring classes"],
     # Only recipes for the task you do ON this page — pairing Budget with the
     # Executive View's reading guide was an authoring slip, not a design.
-    "Budget": ["Building next year's budget", "Once a year — rolling into the new year"],
+    "Budget": ["Building next year's budget", "Once a year — rolling into the new year",
+               "Working on next year while this year runs"],
     "Real Data": ["Every week — the plan review", "Data health warnings"],
     "ACD Shrinkage": ["Data health warnings"],
 }
@@ -3911,8 +4075,8 @@ def weekly_checklist():
     it cannot go stale. Not documentation — a status panel."""
     vw = st.session_state.get("wfm_weekly")
     sw = st.session_state.get("acd_weekly")
-    act = collab.read_active(SCENARIO_DIR)
-    lock = collab.read_lock(SCENARIO_DIR)
+    act = collab.read_active(SCENARIO_DIR, _plan_year())
+    lock = collab.read_lock(SCENARIO_DIR, _plan_year())
     items = []
 
     # 1 — actuals loaded?

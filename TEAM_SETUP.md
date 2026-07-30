@@ -2,9 +2,13 @@
 
 The app is **not hosted**. Each planner runs it on their own PC by double-clicking
 `Launch Capacity Planner.bat` on the share. The shared team state (`scenarios/`
-versions, edit lock, remembered data paths) lives on the share, so everyone sees
+versions, edit locks, remembered data paths) lives on the share, so everyone sees
 the same published plan; the Python environment lives on each PC (fast), built
 automatically by the launcher.
+
+**Each plan year is its own plan** — its own published versions and its own edit
+lock — so someone can build next year while this year stays the operating plan.
+Pick the year with **Plan year** at the top of the sidebar.
 
 ## One-time, per person
 
@@ -52,7 +56,16 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
 ## Updates
 
 - **App updates**: just edit the `.py` files on the share — everyone gets them
-  on their next launch. Ask people to close/relaunch after an update.
+  on their next launch. **Ask people to close and relaunch after an update**, and
+  wait for that before relying on the new version.
+
+  This matters more than it sounds. There is ONE copy of the app on the share, so
+  an update reaches everyone at once — except a session someone left OPEN, whose
+  Python process keeps the old code until it is relaunched. That is the only way
+  two versions of the app can ever be reading the same `scenarios/` folder, and
+  it is why the update instruction is about correctness, not tidiness.
+  Per-PC copies of the app folder have the same effect permanently: four
+  planners, four different apps, four private plans.
 - **Package updates**: change `requirements.txt` (and refresh `wheels\` if used).
   The launcher detects the change and re-syncs each person's environment
   automatically on next launch.

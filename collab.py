@@ -1,11 +1,13 @@
 """Multi-planner collaboration on a shared network drive.
 
-The team works one **active plan** at a time (spreadsheet-style single writer). This
+Each plan YEAR is its own active plan, with its own pointer and its own lock, so
+2026 can stay the operating plan while the team builds 2027. Within a year the
+team works one plan at a time (spreadsheet-style single writer). This
 module owns the three shared-state primitives that live in the scenarios folder
 on the share — no database, no server:
 
-  active.json  — pointer naming the currently-blessed snapshot + its version.
-  edit.lock    — who currently holds edit control (single writer) + heartbeat.
+  active-<year>.json — pointer naming that year's blessed snapshot + version.
+  edit-<year>.lock   — who holds edit control FOR THAT YEAR + heartbeat.
   vNNNN ....json / personal ....json — immutable snapshots (the audit trail).
 
 Design choices:
@@ -93,26 +95,82 @@ def _read_json(path: Path):
         return None
 
 
+# ---------------------------------------------------------------- plan years
+# Each plan year is its own independently-published, independently-locked plan,
+# so 2026 can stay the operating plan while the team works on 2027. Before this
+# there was ONE pointer and ONE lock for the whole folder: publishing 2027 would
+# have displaced 2026, and anyone editing either made the other read-only.
+#
+# LEGACY_YEAR is the single-pointer era's only plan year. Shares written by that
+# code have a bare `active.json` / `edit.lock`; both are still read for that year
+# so an existing share opens with its full history and needs no migration step.
+LEGACY_YEAR = 2026
+
+# Publishing LEGACY_YEAR also writes the bare `active.json`. Everyone launches
+# the one copy on the share, so the only window where two code versions coexist
+# is a session left OPEN across an update — that process keeps the old module
+# until relaunch, and would otherwise read a pointer nobody updates any more.
+# Dual-writing costs one small file per publish and closes it.
+# REMOVE THIS after the release following the one that introduces it (added
+# 2026-07-29). Left alone, a compatibility shim becomes permanent by forgetting,
+# and then nobody can tell whether `active.json` still means anything.
+DUAL_WRITE_LEGACY = True
+
+
 # ---------------------------------------------------------------- active pointer
-def active_path(d) -> Path:
+def active_path(d, year) -> Path:
+    return Path(d) / f"active-{int(year)}.json"
+
+
+def legacy_active_path(d) -> Path:
     return Path(d) / "active.json"
 
 
-def read_active(d):
-    return _read_json(active_path(d))
+def read_active(d, year):
+    j = _read_json(active_path(d, year))
+    if j is None and int(year) == LEGACY_YEAR:
+        j = _read_json(legacy_active_path(d))      # pre-per-year share
+    return j
 
 
-def write_active(d, meta: dict):
-    _atomic_write(active_path(_dir(d)), json.dumps(meta))
+def write_active(d, year, meta: dict):
+    dd = _dir(d)
+    _atomic_write(active_path(dd, int(year)), json.dumps(meta))
+    if DUAL_WRITE_LEGACY and int(year) == LEGACY_YEAR:
+        _atomic_write(legacy_active_path(dd), json.dumps(meta))
 
 
 # ---------------------------------------------------------------- edit lock
-def lock_path(d) -> Path:
+def lock_path(d, year) -> Path:
+    return Path(d) / f"edit-{int(year)}.lock"
+
+
+def legacy_lock_path(d) -> Path:
     return Path(d) / "edit.lock"
 
 
-def read_lock(d):
-    return _read_json(lock_path(d))
+def _live_lock_path(d, year) -> Path:
+    """The lock file to READ AND WRITE for this year.
+
+    Prefers the year-scoped file. Falls back to the bare `edit.lock` only while
+    that file still exists and this is LEGACY_YEAR — otherwise a session left
+    open on the old code would appear to hold nothing, and new code would hand
+    out edit control for a plan someone is actively editing.
+
+    Deliberately NOT dual-written, unlike the pointer: a lock is transient and
+    two files would need an atomic O_EXCL race across both. Once anyone acquires
+    through this code the year-scoped file exists and wins from then on; the
+    stranded legacy lock ages out at LOCK_STALE_MIN and stops mattering."""
+    p = lock_path(d, year)
+    if not p.exists() and int(year) == LEGACY_YEAR:
+        legacy = legacy_lock_path(d)
+        if legacy.exists():
+            return legacy
+    return p
+
+
+def read_lock(d, year):
+    return _read_json(_live_lock_path(d, year))
 
 
 def lock_is_stale(info: dict | None) -> bool:
@@ -147,13 +205,13 @@ def owns_lock(info: dict | None, user: str, token: str | None) -> bool:
     return token is not None and info.get("token") == token
 
 
-def acquire_lock(d, user: str, force: bool = False):
-    """Try to take edit control. Returns (ok, lock_info).
+def acquire_lock(d, year, user: str, force: bool = False):
+    """Try to take edit control OF THIS PLAN YEAR. Returns (ok, lock_info).
 
     ok=False means someone else holds a *fresh* lock (and force was not set);
     lock_info is then the current holder so the UI can offer takeover."""
-    p = lock_path(_dir(d))
-    cur = read_lock(d)
+    p = _live_lock_path(_dir(d), year)
+    cur = read_lock(d, year)
     if cur is None and p.exists():
         # Present but UNREADABLE (crash between O_EXCL create and the JSON
         # write, share hiccup, truncation): before this branch existed, no
@@ -164,32 +222,32 @@ def acquire_lock(d, user: str, force: bool = False):
         # acquire, which keeps concurrent recoverers racing safely.
         try:
             p.replace(p.with_name(
-                f"edit.lock.corrupt-{_now().strftime('%Y%m%d-%H%M%S')}"))
+                f"{p.name}.corrupt-{_now().strftime('%Y%m%d-%H%M%S')}"))
         except OSError:
             pass
-        cur = read_lock(d)   # a valid lock may have appeared meanwhile
+        cur = read_lock(d, year)   # a valid lock may have appeared meanwhile
     if cur is None:
         try:  # atomic create — wins the race against another new acquirer
             fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(_lock_record(user), f)
-            return True, read_lock(d)
+            return True, read_lock(d, year)
         except FileExistsError:
-            cur = read_lock(d)  # lost the race; fall through
+            cur = read_lock(d, year)  # lost the race; fall through
     if cur and cur.get("user") == user:
         # Same planner, (possibly) another session: re-acquire with a FRESH
         # token so exactly one session owns it — the other downgrades on its
         # next heartbeat instead of both silently editing.
         _atomic_write(p, json.dumps(_lock_record(user)))
-        return True, read_lock(d)
+        return True, read_lock(d, year)
     if cur and (force or lock_is_stale(cur)):
         _atomic_write(p, json.dumps(
             _lock_record(user, {"taken_over_from": cur.get("user")})))
-        return True, read_lock(d)
+        return True, read_lock(d, year)
     return False, cur
 
 
-def heartbeat(d, user: str, token: str | None = None) -> bool:
+def heartbeat(d, year, user: str, token: str | None = None) -> bool:
     """Refresh our lock's heartbeat. Returns False if we no longer hold it
     (someone took over, or another session of the same user re-acquired) so
     the caller can downgrade to read-only. The ownership check happens on a
@@ -197,28 +255,30 @@ def heartbeat(d, user: str, token: str | None = None) -> bool:
     milliseconds-wide gap can still be clobbered (plain-filesystem locking
     has no compare-and-swap); the loser then self-detects on its next rerun
     because its own heartbeat/ownership check fails."""
-    cur = read_lock(d)
+    cur = read_lock(d, year)
     if owns_lock(cur, user, token):
         cur["heartbeat"] = _iso(_now())
-        _atomic_write(lock_path(d), json.dumps(cur))
+        # write back to the file we READ — which may still be the legacy
+        # edit.lock during a transition (see _live_lock_path)
+        _atomic_write(_live_lock_path(d, year), json.dumps(cur))
         return True
     return False
 
 
-def release_lock(d, user: str, token: str | None = None,
+def release_lock(d, year, user: str, token: str | None = None,
                  force: bool = False) -> bool:
-    cur = read_lock(d)
+    cur = read_lock(d, year)
     if cur and (force or owns_lock(cur, user, token)):
         try:
-            lock_path(d).unlink()
+            _live_lock_path(d, year).unlink()
         except FileNotFoundError:
             pass
         return True
     return False
 
 
-def holds_lock(d, user: str, token: str | None = None) -> bool:
-    return owns_lock(read_lock(d), user, token)
+def holds_lock(d, year, user: str, token: str | None = None) -> bool:
+    return owns_lock(read_lock(d, year), user, token)
 
 
 # ---------------------------------------------------------------- snapshots
@@ -245,17 +305,30 @@ def _all_snapshots(d) -> list[dict]:
 
 
 def next_version(d) -> int:
-    act = read_active(d)
-    if act and isinstance(act.get("version"), int):
-        return act["version"] + 1
+    """Next version number — GLOBAL across plan years, deliberately.
+
+    It no longer reads the active pointer, because there is no longer a single
+    one. Numbering across years instead of within each keeps every number
+    unique and sortable, and keeps the folder legible on the share: per-year
+    numbering would put two different files in there both calling themselves
+    v0001. The year is carried in the payload (`plan_year`) and displayed
+    beside the version, which is what actually answers "which year is this?".
+    """
     vs = [j.get("version") for j in _all_snapshots(d)
           if isinstance(j.get("version"), int)]
     return (max(vs) + 1) if vs else 1
 
 
-def changelog(d) -> list[dict]:
-    """Published active-plan versions, newest first (for the history panel)."""
+def changelog(d, year=None) -> list[dict]:
+    """Published versions, newest first (for the history panel).
+
+    `year` filters to one plan year; None returns every year. Snapshots written
+    before plan years existed carry no `plan_year`, so they read as LEGACY_YEAR —
+    the same default `_apply_payload` has always used when loading them."""
     snaps = [j for j in _all_snapshots(d) if isinstance(j.get("version"), int)]
+    if year is not None:
+        snaps = [j for j in snaps
+                 if int(j.get("plan_year", LEGACY_YEAR)) == int(year)]
     return sorted(snaps, key=lambda j: j["version"], reverse=True)
 
 
@@ -264,9 +337,15 @@ def load_snapshot(d, fname: str):
 
 
 def publish(d, payload: dict, name: str, author: str,
-            parent_version, note: str = ""):
-    """Write a new immutable version snapshot and advance active.json.
-    `payload` carries the business data (n_weeks / members / lobs)."""
+            parent_version, note: str = "", year=None):
+    """Write a new immutable version snapshot and advance THIS YEAR's pointer.
+
+    `payload` carries the business data (n_weeks / members / lobs / plan_year).
+    `year` says which pointer to advance; it defaults to the payload's own
+    plan_year, which is the only value that can be right — publishing a 2027
+    payload must never move 2026's pointer."""
+    if year is None:
+        year = payload.get("plan_year", LEGACY_YEAR)
     ver = next_version(d)
     stamp = _now().strftime("%Y%m%d-%H%M%S")
     meta = {**payload, "name": name, "author": author,
@@ -275,9 +354,9 @@ def publish(d, payload: dict, name: str, author: str,
             "note": note, "kind": "active"}
     fname = f"v{ver:04d} {stamp} {_safe(name)}.json"
     _atomic_write(_dir(d) / fname, json.dumps(meta))
-    write_active(d, {"file": fname, "version": ver, "name": name,
-                     "author": author, "published_at": meta["published_at"],
-                     "note": note})
+    write_active(d, year, {"file": fname, "version": ver, "name": name,
+                           "author": author, "plan_year": int(year),
+                           "published_at": meta["published_at"], "note": note})
     return meta, fname
 
 
