@@ -467,7 +467,16 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
   border: 1px solid {TEAL}; border-radius: 8px; color: {TEAL};
   background: {SURFACE}; font-weight: 600;
 }}
-[data-testid^="stBaseButton-"] p {{ color: inherit !important; font-weight: 600; }}
+/* A label must never break mid-word. In a narrow sidebar column Streamlit
+   wrapped "Sandbox" one character per line and the button rendered as a
+   vertical stack of letters. nowrap + ellipsis is the right failure mode: a
+   clipped label still reads as a button, and the tooltip carries the full text.
+   The real fix for a cramped row is fewer columns — this only stops the
+   pathological case from ever looking like that again. */
+[data-testid^="stBaseButton-"] p {{
+  color: inherit !important; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
 [data-testid^="stBaseButton-"]:hover:not(:disabled) {{
   background: {TEAL_BG}; border-color: {TEAL}; color: {TEAL};
 }}

@@ -2581,21 +2581,27 @@ def render_publish_panel(mode: str):
         if not log:
             st.caption(f"No {_yr} versions published yet.")
         for j in log[:15]:
-            cols = st.columns([3, 1, 1])
-            cols[0].caption(f"**v{j['version']}** · {j.get('plan_year', DEFAULT_PLAN_YEAR)}"
-                            f" · {j.get('name','')} · {j.get('author','')}"
-                            f" · {_hm(j.get('published_at',''))}"
-                            + (f" — {j['note']}" if j.get("note") else ""))
+            # Caption on its OWN row, buttons beneath. Three columns in the
+            # sidebar left each button about a fifth of the rail, too narrow for
+            # the word "Sandbox" — Streamlit then broke the label one character
+            # per line, so the button rendered as a vertical column of letters.
+            # The year is already in the expander title; drop it from every row.
+            st.caption(f"**v{j['version']}** · {j.get('name','')}"
+                       f" · {j.get('author','')} · {_hm(j.get('published_at',''))}"
+                       + (f" — {j['note']}" if j.get("note") else ""))
+            cols = st.columns(2)
             # View/edit any version privately — e.g. revisit 2026 while the
             # team's active plan is 2027 — without touching the shared pointer.
-            if cols[1].button("Sandbox", key=f"sb_open_{j['version']}",
+            if cols[0].button("Sandbox", key=f"sb_open_{j['version']}",
+                              width="stretch",
                               help="Open this version privately. Nothing shared "
                                    "changes; publish deliberately if you want it live."):
                 st.session_state.sandbox = True
                 _apply_payload(j)
                 st.session_state.loaded_version = None
                 st.rerun()
-            if mode == "editor" and cols[2].button("Restore", key=f"restore_{j['version']}"):
+            if mode == "editor" and cols[1].button("Restore", width="stretch",
+                                                   key=f"restore_{j['version']}"):
                 payload = {k: j[k] for k in ("n_weeks", "members_start", "members_end", "lobs")}
                 payload["plan_year"] = j.get("plan_year", DEFAULT_PLAN_YEAR)
                 meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
