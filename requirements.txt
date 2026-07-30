@@ -1,18 +1,12 @@
-# The stack the app is VERIFIED green on — not the newest available.
+# Tested versions, pinned deliberately — not the newest available.
 #
-# Every version here has been run through the full check suite on BOTH
-# (comment redacted — described the development environment)
-# (comment redacted — described the development environment)
+# Requires Python 3.11.4 or newer, and numpy is what sets that floor: 2.5.x
+# publishes no cp311 wheel, so pinning it makes `pip install -r` fail on Python
+# 3.11 before the app is ever reached. 2.4.6 is the newest numpy with a cp311
+# build. Verified on 3.11 and on 3.14.
 #
-# numpy sets the floor: 2.5.x publishes no cp311 wheel, so pinning it made a
-# 3.11 install impossible — `pip install -r` failed before it ever reached the
-# app. 2.4.6 is the newest numpy with a cp311 build.
-#
-# Pin what you have actually tested. This file previously carried
-# streamlit 1.59.1 / numpy 2.5.1 / altair 6.2.2 / pyarrow 25.0.0, none of which
-# (comment redacted — described the development environment)
-# (comment redacted — described the development environment)
-# version here that nothing verified is a version nobody tested.
+# If you bump anything here, run the full check suite against it first — the
+# launcher re-syncs every environment from this file automatically.
 streamlit==1.57.0
 pandas==3.0.3
 numpy==2.4.6

@@ -446,6 +446,43 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
 [data-testid="stCaptionContainer"] p {{ font-size: 12px; color: {MUTED}; }}
 [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{ font-size: 15px; }}
 
+/* ------- actions are TEAL -------
+   The house rule is "teal is every link and action", but nothing here styled a
+   BUTTON, so every action affordance rendered in Streamlit's native gray while
+   the rest of the page carried the palette. Panels that are mostly buttons and
+   captions (the week-of-month seasonality profile) therefore read as colorless
+   next to a carded, teal-linked page. config.toml's primaryColor only reaches
+   Streamlit's PRIMARY kind, and the app deliberately uses none — all 20 buttons
+   are secondary.
+
+   Selector is the PREFIX form: the testid is composed as
+   `stBaseButton-${{kind}}`, so this covers secondary, primary and form-submit
+   without naming each kind or breaking when a kind is added.
+
+   Outlined, not filled: 20 teal blocks would shout, and a filled button beside
+   the red masthead rule starts competing for "the important thing here". Filled
+   is reserved for the primary kind, if a genuinely primary action ever wants it.
+   Disabled must stay obviously dead — read-only mode depends on that reading. */
+[data-testid^="stBaseButton-"] {{
+  border: 1px solid {TEAL}; border-radius: 8px; color: {TEAL};
+  background: {SURFACE}; font-weight: 600;
+}}
+[data-testid^="stBaseButton-"] p {{ color: inherit !important; font-weight: 600; }}
+[data-testid^="stBaseButton-"]:hover:not(:disabled) {{
+  background: {TEAL_BG}; border-color: {TEAL}; color: {TEAL};
+}}
+[data-testid^="stBaseButton-"]:focus-visible {{
+  outline: 3px solid {TEAL_BG}; outline-offset: 1px;
+}}
+[data-testid^="stBaseButton-"]:disabled,
+[data-testid^="stBaseButton-"]:disabled p {{
+  border-color: {BORDER}; color: {MUTED}; background: {SURFACE};
+}}
+[data-testid="stBaseButton-primary"] {{ background: {TEAL}; color: {SURFACE}; }}
+[data-testid="stBaseButton-primary"]:hover:not(:disabled) {{
+  background: #00646e; border-color: #00646e; color: {SURFACE};
+}}
+
 /* ------- section cards -------
    st.container(key="ccsec_...") becomes a bordered card, so a grid and the
    note that explains it read as one object instead of loose page furniture.
