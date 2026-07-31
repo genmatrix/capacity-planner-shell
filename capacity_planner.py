@@ -2304,6 +2304,64 @@ def render_real_data_page():
         st.warning("No rows to show after mapping.")
         return
 
+    # --- feed cross-check (2026-07-31) --------------------------------------
+    # The ACD feed now measures volume/AHT/SL as well as staffed time, so both
+    # feeds report the same three things and the outer join suffixes the ACD
+    # copies. That overlap is the POINT: it is the evidence for dropping the
+    # WFM feed (manager ask 2026-07-30 — an operational forecast does not
+    # belong beside a long-range capacity plan). Agreement here is what makes
+    # that removal safe, and it can only be measured while BOTH feeds are
+    # loaded, so it is shown before anything is removed, never after.
+    # The comparison is lifted out into its own section and the duplicate
+    # columns dropped from the main table, which otherwise silently doubled
+    # its Actual columns the day the ACD fields landed.
+    _xcheck = []
+    for _c in ("Actual Contacts", "Actual AHT (sec)", "Actual SL %"):
+        _b = f"{_c} · staffing feed"
+        if _c in comb.columns and _b in comb.columns:
+            _xcheck.append((_c, _b))
+    if _xcheck:
+        with st.expander("🔍 Feed cross-check — do the two feeds agree?", expanded=False):
+            st.caption(
+                "The demand feed (WFM) and the staffing feed (ACD) now both "
+                "measure contacts, AHT and service level. They are independent "
+                "systems, so this is a genuine check rather than a restatement. "
+                "**Close agreement here means the ACD feed alone can carry the "
+                "actuals** — which is what lets the WFM feed's *forecast* be "
+                "retired without losing measured CPM, the seasonality curve or "
+                "reconciliation. Judge it on FULL weeks only: partial weeks "
+                "differ simply because the exports end at different points.")
+            _x = comb[["LOB", "Week", "Days Covered"]].copy()
+            for _c, _b in _xcheck:
+                _wfm = pd.to_numeric(comb[_c], errors="coerce")
+                _acd = pd.to_numeric(comb[_b], errors="coerce")
+                _x[f"{_c} — WFM"] = _wfm
+                _x[f"{_c} — ACD"] = _acd
+                _x[f"{_c} — Δ"] = _acd - _wfm
+            st.dataframe(_x, width="stretch", hide_index=True)
+            _lines = []
+            for _c, _b in _xcheck:
+                _wfm = pd.to_numeric(comb[_c], errors="coerce")
+                _acd = pd.to_numeric(comb[_b], errors="coerce")
+                _both = _wfm.notna() & _acd.notna() & (_wfm != 0)
+                if not _both.any():
+                    continue
+                _pct = ((_acd[_both] - _wfm[_both]).abs() / _wfm[_both].abs() * 100)
+                _worst = float(_pct.max())
+                _lines.append(f"**{_c}** — {int(_both.sum())} comparable week(s), "
+                              f"typical gap {float(_pct.median()):.2f}%, worst {_worst:.2f}%")
+            if _lines:
+                st.markdown("\n".join(f"- {ln}" for ln in _lines))
+                st.caption(
+                    "A gap of a fraction of a percent is the two systems "
+                    "counting the same calls with slightly different interval "
+                    "boundaries. Percent-level gaps on a thin queue are usually "
+                    "the AHT weighting basis (the WFM feed weights interval AHT "
+                    "by offered contacts; the ACD sums time and divides by "
+                    "answered). A large gap on a BIG queue is worth chasing "
+                    "before retiring either feed.")
+        comb = comb.drop(columns=[_b for _, _b in _xcheck])
+
     _norm = comb.groupby("LOB")["Days Covered"].transform(
         lambda x: x.mode().max())   # each queue's normal operating days/week
     _norm = _norm - _holiday_allowance(comb["Week"])   # closures aren't partial

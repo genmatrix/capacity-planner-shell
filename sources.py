@@ -227,6 +227,34 @@ FIELDS = {
         ("i_acdtime", False, ("acd time", "talk time", "handle time")),
         ("i_acwtime", False, ("acw time", "after call work", "wrap time")),
         ("i_othertime", False, ("other time",)),
+        # --- measurement columns (added 2026-07-31) -------------------------
+        # The ACD export always carried these; the app just never read them.
+        # They make this feed a complete measurement layer on its own —
+        # volume, AHT, service level — which is what lets the WFM feed be
+        # dropped without losing measured CPM, seasonality-derive, the CPM
+        # trend seed or reconciliation (manager ask 2026-07-30).
+        #
+        # ALL OPTIONAL, deliberately: a planner mid-migration, or any vendor
+        # export without them, must keep loading exactly as before. Absent
+        # columns mean the measurement rows are omitted, never zero — a
+        # fabricated 0 contacts would read as a real quiet week.
+        #
+        # Formulas are NOT invented here; they are the definitions already
+        # verified against the WFM feed on real data by crosscheck_metrics.py:
+        #     SL%  = acceptable / callsoffered
+        #     AHT  = (acdtime + holdtime + acwtime) / acdcalls
+        # Hold time IS in the numerator — that inclusion is what made ACD and
+        # WFM agree. Aliases stay NARROW: these sit beside i_acdtime/i_acwtime,
+        # whose alias lists already cover the generic phrasings, and a
+        # too-clever alias here would collide with them (see resolve_columns).
+        ("callsoffered", False, ("calls offered", "offered", "contacts offered")),
+        ("acdcalls", False, ("acd calls", "answered calls", "handled calls")),
+        ("acdtime", False, ()),
+        ("holdtime", False, ("hold time",)),
+        ("acwtime", False, ()),
+        ("abncalls", False, ("abandoned calls", "abandons")),
+        ("acceptable", False, ("calls answered in service level", "within sl")),
+        ("servicelevel", False, ("service level threshold", "sl threshold")),
     ],
 }
 
@@ -260,7 +288,22 @@ FIELD_LABELS = {
     "i_acdtime": "Talk time (sec)",
     "i_acwtime": "After-call work time (sec)",
     "i_othertime": "Other time (sec)",
+    "callsoffered": "Contacts offered",
+    "acdcalls": "Contacts answered",
+    "acdtime": "Talk time, total (sec)",
+    "holdtime": "Hold time, total (sec)",
+    "acwtime": "After-call work, total (sec)",
+    "abncalls": "Abandoned contacts",
+    "acceptable": "Contacts answered within service level",
+    "servicelevel": "Service level threshold (sec)",
 }
+
+
+# The ACD measurement columns, in one place: load_split coerces whichever of
+# them an export carried, split_weekly rolls up whichever survived. Keeping the
+# list here (not inline in two functions) is what stops the two drifting.
+MEASURE_COLS = ["callsoffered", "acdcalls", "acdtime", "holdtime", "acwtime",
+                "abncalls", "acceptable", "servicelevel"]
 
 
 def field_label(name: str) -> str:
@@ -289,26 +332,52 @@ def resolve_columns(df: pd.DataFrame, feed: str, saved_map: dict | None = None
 
     Returns (renamed_df, resolved {canonical: source_column},
              missing_required, auto_detected_canonicals). Never guesses past
-    the alias table; anything unresolved is reported, not invented."""
+    the alias table; anything unresolved is reported, not invented.
+
+    Resolution runs in TWO PASSES, and the order is load-bearing: every exact
+    and planner-saved match is claimed BEFORE any alias guess, and a source
+    column already claimed is never handed to a second canonical.
+
+    Why (2026-07-31, adding the ACD measurement columns): the ACD export
+    carries BOTH `i_acdtime` (interval talk time) and `acdtime` (talk time for
+    the AHT numerator) — different columns — while `i_acdtime`'s alias list
+    contains "acd time", which normalizes to exactly `acdtime`. Resolving
+    field-by-field, an export missing `i_acdtime` would let its alias claim the
+    `acdtime` column, and then `acdtime`'s own EXACT match would claim it too.
+    Both canonicals map to one source, the rename dict collapses, and one field
+    silently ends up holding the other's numbers — an AHT wrong by the width of
+    after-call work with nothing on screen to say so. A guess must never beat a
+    certainty, and the same column must never mean two things."""
     saved = {k: v for k, v in (saved_map or {}).items() if v}
     by_key = {_key(c): c for c in df.columns}
     resolved, missing, auto = {}, [], []
-    for canon, required, aliases in FIELDS[feed]:
+    claimed: set[str] = set()
+
+    # Pass 1 — certainties: the planner's explicit pick, then the canonical
+    # name appearing verbatim in the export.
+    for canon, _required, _aliases in FIELDS[feed]:
         src_col = None
         if canon in saved and saved[canon] in df.columns:
             src_col = saved[canon]                       # planner's explicit pick
         elif canon in df.columns:
             src_col = canon                              # already canonical
-        else:
-            for cand in (canon,) + tuple(aliases):       # alias auto-detect
-                hit = by_key.get(_key(cand))
-                if hit is not None:
-                    src_col, _ = hit, auto.append(canon)
-                    break
         if src_col is not None:
             resolved[canon] = src_col
-        elif required:
-            missing.append(canon)
+            claimed.add(src_col)
+
+    # Pass 2 — guesses: alias auto-detect, over what pass 1 left unclaimed.
+    for canon, _required, aliases in FIELDS[feed]:
+        if canon in resolved:
+            continue
+        for cand in (canon,) + tuple(aliases):
+            hit = by_key.get(_key(cand))
+            if hit is not None and hit not in claimed:
+                resolved[canon] = hit
+                claimed.add(hit)
+                auto.append(canon)
+                break
+
+    missing = [c for c, required, _ in FIELDS[feed] if required and c not in resolved]
     renamed = df.rename(columns={v: k for k, v in resolved.items() if v != k})
     return renamed, resolved, missing, auto
 
@@ -515,7 +584,11 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
         rep.errors.append("No ACD split rows matched the mapping.")
         return pd.DataFrame(), rep
 
-    for c in ["i_stafftime", "i_auxtime"]:
+    # The measurement columns get the SAME coercion discipline as the time
+    # columns — they are optional, so only the ones this export actually
+    # carried are touched.
+    for c in ["i_stafftime", "i_auxtime"] + [m for m in MEASURE_COLS
+                                             if m in df.columns]:
         raw = df[c]
         coerced = pd.to_numeric(raw, errors="coerce")
         blank = raw.isna() | (raw.astype(str).str.strip() == "")
@@ -549,8 +622,19 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
 
 def split_weekly(df: pd.DataFrame, assumptions: dict | None = None
                  ) -> pd.DataFrame:
-    """Weekly per-LOB actual staffed FTE + measured in-office shrinkage %."""
+    """Weekly per-LOB actual staffed FTE + measured in-office shrinkage %, and
+    — when the export carried the measurement columns — actual volume, AHT,
+    service level and abandons (added 2026-07-31).
+
+    Those extra columns are what make this feed a measurement layer in its own
+    right rather than a staffing-time feed, so the WFM feed's forecast can be
+    dropped without taking the app's actuals with it.
+
+    Every measurement is OMITTED when its source column is absent, never
+    defaulted to 0: a fabricated zero would read as a genuinely quiet week and
+    silently drag measured CPM and the derived seasonality curve down."""
     assumptions = assumptions or {}
+    have = [c for c in MEASURE_COLS if c in df.columns]
     rows = []
     for (lob, week), g in df.groupby(["LOB", "Week"]):
         a = assumptions.get(lob, {})
@@ -561,11 +645,48 @@ def split_weekly(df: pd.DataFrame, assumptions: dict | None = None
         # Staffed hours are already net of AUX-out-of-office by ACD definition;
         # in-office shrink here = AUX time as a share of staffed time.
         shrink_pct = (aux_hrs / staff_hrs * 100) if staff_hrs else np.nan
-        rows.append({
+        row = {
             "LOB": lob, "Week": week, "Days Covered": days,
             "Actual Staffed FTE": round(staff_hrs / paid, 1) if paid else np.nan,
             "Staffed Hrs": round(staff_hrs, 1),
             "In-Office Shrink %": round(shrink_pct, 1) if pd.notna(shrink_pct) else np.nan,
-        })
+        }
+
+        def tot(col):
+            """Week total, or NaN when the column is absent/entirely missing —
+            `min_count=1` is what keeps 'no data' from summing to a real 0."""
+            return g[col].sum(min_count=1) if col in have else np.nan
+
+        offered, answered = tot("callsoffered"), tot("acdcalls")
+        talk, hold, acw = tot("acdtime"), tot("holdtime"), tot("acwtime")
+        accepted, abandoned = tot("acceptable"), tot("abncalls")
+
+        if pd.notna(offered):
+            row["Actual Contacts"] = float(offered)
+        if pd.notna(answered):
+            row["Answered Contacts"] = float(answered)
+        # AHT = (talk + hold + acw) / answered — hold time INCLUDED; that
+        # inclusion is what made this agree with the WFM feed on real data
+        # (crosscheck_metrics.py). Divide by ANSWERED, not offered: an
+        # abandoned contact consumed no handle time.
+        if pd.notna(talk) and pd.notna(answered) and answered > 0:
+            handle = float(talk) + float(hold or 0) + float(acw or 0)
+            row["Actual AHT (sec)"] = round(handle / float(answered), 1)
+        if pd.notna(accepted) and pd.notna(offered) and offered > 0:
+            row["Actual SL %"] = round(float(accepted) / float(offered) * 100, 1)
+        if pd.notna(abandoned):
+            row["Abandoned Contacts"] = float(abandoned)
+            if pd.notna(offered) and offered > 0:
+                row["Abandon %"] = round(float(abandoned) / float(offered) * 100, 1)
+        if "servicelevel" in have:
+            # The SL THRESHOLD in seconds (20/40/120) — a label for the SL%
+            # above, not a measurement. It is a per-queue setting, so a week
+            # mixing queues with different thresholds has no single answer:
+            # report the modal value and only when the week agrees on one.
+            thr = pd.to_numeric(g["servicelevel"], errors="coerce").dropna()
+            thr = thr[thr > 0]
+            if not thr.empty and thr.nunique() == 1:
+                row["SL Threshold (sec)"] = float(thr.iloc[0])
+        rows.append(row)
     out = pd.DataFrame(rows)
     return out.sort_values(["LOB", "Week"]).reset_index(drop=True) if not out.empty else out
