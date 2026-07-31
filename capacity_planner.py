@@ -2569,7 +2569,15 @@ def render_team_status() -> tuple[bool, str]:
     if c1.button(take_label, width="stretch"):
         ok, info = collab.acquire_lock(SCENARIO_DIR, year, user, force=True)
         st.session_state[f"lock_token_{year}"] = (info or {}).get("token")
-        _load_active_into_session()  # edit from the current truth (no-op if none)
+        # Re-seed from the shared truth ONLY when it actually moved under us
+        # (a colleague published while we were viewing). Reloading the version
+        # we are already on is not the no-op it looks like: _apply_payload
+        # overwrites every frame, so it silently discarded work held in the
+        # session — the other half of the vanishing-new-hires report
+        # (2026-07-31). Same-version case: keep what we have.
+        _act = collab.read_active(SCENARIO_DIR, year)
+        if _act and _act.get("version") != st.session_state.get("loaded_version"):
+            _load_active_into_session()
         st.session_state[_we_key] = True
         st.rerun()
     if c2.button("Sandbox", width="stretch"):
@@ -4855,6 +4863,17 @@ elif view == CONSOLIDATED:
 else:
     lob = st.session_state.lobs[view]
     page_help("Capacity Plan")
+    if RO:
+        # The grids below are LOCKED while read-only. They used to accept typing
+        # that Take control then destroyed: acquiring the lock reloads the
+        # published snapshot over the session, so a class entered while viewing
+        # vanished the moment you took control (field report 2026-07-31 — the
+        # symptom read as "rollover ate my new hires", but no rollover was
+        # needed). The sidebar has gated every input on `RO` since day one; the
+        # three grids were the hole in that rule.
+        st.info("**Read-only** — take control (sidebar) to edit this plan, or "
+                "open a Sandbox to try changes privately. The grids below are "
+                "locked so nothing you type can be lost.")
     tab_plan, tab_inputs, tab_nh = st.tabs(["Plan", "Weekly Inputs", "New-Hire Classes"])
 
     with tab_inputs:
@@ -4874,7 +4893,7 @@ else:
             prev_demand = lob["demand"]
             edited_demand = stable_editor(
                 prev_demand, state_key=f"demand_{view}", width="stretch", num_rows="fixed",
-                disabled=["Week", "Members"], hide_index=True,
+                disabled=True if RO else ["Week", "Members"], hide_index=True,
                 column_config={
                     "Seasonality": st.column_config.NumberColumn(
                         format="%.2f", min_value=0.0,
@@ -4990,7 +5009,7 @@ else:
             prev_roster = lob["roster"]
             edited_roster = stable_editor(
                 prev_roster, state_key=f"roster_{view}", width="stretch", num_rows="fixed",
-                disabled=["Week"], hide_index=True)
+                disabled=True if RO else ["Week"], hide_index=True)
             filled = [forward_fill_step(prev_roster, edited_roster, c)
                       for c in ("LOA", "Supervisors", "Leads/Project")]
             lob["roster"] = edited_roster
@@ -5008,7 +5027,12 @@ else:
                 "bottom row; to remove one, select the row (left edge) and press "
                 "Delete — or the trash icon.")
             lob["nh"] = stable_editor(
-                lob["nh"], state_key=f"nh_{view}", width="stretch", num_rows="dynamic",
+                lob["nh"], state_key=f"nh_{view}", width="stretch",
+                # num_rows too, not just `disabled`: a dynamic editor keeps its
+                # add-row affordance when disabled, so a viewer could still type
+                # a class into a grid that cannot keep it.
+                num_rows="fixed" if RO else "dynamic",
+                disabled=RO,
                 hide_index=True,
                 column_config={
                     "Class Start Week": st.column_config.SelectboxColumn(
