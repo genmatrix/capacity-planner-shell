@@ -257,6 +257,13 @@ def _switch_year(year: int) -> None:
         # Nothing published for that year yet (a fresh rollover). Keep the
         # frames on screen — they ARE that year's working plan.
         st.session_state.loaded_version = None
+    # That year may hold unpublished work: drafts are per-year, so the year you
+    # left kept its own. Offer it HERE rather than only at the next boot —
+    # someone who added classes, rolled over, and came back found the year
+    # apparently empty with no hint the work still existed (field report
+    # 2026-07-30). Same Resume/Discard banner the startup check raises.
+    st.session_state.pop("_draft_pending", None)
+    _startup_draft_check()
     st.rerun()
 
 
@@ -2902,6 +2909,36 @@ with st.sidebar:
                        "(actual)** on the demand grid and load the WFM feed to build "
                        "the history the trend needs.")
 
+        # Rollover REPLACES the working plan, and since plan years became
+        # separate plans, switching back to <year> loads its PUBLISHED version —
+        # so anything edited but not published is reachable only through the
+        # per-year draft at the next boot. Publishing first makes the year you
+        # are leaving recoverable in one click, forever. (Field report
+        # 2026-07-30: "rolling over made my 2026 new hires disappear" — they
+        # were intact in the published version, but nothing said where.)
+        _unpub = False
+        try:
+            _act_now = collab.read_active(SCENARIO_DIR, _yr)
+            _snap_now = (collab.load_snapshot(SCENARIO_DIR, _act_now["file"])
+                         if _act_now else None)
+            if _snap_now is None:
+                _unpub = True
+            else:
+                _keys = ("n_weeks", "plan_year", "members_start", "members_end", "lobs")
+                _mine = {k: v for k, v in _serialize_lobs().items() if k in _keys}
+                _ref = {k: _snap_now.get(k) for k in _keys if k in _snap_now}
+                _unpub = (json.dumps(_mine, sort_keys=True, default=str)
+                          != json.dumps(_ref, sort_keys=True, default=str))
+        except Exception:      # never let a check block the panel
+            _unpub = False
+        if _unpub:
+            st.warning(
+                f"⚠️ This {_yr} plan has changes that are **not published**. "
+                f"Rolling over replaces your working plan with {_yr + 1}, and "
+                f"switching back to {_yr} then loads its last *published* "
+                "version — these edits would not be in it. **Publish "
+                f"{_yr} first**, then roll over.")
+
         sure = st.checkbox(f"Replace my working plan with a seeded {_yr + 1} plan",
                            key="roll_confirm", disabled=RO)
         if st.button(f"Roll into {_yr + 1}", disabled=RO or not sure, key="roll_btn"):
@@ -3442,9 +3479,13 @@ def _org_actual_aht(lobs: list[str], weeks: list[str]) -> tuple[float, int] | No
     return (num / den, len(covered)) if den > 0 else None
 
 
-def _org_measured_attrition(plans: dict) -> tuple[float, int] | None:
-    """(annualized %, weeks recorded) across every LOB, from the weeks a planner
-    actually entered an Attrition (actual) figure.
+def _org_measured_attrition(plans: dict) -> dict | None:
+    """Annualized attrition across every LOB, from the weeks a planner actually
+    entered an Attrition (actual) figure.
+
+    Returns the INPUTS as well as the answer — pct, weeks, departures,
+    avg_at_risk, blank_elapsed — so the tile can show its own arithmetic
+    instead of asking anyone to take 42.6% on faith.
 
     Aggregated from the numerator and denominator — Σ departures ÷ Σ
     headcount-at-risk × 52 — NOT by averaging the per-LOB percentages, which
@@ -3454,7 +3495,7 @@ def _org_measured_attrition(plans: dict) -> tuple[float, int] | None:
     it read as zero departures would teach the org a falsely low rate.
     Caller must respect ATTR_MIN_WEEKS before presenting it as fact."""
     dep = risk = 0.0
-    weeks_recorded = 0
+    weeks_recorded = blanks = 0
     for name, d in st.session_state.lobs.items():
         ros = d["roster"]
         if "Attrition (actual)" not in ros.columns or name not in plans:
@@ -3468,9 +3509,19 @@ def _org_measured_attrition(plans: dict) -> tuple[float, int] | None:
         dep += float(act[m].sum())
         risk += float(start[m].sum())
         weeks_recorded = max(weeks_recorded, int(m.sum()))
+        # Elapsed weeks with NOTHING entered are the inflation risk: they are
+        # excluded from the denominator, so recording only the weeks where
+        # someone LEFT divides by the bad weeks alone and annualizes from
+        # them. The walk already reads a blank elapsed week as zero
+        # departures; the measurement deliberately does not, to stop Adopt
+        # learning a falsely LOW rate from missing data. That asymmetry is
+        # correct but it has a mirror image, so it has to be visible.
+        blanks += int((_weeks_passed(d["demand"]["Week"].tolist()) & ~m).sum())
     if risk <= 0:
         return None
-    return float(dep / risk * 52 * 100), weeks_recorded
+    return {"pct": float(dep / risk * 52 * 100), "weeks": weeks_recorded,
+            "departures": dep, "avg_at_risk": risk / max(weeks_recorded, 1),
+            "blank_elapsed": blanks}
 
 
 def _compact(v: float) -> str:
@@ -3617,13 +3668,24 @@ def render_executive_view():
                    else ("· 0" if _hd is not None else None)),
          "delta_tone": ("good" if (_hd or 0) > 0 else "bad") if _hd else "",
          "spark": list(cons_hc), "spark_color": brand.SUPPLY},
-        {"label": "Attrition (actual)",
-         "value": f"{attr[0]:.1f}%" if attr else "—",
-         "sub": (("%d wk(s) recorded" % attr[1]
-                  + ("" if attr[1] >= ATTR_MIN_WEEKS
-                     else f" — under {ATTR_MIN_WEEKS}, treat as noise"))
+        # Label says ANNUALIZED, and the sub shows the arithmetic. "42.6%" on
+        # 53 departures reads like a mistake until you can see it is
+        # 53 ÷ (216 × 30 wks) × 52 — the year-to-date rate scaled to a full
+        # year, not the share of the workforce that has left (field question
+        # 2026-07-30). A figure a planner cannot check is a figure they cannot
+        # trust, and this one drives hiring.
+        {"label": "Attrition (annualized)",
+         "value": f"{attr['pct']:.1f}%" if attr else "—",
+         "sub": ((f"{attr['departures']:,.0f} left over {attr['weeks']} wk(s), "
+                  f"avg {attr['avg_at_risk']:,.0f} at risk"
+                  + ("" if attr["weeks"] >= ATTR_MIN_WEEKS
+                     else f" — under {ATTR_MIN_WEEKS}, treat as noise")
+                  + (f" · ⚠ {attr['blank_elapsed']} elapsed wk(s) blank, "
+                     "which inflates this"
+                     if attr["blank_elapsed"] else ""))
                  if attr else "no departures recorded yet"),
-         "sub_warn": attr is None or attr[1] < ATTR_MIN_WEEKS},
+         "sub_warn": (attr is None or attr["weeks"] < ATTR_MIN_WEEKS
+                      or bool(attr["blank_elapsed"]))},
     ]
     brand.stat_row(tiles)
 
