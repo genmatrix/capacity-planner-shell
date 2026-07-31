@@ -291,11 +291,26 @@ h2, h3 {{ letter-spacing: -0.022em; color: {TEXT}; }}
 }}
 .cc-brand {{ display: flex; align-items: center; gap: 12px; }}
 .cc-tile {{
-  width: 42px; height: 42px; border-radius: 8px;
+  height: 42px; min-width: 42px; padding: 0 11px;
+  /* THREE corners sharp, only the bottom-right rounded. The order is
+     top-left / top-right / bottom-right / bottom-left, so a single value in
+     the third slot is the whole effect — rounding the trailing EDGE (two
+     corners) reads as a button instead of a plate. */
+  border-radius: 0 0 14px 0;
   background: {RED};
-  display: flex; align-items: center; justify-content: center;
-  color: #fff; font-weight: 800; font-size: 16px; letter-spacing: -0.02em;
+  display: flex; align-items: center; justify-content: center; gap: 0;
+  color: #fff; font-weight: 800; letter-spacing: .02em;
 }}
+/* Each character sits in its own cell with a hairline rule between — the
+   separator is a BORDER on the cell, so it never renders before the first
+   letter or after the last, whatever the mark's length. The mark itself comes
+   from branding.json, which is gitignored and never published; only this
+   geometry ships. */
+.cc-tile .ch {{
+  padding: 0 8px; line-height: 1;
+  border-left: 1.5px solid rgba(255,255,255,.92);
+}}
+.cc-tile .ch:first-child {{ border-left: 0; }}
 .cc-word {{ color: {TEXT}; font-weight: 700; font-size: 19px; line-height: 1.05; }}
 .cc-sub {{
   color: {MUTED}; font-size: 10.5px; text-transform: uppercase;
@@ -616,13 +631,16 @@ def inject():
 # ---------------------------------------------------------------- components
 def header(doc_type: str, meta: str):
     ident = identity()
-    # The tile is a fixed square, so the mark has to shrink to fit rather than
-    # overflow it — "CC" and a four-letter mark cannot share one font size.
-    tile_px = {1: 18, 2: 16, 3: 13}.get(len(ident["mark"]), 11)
+    # The tile grows with the mark now (min-width keeps a 1-2 char mark square),
+    # so the font size only has to step down for genuinely long marks.
+    tile_px = {1: 19, 2: 18, 3: 17}.get(len(ident["mark"]), 16)
+    # One cell per character; the CSS draws the rule between them.
+    _cells = "".join(f'<span class="ch">{_esc(c)}</span>'
+                     for c in ident["mark"])
     st.markdown(f"""
 <div class="cc-header">
   <div class="cc-brand">
-    <div class="cc-tile" style="font-size:{tile_px}px">{_esc(ident["mark"])}</div>
+    <div class="cc-tile" style="font-size:{tile_px}px">{_cells}</div>
     <div><div class="cc-word">{_esc(ident["word"])}</div>
          <div class="cc-sub">{_esc(ident["sub"])}</div></div>
   </div>
