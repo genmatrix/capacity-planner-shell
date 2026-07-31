@@ -4575,8 +4575,7 @@ def render_budget_page():
         f"The plan as leadership consumes it: **how many contacts** we expect in "
         f"{yr} and **how many people** it takes to serve them, by month or quarter. "
         "Contacts are summed across the period; FTE is averaged (headcount is a "
-        "level, not a flow) with the peak week shown alongside. **No cost figures** "
-        "— Finance applies its own rates to these FTE numbers. A week belongs to "
+        "level, not a flow) with the peak week shown alongside. A week belongs to "
         "the period containing its Monday.")
     page_help("Budget")
 
