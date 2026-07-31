@@ -1,21 +1,29 @@
 """
-Importers for the three real feeds the WFM team already exports:
+Importers for the real feeds the WFM team exports:
 
   * Skill_Mapping.csv  — the join table: Skill_ID / Queue_Name -> Line of Business
-  * wfm.csv         — WFM interval export (the forecast is already done here:
-                         Forecasted_CV, Forecasted_AHT, Required_FTE per queue)
-  * split.csv          — ACD hsplit interval export (actual staffed time + AUX)
+  * split.csv          — ACD hsplit interval export: the MEASUREMENT layer
+                         (contacts offered/answered, handle time, service level,
+                         abandons, staffed time, AUX)
 
-Nothing here forecasts. WFM and ACD become the *reality check* against the
-planner's built-in model:
-  - WFM's interval Required_FTE  -> weekly ON-ROLL FTE benchmark (seated-hours
-    method: sum(Required_FTE)*interval_hrs, grossed up by shrinkage over paid hrs).
-  - ACD staffed time + AUX          -> measured actual staffed FTE and in-office
-    shrinkage, to calibrate the model's assumptions instead of guessing.
+Nothing here forecasts. The ACD export is the *reality check* against the
+planner's built-in model: measured volume and AHT calibrate the demand
+assumptions, measured staffed time and AUX give actual FTE and in-office
+shrinkage, and measured SL/abandons say whether the staffing worked.
 
-Grain note: WFM/ACD rows are 15-min intervals. We roll up to weeks (Mon-anchored)
-and always report how many *days* each week actually covers — a partial week (the
-sanitized sample is a single day) must never be read as a full week.
+The WFM (WFM) feed was RETIRED on 2026-07-31 (manager ask 2026-07-30). It
+is an OPERATIONAL forecast — intraday-shaped, horizon ending with the current
+year — and setting it beside a long-range capacity plan invited comparisons
+that confused more than they informed; its per-15-min Required_FTE also
+inflated small queues about 2x, which the team already distrusted. Its ACTUALS
+were the app's whole measurement layer, so they were not simply dropped: the
+ACD export always carried the same measurements and the app now reads them.
+Verified on real data before the removal — SL% and AHT agreed to within
+0.27pp and a few seconds per queue. See git history for the loader.
+
+Grain note: ACD rows are 15-min intervals. We roll up to weeks (Mon-anchored)
+and always report how many *days* each week actually covers — a partial week
+(the sanitized sample is a single day) must never be read as a full week.
 """
 from __future__ import annotations
 
@@ -167,8 +175,8 @@ def _seated_hrs_to_fte(seated_hrs, shrink_pct, paid_hrs_week) -> float:
 # Vendor-agnostic column mapping
 #
 # The app works in CANONICAL field names (the ones the engine and rollups
-# use). Any vendor's export — WFM today, NICE IEX tomorrow, a hand-built
-# CSV — is admitted by mapping ITS headers onto these. Resolution order:
+# use). Any vendor's export — ACD today, another ACD tomorrow, a
+# hand-built CSV — is admitted by mapping ITS headers onto these. Resolution order:
 #   1. an explicit saved map (planner picked the columns in the UI), then
 #   2. alias auto-detection (case/punctuation-insensitive), then
 #   3. the canonical name itself.
@@ -183,36 +191,6 @@ FIELDS = {
                                     "department", "team", "service")),
         ("Queue_Name", True, ("queue name", "queue", "ctgroup", "contact group",
                               "management unit", "mu")),
-    ],
-    "wfm": [   # forecast + actuals feed (WFM / IEX / …)
-        ("Date", True, ("date", "datetime", "interval start", "start time",
-                        "timestamp", "date/time", "period")),
-        ("Queue", True, ("queue", "queue name", "ctgroup", "contact group",
-                         "skill", "service", "queue_id", "mu", "management unit")),
-        ("Required_FTE", True, ("required fte", "req fte", "required staff",
-                                "requirement", "required agents", "req agents")),
-        ("Forecasted_CV", True, ("forecast cv", "forecast volume", "fcst volume",
-                                 "forecast contacts", "forecast calls",
-                                 "forecasted contacts", "fcst cv")),
-        ("Forecasted_AHT", True, ("forecast aht", "fcst aht", "forecasted aht",
-                                  "forecast handle time")),
-        ("Actual_CV", True, ("actual cv", "actual volume", "actual contacts",
-                             "actual calls", "offered", "contacts offered",
-                             "calls offered", "volume")),
-        ("Actual_AHT", True, ("actual aht", "aht", "handle time",
-                              "average handle time")),
-        ("Actual_ASA", False, ("actual asa", "asa", "average speed of answer",
-                               "avg speed answer")),
-        ("Actual_Abandonment", False, ("actual abandonment", "abandon rate",
-                                       "abandonment", "abandon %", "aband rate")),
-        ("Actual_Occupancy", False, ("actual occupancy", "occupancy", "occ %",
-                                     "occupancy %")),
-        ("Actual_PCA", False, ("actual pca", "actual sl", "actual service level",
-                               "service level", "sl %", "sl actual", "pca")),
-        ("Forecasted_PCA", False, ("forecast pca", "forecast sl",
-                                   "forecasted service level", "fcst sl")),
-        ("Required_PCA", False, ("required pca", "sl target", "service level target",
-                                 "sl goal", "target sl")),
     ],
     "acd": [   # staffed-time + AUX feed (ACD hsplit / IEX-side ACD / …)
         ("row_date", True, ("row date", "date", "day")),
@@ -255,6 +233,12 @@ FIELDS = {
         ("abncalls", False, ("abandoned calls", "abandons")),
         ("acceptable", False, ("calls answered in service level", "within sl")),
         ("servicelevel", False, ("service level threshold", "sl threshold")),
+        # ASA's numerator. Occupancy needs no new column — it comes from
+        # i_acdtime/i_acwtime over i_stafftime, all already above. Both were
+        # WFM-only readings until 2026-07-31; deriving them here is what let
+        # the WFM feed go without quietly losing two metrics off the
+        # reconciliation.
+        ("anstime", False, ("answer time", "total answer time")),
     ],
 }
 
@@ -266,19 +250,6 @@ FIELD_LABELS = {
     "Skill_ID": "Split / skill ID",
     "Line_of_Business": "Line of business",
     "Queue_Name": "Queue name",
-    "Date": "Date / interval start",
-    "Queue": "Queue name",
-    "Required_FTE": "Required staff per interval",
-    "Forecasted_CV": "Forecast contacts",
-    "Forecasted_AHT": "Forecast handle time (AHT, sec)",
-    "Actual_CV": "Actual contacts",
-    "Actual_AHT": "Actual handle time (AHT, sec)",
-    "Actual_ASA": "Actual speed of answer (ASA, sec)",
-    "Actual_Abandonment": "Actual abandon rate",
-    "Actual_Occupancy": "Actual occupancy %",
-    "Actual_PCA": "Actual service level %",
-    "Forecasted_PCA": "Forecast service level %",
-    "Required_PCA": "Service level target %",
     "row_date": "Date",
     "split": "Split / skill number",
     "i_stafftime": "Staffed time (sec)",
@@ -296,6 +267,7 @@ FIELD_LABELS = {
     "abncalls": "Abandoned contacts",
     "acceptable": "Contacts answered within service level",
     "servicelevel": "Service level threshold (sec)",
+    "anstime": "Answer (queue wait) time, total (sec)",
 }
 
 
@@ -303,7 +275,7 @@ FIELD_LABELS = {
 # them an export carried, split_weekly rolls up whichever survived. Keeping the
 # list here (not inline in two functions) is what stops the two drifting.
 MEASURE_COLS = ["callsoffered", "acdcalls", "acdtime", "holdtime", "acwtime",
-                "abncalls", "acceptable", "servicelevel"]
+                "abncalls", "acceptable", "servicelevel", "anstime"]
 
 
 def field_label(name: str) -> str:
@@ -382,171 +354,6 @@ def resolve_columns(df: pd.DataFrame, feed: str, saved_map: dict | None = None
     return renamed, resolved, missing, auto
 
 
-def load_wfm(files, mapping: Mapping, field_map: dict | None = None
-                ) -> tuple[pd.DataFrame, ImportReport]:
-    """Read WFM interval export(s) (WFM, IEX, …) and tag each row with its
-    LOB. `field_map` = saved {canonical: source column} from the UI mapper."""
-    rep = ImportReport()
-    files = files if isinstance(files, (list, tuple)) else [files]
-    try:
-        df = _read_concat(files)
-    except Exception as exc:  # noqa: BLE001
-        rep.errors.append(f"Could not read WFM export: {exc}")
-        return pd.DataFrame(), rep
-
-    df, resolved, missing, auto = resolve_columns(df, "wfm", field_map)
-    if missing:
-        rep.errors.append(
-            "WFM export missing required field(s): "
-            + ", ".join(f"{field_label(m)} ({m})" for m in missing)
-            + ". Map them to this file's columns in Column mapping "
-              "(Real Data page) — any vendor's export works once mapped.")
-        return pd.DataFrame(), rep
-    if auto:
-        rep.notes.append("Auto-matched by alias: "
-                         + ", ".join(f"{field_label(c)} ← {resolved[c]}"
-                                     for c in auto))
-
-    df = df.copy()
-    df["LOB"] = df["Queue"].map(mapping.lob_for_queue)
-    unmapped = sorted(set(df.loc[df["LOB"].isna(), "Queue"].dropna().unique()))
-    if unmapped:
-        rep.warnings.append(
-            f"{len(unmapped)} WFM queue(s) not in mapping — excluded: "
-            + ", ".join(unmapped[:6]) + ("…" if len(unmapped) > 6 else ""))
-    df = df[df["LOB"].notna()].copy()
-    if df.empty:
-        rep.errors.append("No WFM rows matched the mapping.")
-        return pd.DataFrame(), rep
-
-    opt = ["Actual_ASA", "Actual_Abandonment", "Actual_Occupancy",
-           "Actual_PCA", "Forecasted_PCA", "Required_PCA"]
-    _raw_cols = {}
-    for c in (["Required_FTE", "Forecasted_CV", "Forecasted_AHT",
-               "Actual_CV", "Actual_AHT"] + [o for o in opt if o in df.columns]):
-        _raw_cols[c] = df[c].copy()          # pre-coercion, for blank-vs-malformed
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Week"] = _week_start(df["Date"])
-    df["_date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-    # Post-coercion honesty (audit 2026-07-14): presence checks can't catch a
-    # date-format change or text pollution — those coerce to NaT/NaN, NaT-dated
-    # rows silently vanished in the weekly groupby, and all-NaN weeks summed
-    # to a plausible-looking 0. Count, say so loudly, drop unreadable dates
-    # EXPLICITLY, and reject an import with no readable dates at all.
-    bad_dates = int(df["_date"].isna().sum())
-    if bad_dates:
-        rep.warnings.append(
-            f"{bad_dates:,} WFM row(s) have unreadable dates — EXCLUDED from "
-            "weekly rollups (a date-format change in the export is the usual "
-            "cause; fix the export or the column mapping).")
-        df = df[df["_date"].notna()].copy()
-        if df.empty:
-            rep.errors.append("Every WFM row had an unreadable date — import "
-                              "rejected rather than shown as empty weeks.")
-            return pd.DataFrame(), rep
-    # Two distinct hazards (audit#2 2026-07-14), two calibrations:
-    # MALFORMED non-blank values ("oops", "#N/A") — a healthy export has ZERO,
-    # so ANY count is corruption and warns, even one (a single silent -1 was
-    # the audit's repro). Legitimate BLANKS are normal interval data (~17%
-    # blank Actual_CV on the clean sample — not-yet-elapsed intervals), so
-    # blank share warns only above 25% (a format-change tell).
-    for c in ["Required_FTE", "Forecasted_CV", "Forecasted_AHT",
-              "Actual_CV", "Actual_AHT"]:
-        raw = _raw_cols[c]
-        blank = raw.isna() | (raw.astype(str).str.strip() == "")
-        malformed = int((~blank & df[c].isna()).sum())
-        if malformed:
-            rep.warnings.append(
-                f"WFM '{field_label(c)}' ({c}): {malformed:,} MALFORMED non-blank "
-                "value(s) read as blank — a healthy export has none; the "
-                "affected intervals no longer count toward totals. Check the "
-                "export format.")
-        n_blank = int(blank.sum())
-        if n_blank and n_blank / len(df) > 0.25:
-            rep.warnings.append(
-                f"WFM '{field_label(c)}' ({c}): {n_blank:,} of {len(df):,} value(s) "
-                "blank — unusually high; all-blank weeks stay missing in the "
-                "rollup, never 0. If this export used to load cleanly, its "
-                "format changed.")
-    rep.notes.append(f"Loaded {len(df):,} WFM interval rows across "
-                     f"{df['_date'].nunique()} day(s).")
-    return df, rep
-
-
-def wfm_weekly(df: pd.DataFrame, assumptions: dict | None = None
-                  ) -> pd.DataFrame:
-    """Roll interval WFM rows up to weekly per-LOB on-roll FTE benchmark.
-
-    `assumptions` is an optional {lob: {shrinkage_pct, paid_hours_per_week}} map;
-    LOBs absent from it fall back to module defaults.
-    """
-    assumptions = assumptions or {}
-    rows = []
-    for (lob, week), g in df.groupby(["LOB", "Week"]):
-        a = assumptions.get(lob, {})
-        shrink = float(a.get("shrinkage_pct", DEFAULT_SHRINKAGE_PCT))
-        paid = float(a.get("paid_hours_per_week", DEFAULT_PAID_HRS_WEEK))
-        occ = float(a.get("occupancy_pct", DEFAULT_OCCUPANCY_PCT))
-        margin = float(a.get("workload_margin_pct", DEFAULT_MARGIN_PCT))
-        # min_count=1: a week whose column failed coercion entirely must stay
-        # MISSING — the pandas default would sum all-NaN to a plausible 0
-        # (audit 2026-07-14; same rule as the app-side _bench_series).
-        seated_hrs = g["Required_FTE"].sum(min_count=1) * INTERVAL_HOURS
-        fcst_cv = g["Forecasted_CV"].sum(min_count=1)
-        act_cv = g["Actual_CV"].sum(min_count=1)
-        # Contact-weighted handle times & service metrics (blank intervals ignored).
-        f_aht = _wavg(g["Forecasted_AHT"], g["Forecasted_CV"])
-        a_aht = _wavg(g["Actual_AHT"], g["Actual_CV"])
-        a_asa = _wavg(g["Actual_ASA"], g["Actual_CV"]) if "Actual_ASA" in g else np.nan
-        a_ab = _wavg(g["Actual_Abandonment"], g["Actual_CV"]) if "Actual_Abandonment" in g else np.nan
-        a_occ = _wavg(g["Actual_Occupancy"], g["Actual_CV"]) if "Actual_Occupancy" in g else np.nan
-        a_occ = a_occ if (pd.notna(a_occ) and a_occ > 0) else np.nan  # 0% = not reported
-        # PCA is WFM's service level (% answered within threshold, i.e.
-        # acceptable ÷ offered — verified against ACD acceptable/callsoffered),
-        # so the weekly figure is the contact-weighted interval average.
-        f_sl = _wavg(g["Forecasted_PCA"], g["Forecasted_CV"]) if "Forecasted_PCA" in g else np.nan
-        a_sl = _wavg(g["Actual_PCA"], g["Actual_CV"]) if "Actual_PCA" in g else np.nan
-        # Required_PCA is the queue's SL target (75/80); constant per queue, so
-        # the contact-weighted blend only matters when an LOB mixes targets.
-        t_sl = _wavg(g["Required_PCA"], g["Actual_CV"]) if "Required_PCA" in g else np.nan
-        # Workload-based requirement from WFM's forecast CV × AHT and OUR
-        # assumptions — same formula as compute_plan. Alternative to WFM's
-        # interval Required_FTE, whose per-interval minimum staffing inflates
-        # the weekly sum for small queues with long open hours.
-        prod_hrs = paid * (1 - shrink / 100) * (occ / 100)
-        wl_fte = (fcst_cv * f_aht / 3600 * (1 + margin / 100) / prod_hrs
-                  if pd.notna(f_aht) and fcst_cv > 0 and prod_hrs > 0 else np.nan)
-        rows.append({
-            "LOB": lob, "Week": week,
-            "Days Covered": g["_date"].nunique(),
-            "WFM Required FTE": round(_seated_hrs_to_fte(seated_hrs, shrink, paid), 1),
-            "Workload Req FTE": round(wl_fte, 1) if pd.notna(wl_fte) else np.nan,
-            "Seated Hrs (req)": round(seated_hrs, 1),
-            "Forecast Contacts": float(fcst_cv) if pd.notna(fcst_cv) else np.nan,
-            "Actual Contacts": float(act_cv) if pd.notna(act_cv) else np.nan,
-            "Forecast AHT (sec)": round(f_aht, 0) if pd.notna(f_aht) else np.nan,
-            "Actual AHT (sec)": round(a_aht, 0) if pd.notna(a_aht) else np.nan,
-            "Forecast SL %": round(f_sl, 1) if pd.notna(f_sl) else np.nan,
-            "Actual SL %": round(a_sl, 1) if pd.notna(a_sl) else np.nan,
-            "SL Target %": round(t_sl, 1) if pd.notna(t_sl) else np.nan,
-            "Actual ASA (sec)": round(a_asa, 0) if pd.notna(a_asa) else np.nan,
-            "Abandon (actual)": round(a_ab, 2) if pd.notna(a_ab) else np.nan,
-            "Occupancy % (actual)": round(a_occ, 1) if pd.notna(a_occ) else np.nan,
-        })
-    out = pd.DataFrame(rows)
-    return out.sort_values(["LOB", "Week"]).reset_index(drop=True) if not out.empty else out
-
-
-def _wavg(values: pd.Series, weights: pd.Series) -> float:
-    v = pd.to_numeric(values, errors="coerce")
-    w = pd.to_numeric(weights, errors="coerce").fillna(0)
-    mask = v.notna() & (w > 0)
-    return float((v[mask] * w[mask]).sum() / w[mask].sum()) if mask.any() else np.nan
-
-
-# ----------------------------------------------------------------------
-# ACD split  ->  actual staffed FTE + measured in-office shrinkage
-# ----------------------------------------------------------------------
 def load_split(files, mapping: Mapping, field_map: dict | None = None
                ) -> tuple[pd.DataFrame, ImportReport]:
     """Read ACD interval export(s) (ACD hsplit, …). `field_map` = saved
@@ -596,9 +403,15 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
         if malformed:
             # Corruption stays UNKNOWN (NaN), never a fake observed 0 — zero
             # staffed time is a real possible measurement (audit#2 2026-07-14).
+            # Name what the affected weeks actually lose. This used to say
+            # "missing staffing" for every column, which was wrong the moment
+            # the measurement columns landed (2026-07-31) — a corrupt
+            # callsoffered does not cost you staffing, it costs you volume.
+            _lost = ("staffing" if c in ("i_stafftime", "i_auxtime")
+                     else "this measurement")
             rep.warnings.append(
                 f"ACD '{field_label(c)}' ({c}): {malformed:,} MALFORMED non-blank value(s) kept as "
-                "missing — affected weeks show missing staffing, not an "
+                f"missing — affected weeks show missing {_lost}, not an "
                 "understated figure. Check the export format.")
         # legitimate blanks = 0 (an interval with no AUX/staffed seconds);
         # malformed non-blanks stay NaN (unknown), valid values pass through
@@ -678,6 +491,22 @@ def split_weekly(df: pd.DataFrame, assumptions: dict | None = None
             row["Abandoned Contacts"] = float(abandoned)
             if pd.notna(offered) and offered > 0:
                 row["Abandon %"] = round(float(abandoned) / float(offered) * 100, 1)
+        # ASA = total answer (queue wait) time / answered. Was a WFM-only
+        # reading until 2026-07-31; deriving it here is what stopped the WFM
+        # removal quietly costing the reconciliation two rows.
+        answer_t = tot("anstime")
+        if pd.notna(answer_t) and pd.notna(answered) and answered > 0:
+            row["Actual ASA (sec)"] = round(float(answer_t) / float(answered), 1)
+        # Occupancy = productive time / staffed time, from columns the feed
+        # already carried. Note this is a MEASUREMENT of what occupancy ran at,
+        # not the `occupancy_pct` ASSUMPTION the engine sizes with — same word,
+        # two different things, and only one of them is evidence.
+        talk_i = g["i_acdtime"].sum(min_count=1) if "i_acdtime" in df.columns else np.nan
+        acw_i = g["i_acwtime"].sum(min_count=1) if "i_acwtime" in df.columns else np.nan
+        if pd.notna(talk_i) and pd.notna(staff_hrs) and staff_hrs > 0:
+            productive = float(talk_i) + float(acw_i if pd.notna(acw_i) else 0.0)
+            row["Occupancy % (actual)"] = round(
+                productive / (float(staff_hrs) * 3600) * 100, 1)
         if "servicelevel" in have:
             # The SL THRESHOLD in seconds (20/40/120) — a label for the SL%
             # above, not a measurement. It is a per-queue setting, so a week

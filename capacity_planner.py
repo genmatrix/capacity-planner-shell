@@ -291,7 +291,7 @@ WEEKS_PER_YEAR = 52  # annual Members×CPM ÷ 52 → weekly volume (fixed, not t
 
 def week_starts(n: int, year: int | None = None):
     # Anchor to the Monday of the week containing Jan 1 — same rule sources.py
-    # uses to bucket WFM/ACD rows, so real weeks line up with plan weeks.
+    # uses to bucket ACD rows, so real weeks line up with plan weeks.
     jan1 = date(year if year is not None else plan_year(), 1, 1)
     anchor = jan1 - timedelta(days=jan1.weekday())
     return [anchor + timedelta(weeks=i) for i in range(n)]
@@ -397,7 +397,7 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
 
 def _mapped_blank_lobs(n_weeks: int) -> dict | None:
     """Blank scaffolds named for the LOBs in Skill_Mapping.csv (app folder),
-    seeding AHT from WFM measured AHT where the export is present. Returns
+    seeding AHT from ACD measured AHT where the export is present. Returns
     None if the mapping file is absent or unreadable (caller falls back to demo)."""
     mp_path = APP_DIR / "Skill_Mapping.csv"
     if not mp_path.exists():
@@ -411,15 +411,17 @@ def _mapped_blank_lobs(n_weeks: int) -> dict | None:
     if mapping is None:
         return None
     meas_aht: dict = {}
-    v_path = APP_DIR / "wfm.csv"
-    if v_path.exists():
+    s_path = APP_DIR / "split.csv"
+    if s_path.exists():
         try:
-            vdf, r, _secs, _mb = _cached_feed_raw(
-                "wfm", _files_sig([v_path]), _msig,
-                json.dumps(load_field_maps().get("wfm") or {}), mapping)
+            sdf, r, _secs, _mb = _cached_feed_raw(
+                "acd", _files_sig([s_path]), _msig,
+                json.dumps(load_field_maps().get("acd") or {}), mapping)
             if r.ok:
-                meas_aht = (sx.wfm_weekly(vdf).groupby("LOB")["Actual AHT (sec)"]
-                            .mean().dropna().round().to_dict())
+                _sw = sx.split_weekly(sdf)
+                if "Actual AHT (sec)" in _sw.columns:
+                    meas_aht = (_sw.groupby("LOB")["Actual AHT (sec)"]
+                                .mean().dropna().round().to_dict())
         except Exception:  # noqa: BLE001 — seeding is best-effort
             meas_aht = {}
     return {lob: make_blank_lob(n_weeks, float(meas_aht.get(lob, 400.0)))
@@ -618,7 +620,7 @@ def wom_seasonality(weeks: list[str], uplift: dict[int, float]) -> np.ndarray:
 
 def derive_seasonality_from_history(bench: pd.DataFrame | None, lob: str,
                                     weeks: list[str], min_weeks: int = 8):
-    """Derive a weekly Seasonality index from WFM actual contacts.
+    """Derive a weekly Seasonality index from ACD actual contacts.
 
     Each full history week's volume is bucketed by ISO week-of-year (averaging
     across years when more than one is loaded) and divided by the overall mean,
@@ -633,8 +635,8 @@ def derive_seasonality_from_history(bench: pd.DataFrame | None, lob: str,
     entire real history as partial (found at work, 2026-07-13). Truncated
     boundary weeks (below the queue's norm) are still excluded."""
     if bench is None or bench.empty or "Actual Contacts" not in bench.columns:
-        return None, ("No WFM history loaded — open the Real Data page "
-                      "first so actuals are available.")
+        return None, ("No ACD history with volume loaded — open the Real Data "
+                      "page first so actuals are available.")
     b = bench[bench["LOB"] == lob]
     full = 7
     if "Days Covered" in b.columns and not b.empty:
@@ -648,7 +650,7 @@ def derive_seasonality_from_history(bench: pd.DataFrame | None, lob: str,
     vol = b.groupby("Week")["Actual Contacts"].sum(min_count=1).dropna()
     vol = vol[vol > 0]
     if len(vol) < min_weeks:
-        return None, (f"Only {len(vol)} full week(s) of WFM history for "
+        return None, (f"Only {len(vol)} full week(s) of ACD history for "
                       f"**{lob}** (full = {full} operating day(s)/week for this "
                       f"queue) — need at least {min_weeks} to derive a curve "
                       "worth trusting. Export more history and reload.")
@@ -976,7 +978,7 @@ def _partial_bench_weeks(lob: str | None) -> list[str]:
     """The distinct partial feed weeks _drop_partial_weeks is hiding for this
     LOB (or all LOBs) — so pages can SAY they excluded them, never silently."""
     out: set[str] = set()
-    for key in ("wfm_weekly", "acd_weekly"):
+    for key in ("acd_weekly",):
         bench = st.session_state.get(key)
         if bench is None or bench.empty or "Days Covered" not in bench.columns:
             continue
@@ -1003,7 +1005,7 @@ def _partial_note(lob: str | None):
 
 
 def _bench_series(key: str, col: str, lob: str | None, weeks) -> pd.Series | None:
-    """Pull a persisted WFM/ACD benchmark column, aligned to the plan weeks.
+    """Pull a persisted ACD benchmark column, aligned to the plan weeks.
 
     `lob=None` sums across all LOBs (for the consolidated view). Returns None if
     the benchmark isn't loaded or has no weeks overlapping the plan horizon.
@@ -1045,7 +1047,7 @@ def measured_cpm(lob: str) -> tuple[float, int] | None:
         m_act = pd.to_numeric(dem["Members (actual)"], errors="coerce")
     else:
         return None
-    contacts = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+    contacts = _bench_series("acd_weekly", "Actual Contacts", lob, weeks)
     if contacts is None:
         return None
     c = pd.to_numeric(pd.Series(contacts.values, index=dem.index), errors="coerce")
@@ -1080,7 +1082,7 @@ def cpm_weekly_actuals(lob: str) -> pd.DataFrame | None:
         return None
     dem = lobs[lob]["demand"]
     weeks = dem["Week"].tolist()
-    contacts = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+    contacts = _bench_series("acd_weekly", "Actual Contacts", lob, weeks)
     if contacts is None:
         return None
     # Org-wide series is the source of truth: the sidebar (which fits the trend
@@ -1518,7 +1520,7 @@ def _field_maps_path():
 def load_field_maps() -> dict:
     """Remembered column mapping per feed — how THIS vendor's headers map onto
     the app's canonical fields. Empty until a planner maps a non-standard
-    export (WFM/ACD samples resolve by name or alias with no map at all)."""
+    export (the ACD sample resolves by name or alias with no map at all)."""
     try:
         return json.loads(_field_maps_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1817,7 +1819,7 @@ def render_shrinkage_page():
 
 
 # ----------------------------------------------------------------------
-# Real-data page — WFM forecast benchmark + ACD actuals + calibration
+# Real-data page — ACD actuals + calibration
 # ----------------------------------------------------------------------
 APP_DIR = Path(__file__).parent
 
@@ -1830,7 +1832,7 @@ def _autoload(name: str):
 
 # Remembered feed locations — the exports always live in the same place on the
 # share, so nobody should re-attach them. Stored next to the app (on the share
-# that means one config for the whole team), keys: mapping / wfm / acd.
+# that means one config for the whole team), keys: mapping / acd.
 DATA_PATHS_FILE = APP_DIR / "data_paths.json"
 
 
@@ -1848,7 +1850,7 @@ def save_data_paths(paths: dict):
 
 def resolve_data_path(key: str, saved: dict) -> list[Path]:
     """A remembered location -> existing CSV file(s). Accepts a single file, a
-    folder (all *.csv inside), or a glob pattern (e.g. …/wfm/2026-*.csv).
+    folder (all *.csv inside), or a glob pattern (e.g. …/acd/2026-*.csv).
     [] when nothing matches (share offline, typo) — callers warn about that
     loudly instead of silently falling back."""
     spec = str(saved.get(key, "") or "").strip()
@@ -1913,36 +1915,30 @@ def _cached_feed_raw(feed: str, sig: tuple, map_sig: tuple, fmap_json: str,
     is a shared reference — NEVER mutate it."""
     files = [Path(x[0]) for x in sig]
     mb = sum(x[2] for x in sig) / 1e6
-    loader = sx.load_wfm if feed == "wfm" else sx.load_split
     t0 = time.perf_counter()
-    df, rep = loader(files, _mapping,
-                     json.loads(fmap_json) if fmap_json != "{}" else None)
+    df, rep = sx.load_split(files, _mapping,
+                            json.loads(fmap_json) if fmap_json != "{}" else None)
     return df, rep, time.perf_counter() - t0, mb
 
 
 def _feed_sources_from_saved(saved: dict) -> tuple:
     """The page's source precedence WITHOUT uploads: remembered location,
-    else the app-folder sample. (map_files, wfm_files, acd_files)."""
+    else the app-folder sample. (map_files, acd_files)."""
     m = resolve_data_path("mapping", saved) or \
         ([_autoload("Skill_Mapping.csv")] if _autoload("Skill_Mapping.csv") else [])
-    v = resolve_data_path("wfm", saved) or \
-        ([_autoload("wfm.csv")] if _autoload("wfm.csv") else [])
     c = resolve_data_path("acd", saved) or \
         ([_autoload("split.csv")] if _autoload("split.csv") else [])
-    return m, v, c
+    return m, c
 
 
-def _rollups_from_raw(vraw, sraw) -> tuple:
-    """Weekly rollups from cached raw frames — recomputed live because they
-    depend on per-LOB assumptions and the shrinkage toggles."""
+def _rollups_from_raw(sraw):
+    """Weekly rollup from the cached raw ACD frame — recomputed live because it
+    depends on per-LOB assumptions and the shrinkage toggles."""
     assume = {lob: d["assumptions"] for lob, d in st.session_state.lobs.items()}
-    vw = (sx.wfm_weekly(vraw, assume)
-          if vraw is not None and not vraw.empty else None)
-    sw = None
-    if sraw is not None and not sraw.empty:
-        sdf = apply_acd_toggles(sraw)
-        sw = sx.split_weekly(sdf, assume) if not sdf.empty else None
-    return vw, sw
+    if sraw is None or sraw.empty:
+        return None
+    sdf = apply_acd_toggles(sraw)
+    return sx.split_weekly(sdf, assume) if not sdf.empty else None
 
 
 def autoload_feeds():
@@ -1953,13 +1949,12 @@ def autoload_feeds():
     Perf lands in _feed_perf (MB, parse seconds, wall seconds) so the slow
     share's cost is measured, not guessed; import errors land in _feed_errors
     and surface on the Executive View's data-health band."""
-    if "wfm_weekly" in st.session_state:
+    if "acd_weekly" in st.session_state:
         return
-    st.session_state["wfm_weekly"] = None
     st.session_state["acd_weekly"] = None
     saved = load_data_paths()
-    m_files, v_files, s_files = _feed_sources_from_saved(saved)
-    if not m_files or not (v_files or s_files):
+    m_files, s_files = _feed_sources_from_saved(saved)
+    if not m_files or not s_files:
         return                          # nothing to load — page explains
     errors, perf = [], {}
     fmaps = load_field_maps()
@@ -1969,28 +1964,17 @@ def autoload_feeds():
         mapping, rep = _cached_mapping(map_sig,
                                        json.dumps(fmaps.get("mapping") or {}))
         errors += rep.errors
-        vraw = sraw = None
         if mapping is not None:
-            for feed, files, label in (("wfm", v_files, "WFM"),
-                                       ("acd", s_files, "ACD")):
-                if not files:
-                    continue
-                t0 = time.perf_counter()
-                df, rep, secs, mb = _cached_feed_raw(
-                    feed, _files_sig(files), map_sig,
-                    json.dumps(fmaps.get(feed) or {}), mapping)
-                errors += rep.errors
-                perf[label] = {"mb": mb, "parse_s": secs,
-                               "wall_s": time.perf_counter() - t0,
-                               "files": len(files)}
-                if rep.ok:
-                    if feed == "wfm":
-                        vraw = df
-                    else:
-                        sraw = df
-            vw, sw = _rollups_from_raw(vraw, sraw)
-            st.session_state["wfm_weekly"] = vw
-            st.session_state["acd_weekly"] = sw
+            t0 = time.perf_counter()
+            df, rep, secs, mb = _cached_feed_raw(
+                "acd", _files_sig(s_files), map_sig,
+                json.dumps(fmaps.get("acd") or {}), mapping)
+            errors += rep.errors
+            perf["ACD"] = {"mb": mb, "parse_s": secs,
+                           "wall_s": time.perf_counter() - t0,
+                           "files": len(s_files)}
+            st.session_state["acd_weekly"] = (_rollups_from_raw(df)
+                                              if rep.ok else None)
     perf["total_s"] = time.perf_counter() - t_all
     st.session_state["_feed_perf"] = perf
     st.session_state["_feed_errors"] = errors
@@ -2026,13 +2010,17 @@ def _show_report(rep):
 
 
 def render_real_data_page():
-    st.header("Real Data — WFM forecast & ACD actuals")
+    st.header("Real Data — ACD actuals")
     page_help("Real Data")
     st.caption(
-        "WFM already forecasts demand; ACD measures how you actually staffed. "
-        "This page maps both to your lines of business, checks them against the "
-        "planner's model, and lets you replace guessed AHT/shrinkage with measured "
-        "values."
+        "The ACD export measures what actually happened: contacts offered and "
+        "answered, handle time, service level, abandons, staffed time and "
+        "shrinkage. This page maps it to your lines of business, checks it "
+        "against the planner's model, and lets you replace guessed "
+        "AHT/shrinkage with measured values. The WFM forecast feed was retired "
+        "on 2026-07-31 — it is an OPERATIONAL plan, and setting it beside a "
+        "long-range capacity plan invited comparisons that confused more than "
+        "they informed."
     )
 
     # 0 — Remembered locations (set once, loads every session) -------------
@@ -2040,19 +2028,19 @@ def render_real_data_page():
     with st.expander("Remembered data locations", expanded=not saved):
         st.caption(
             "Point each feed at its permanent home — a **file**, a **folder** of "
-            "CSVs, or a **pattern** like `/Volumes/WFM/wfm/2026-*.csv`. Saved to "
+            "CSVs, or a **pattern** like `/Volumes/ACD/2026-*.csv`. Saved to "
             "`data_paths.json` next to the app, so on the share the whole team gets "
             "them and nobody re-attaches files. Uploads below remain one-off overrides.")
         p_map = st.text_input("Skill mapping file", value=saved.get("mapping", ""),
                               placeholder="/Volumes/WFM/Skill_Mapping.csv",
                               key="dp_mapping")
-        p_ver = st.text_input("WFM export — file / folder / pattern",
-                              value=saved.get("wfm", ""), key="dp_wfm")
         p_acd = st.text_input("ACD split export — file / folder / pattern",
                               value=saved.get("acd", ""), key="dp_acd")
         if st.button("Remember these locations", key="dp_save"):
-            save_data_paths({"mapping": p_map.strip(), "wfm": p_ver.strip(),
-                             "acd": p_acd.strip()})
+            # The retired "wfm" key is deliberately NOT carried forward: a
+            # saved path for a feed nothing reads is a trap for whoever next
+            # wonders why editing it changes nothing.
+            save_data_paths({"mapping": p_map.strip(), "acd": p_acd.strip()})
             st.success("Saved — these feeds now load automatically every session.")
             st.rerun()
 
@@ -2098,17 +2086,16 @@ def render_real_data_page():
                                "retry when it's back.")
 
     # 0b — Column mapping (vendor-agnostic ingestion) ----------------------
-    def _render_column_mapper(m_files, v_files, s_files):
+    def _render_column_mapper(m_files, s_files):
         """Map any vendor's headers onto the app's canonical fields. Ships
-        empty: the current WFM/ACD exports resolve by name or alias with no
+        empty: the current ACD export resolves by name or alias with no
         mapping at all. Needed when a system's headers differ (e.g. a NICE IEX
         export). Renders BEFORE the feeds load, so a file whose headers don't
         match can still be fixed from here — being locked out of the mapper by
         the very file it maps was a real bug (2026-07-13)."""
         fmaps = load_field_maps()
         feeds = [("mapping", "Skill-mapping file (split/queue → LOB)", m_files),
-                 ("wfm", "WFM / forecast feed", v_files),
-                 ("acd", "ACD / staffed-time feed", s_files)]
+                 ("acd", "ACD / actuals feed", s_files)]
         broken = []
         for feed, _, files in feeds:
             if not files:
@@ -2130,7 +2117,7 @@ def render_real_data_page():
         with st.expander("Column mapping — use any system's export",
                          expanded=bool(broken)):
             st.caption(
-                "The app works in canonical field names. Any export (WFM, "
+                "The app works in canonical field names. Any export (ACD, "
                 "NICE IEX, a hand-built CSV) works once its columns are mapped "
                 "here — **map once, remembered for the team** (`field_maps.json`). "
                 "Blank = auto-detect by name/alias, which is why the current "
@@ -2174,14 +2161,12 @@ def render_real_data_page():
                 st.success("Saved — this export's layout is now remembered.")
                 st.rerun()
 
-    # 1 — Skill mapping (the join table both feeds depend on) --------------
+    # 1 — Skill mapping (the join table the feed depends on) ---------------
     st.subheader("1 · Skill mapping")
     map_up = st.file_uploader("Skill_Mapping.csv", type="csv", key="map_upl")
     map_cfg = resolve_data_path("mapping", saved)
     _render_column_mapper(
         [map_up] if map_up else map_cfg,
-        [v for v in ([_up for _up in (st.session_state.get("v_upl") or [])]
-                     or resolve_data_path("wfm", saved)) if v is not None],
         [s for s in ([_up for _up in (st.session_state.get("s_upl") or [])]
                      or resolve_data_path("acd", saved)) if s is not None])
     if map_up is None and saved.get("mapping") and not map_cfg:
@@ -2206,161 +2191,61 @@ def render_real_data_page():
         return
     st.write("**Lines of business:** " + ", ".join(mapping.lobs))
 
-    # 2 — Load the two interval feeds -------------------------------------
-    st.subheader("2 · Load feeds")
-    c1, c2 = st.columns(2)
-    v_up = c1.file_uploader("WFM export(s)", type="csv",
-                            accept_multiple_files=True, key="v_upl")
-    s_up = c2.file_uploader("ACD split export(s)", type="csv",
+    # 2 — Load the interval feed ------------------------------------------
+    st.subheader("2 · Load feed")
+    s_up = st.file_uploader("ACD split export(s)", type="csv",
                             accept_multiple_files=True, key="s_upl")
-    v_cfg = resolve_data_path("wfm", saved)
     s_cfg = resolve_data_path("acd", saved)
-    if not v_up and saved.get("wfm") and not v_cfg:
-        c1.warning(f"Remembered WFM location matches no file: `{saved['wfm']}`")
     if not s_up and saved.get("acd") and not s_cfg:
-        c2.warning(f"Remembered ACD location matches no file: `{saved['acd']}`")
-    v_src = list(v_up) if v_up else (v_cfg or ([_autoload("wfm.csv")]
-                                               if _autoload("wfm.csv") else []))
+        st.warning(f"Remembered ACD location matches no file: `{saved['acd']}`")
     s_src = list(s_up) if s_up else (s_cfg or ([_autoload("split.csv")]
                                                if _autoload("split.csv") else []))
-    if not v_up and v_src:
-        c1.caption(f"Loaded **{len(v_cfg)}** WFM file(s) from remembered location."
-                   if v_cfg else "Auto-loaded **wfm.csv**.")
     if not s_up and s_src:
-        c2.caption(f"Loaded **{len(s_cfg)}** ACD file(s) from remembered location."
+        st.caption(f"Loaded **{len(s_cfg)}** ACD file(s) from remembered location."
                    if s_cfg else "Auto-loaded **split.csv**.")
-    if not v_src and not s_src:
-        st.info("Upload at least one WFM or ACD export to continue.")
+    if not s_src:
+        st.info("Upload an ACD export to continue.")
         return
 
     # Gross-up assumptions come from matching model LOBs (else module defaults).
     assume = {lob: d["assumptions"] for lob, d in st.session_state.lobs.items()}
 
     fmaps = load_field_maps()
-    vw = sw = None
-    if v_src:
-        if v_up or _msig is None:          # uploads (either feed's or the
-            vdf, r = sx.load_wfm(v_src, mapping, fmaps.get("wfm"))  # map's)
-        else:                              # bypass the cache — correctness
-            vdf, r, _secs, _mb = _cached_feed_raw(
-                "wfm", _files_sig(v_src), _msig,
-                json.dumps(fmaps.get("wfm") or {}), mapping)
-            c1.caption(f"{_mb:.0f} MB parsed in {_secs:.1f}s — cached until "
-                       "the file changes.")
-        _show_report(r)
-        if r.ok:
-            vw = sx.wfm_weekly(vdf, assume)
-    if s_src:
-        if s_up or _msig is None:
-            sdf, r = sx.load_split(s_src, mapping, fmaps.get("acd"))
-        else:
-            sdf, r, _secs, _mb = _cached_feed_raw(
-                "acd", _files_sig(s_src), _msig,
-                json.dumps(fmaps.get("acd") or {}), mapping)
-            c2.caption(f"{_mb:.0f} MB parsed in {_secs:.1f}s — cached until "
-                       "the file changes.")
-        _show_report(r)
-        if r.ok:
-            sdf = apply_acd_toggles(sdf)
-            if sdf.empty:
-                st.warning("All ACD splits are excluded by the Shrinkage page "
-                           "mapping — nothing to roll up.")
-            sw = sx.split_weekly(sdf, assume) if not sdf.empty else None
-            st.caption("ACD numbers here honor the split include/exclude and AUX "
-                       "shrink toggles from the ACD Shrinkage page — one "
-                       "shrinkage truth everywhere.")
+    sw = None
+    if s_up or _msig is None:              # uploads bypass the cache
+        sdf, r = sx.load_split(s_src, mapping, fmaps.get("acd"))
+    else:
+        sdf, r, _secs, _mb = _cached_feed_raw(
+            "acd", _files_sig(s_src), _msig,
+            json.dumps(fmaps.get("acd") or {}), mapping)
+        st.caption(f"{_mb:.0f} MB parsed in {_secs:.1f}s — cached until "
+                   "the file changes.")
+    _show_report(r)
+    if r.ok:
+        sdf = apply_acd_toggles(sdf)
+        if sdf.empty:
+            st.warning("All ACD splits are excluded by the Shrinkage page "
+                       "mapping — nothing to roll up.")
+        sw = sx.split_weekly(sdf, assume) if not sdf.empty else None
+        st.caption("ACD numbers here honor the split include/exclude and AUX "
+                   "shrink toggles from the Shrinkage page — one shrinkage "
+                   "truth everywhere.")
 
     # Persist so the Capacity Plan chart can overlay these benchmarks.
-    st.session_state["wfm_weekly"] = vw
     st.session_state["acd_weekly"] = sw
 
     # 3 — Combined benchmark ---------------------------------------------
-    st.subheader("3 · Demand vs. actual staffing")
-    if vw is not None and sw is not None:
-        # Join on LOB + Week ONLY. "Days Covered" used to be a join key too,
-        # which assumed both feeds always cover the same days of a week. They
-        # are different systems with independently-computed coverage, so the
-        # moment one exported 6 days and the other 5, the key missed and the
-        # OUTER join emitted TWO rows for that LOB+week — one carrying
-        # contacts, one carrying staffed FTE, on separate lines with different
-        # Days Covered (reported from the field 2026-07-30).
-        comb = vw.merge(sw, on=["LOB", "Week"], how="outer",
-                        suffixes=("", " · staffing feed"))
-        _dc_b = "Days Covered · staffing feed"
-        if _dc_b in comb.columns:
-            _a = pd.to_numeric(comb["Days Covered"], errors="coerce")
-            _b = pd.to_numeric(comb[_dc_b], errors="coerce")
-            # A week is only as complete as the THINNER feed: taking the larger
-            # would let a week read "full" while half its staffing is missing.
-            comb["Days Covered"] = np.fmin(_a.fillna(_b), _b.fillna(_a))
-            _mismatch = int(((_a.notna() & _b.notna()) & (_a != _b)).sum())
-            comb = comb.drop(columns=[_dc_b])
-        else:
-            _mismatch = 0
-    else:
-        comb = vw if vw is not None else sw
-        _mismatch = 0
+    st.subheader("3 · Plan vs. actuals")
+    # ONE feed now, so no merge — and with it the whole duplicate-week bug
+    # class disappears structurally rather than by careful joining: one feed
+    # means one coverage figure means one row per LOB+week. The old code
+    # outer-joined the WFM and ACD rollups and had to reconcile two
+    # independently-computed "Days Covered" (field report 2026-07-30, where a
+    # 6-day and a 5-day export split one week onto two lines).
+    comb = sw
     if comb is None or comb.empty:
         st.warning("No rows to show after mapping.")
         return
-
-    # --- feed cross-check (2026-07-31) --------------------------------------
-    # The ACD feed now measures volume/AHT/SL as well as staffed time, so both
-    # feeds report the same three things and the outer join suffixes the ACD
-    # copies. That overlap is the POINT: it is the evidence for dropping the
-    # WFM feed (manager ask 2026-07-30 — an operational forecast does not
-    # belong beside a long-range capacity plan). Agreement here is what makes
-    # that removal safe, and it can only be measured while BOTH feeds are
-    # loaded, so it is shown before anything is removed, never after.
-    # The comparison is lifted out into its own section and the duplicate
-    # columns dropped from the main table, which otherwise silently doubled
-    # its Actual columns the day the ACD fields landed.
-    _xcheck = []
-    for _c in ("Actual Contacts", "Actual AHT (sec)", "Actual SL %"):
-        _b = f"{_c} · staffing feed"
-        if _c in comb.columns and _b in comb.columns:
-            _xcheck.append((_c, _b))
-    if _xcheck:
-        with st.expander("🔍 Feed cross-check — do the two feeds agree?", expanded=False):
-            st.caption(
-                "The demand feed (WFM) and the staffing feed (ACD) now both "
-                "measure contacts, AHT and service level. They are independent "
-                "systems, so this is a genuine check rather than a restatement. "
-                "**Close agreement here means the ACD feed alone can carry the "
-                "actuals** — which is what lets the WFM feed's *forecast* be "
-                "retired without losing measured CPM, the seasonality curve or "
-                "reconciliation. Judge it on FULL weeks only: partial weeks "
-                "differ simply because the exports end at different points.")
-            _x = comb[["LOB", "Week", "Days Covered"]].copy()
-            for _c, _b in _xcheck:
-                _wfm = pd.to_numeric(comb[_c], errors="coerce")
-                _acd = pd.to_numeric(comb[_b], errors="coerce")
-                _x[f"{_c} — WFM"] = _wfm
-                _x[f"{_c} — ACD"] = _acd
-                _x[f"{_c} — Δ"] = _acd - _wfm
-            st.dataframe(_x, width="stretch", hide_index=True)
-            _lines = []
-            for _c, _b in _xcheck:
-                _wfm = pd.to_numeric(comb[_c], errors="coerce")
-                _acd = pd.to_numeric(comb[_b], errors="coerce")
-                _both = _wfm.notna() & _acd.notna() & (_wfm != 0)
-                if not _both.any():
-                    continue
-                _pct = ((_acd[_both] - _wfm[_both]).abs() / _wfm[_both].abs() * 100)
-                _worst = float(_pct.max())
-                _lines.append(f"**{_c}** — {int(_both.sum())} comparable week(s), "
-                              f"typical gap {float(_pct.median()):.2f}%, worst {_worst:.2f}%")
-            if _lines:
-                st.markdown("\n".join(f"- {ln}" for ln in _lines))
-                st.caption(
-                    "A gap of a fraction of a percent is the two systems "
-                    "counting the same calls with slightly different interval "
-                    "boundaries. Percent-level gaps on a thin queue are usually "
-                    "the AHT weighting basis (the WFM feed weights interval AHT "
-                    "by offered contacts; the ACD sums time and divides by "
-                    "answered). A large gap on a BIG queue is worth chasing "
-                    "before retiring either feed.")
-        comb = comb.drop(columns=[_b for _, _b in _xcheck])
 
     _norm = comb.groupby("LOB")["Days Covered"].transform(
         lambda x: x.mode().max())   # each queue's normal operating days/week
@@ -2371,55 +2256,39 @@ def render_real_data_page():
             "operates (see *Days Covered*; a 5-day queue's complete week is 5). "
             "Totals for those weeks reflect only the days present.")
 
-    # The old caption promised that within-week comparisons were always valid
-    # "because both use the same days". That was only true while Days Covered
-    # was a join key — which is what produced the duplicate rows. Say when it
-    # actually holds, and name the weeks where it does not.
-    if _mismatch:
-        st.warning(
-            f"⚠️ {_mismatch} week(s) have **different coverage in the two feeds** "
-            "— the demand export and the staffing export span a different number "
-            "of days. *Days Covered* shows the thinner of the two, and for those "
-            "weeks a within-week comparison (required vs. staffed) is not "
-            "like-for-like: one side counts a day the other is missing. Re-export "
-            "the shorter feed for those weeks before drawing conclusions.")
+    # The FTE-requirement benchmark picker went with the WFM feed: both of
+    # its options were built on that forecast (its interval Required_FTE, or
+    # the plan's workload math applied to its forecast volume). What remains
+    # is the comparison that was always the honest one — the plan's OWN
+    # requirement against measured staffing.
+    plan_req = {}
+    for _lob, _d in st.session_state.lobs.items():
+        _pf = compute_plan(_d)
+        plan_req[_lob] = dict(zip(_pf["Week"], _pf["Required FTE"]))
+    comb["Plan Required FTE"] = [
+        round(plan_req.get(r["LOB"], {}).get(r["Week"], np.nan), 1)
+        for _, r in comb.iterrows()]
+    comb["Net (staffed − required)"] = (
+        comb["Actual Staffed FTE"] - comb["Plan Required FTE"]).round(1)
 
-    if vw is not None:
-        pick = st.radio(
-            "FTE requirement benchmark",
-            ["Computed — forecast CV × AHT with our assumptions",
-             "WFM interval Required_FTE (seated-hours)"],
-            horizontal=True, key="req_bench_pick",
-            help="WFM's Required_FTE is a per-15-min seat count; minimum "
-                 "staffing every open interval inflates the weekly sum for small "
-                 "queues. The computed benchmark applies the plan model's own "
-                 "workload math (occupancy, shrinkage, paid hours, margin) to "
-                 "WFM's forecast volume and AHT.")
-        st.session_state["req_bench_col"] = (
-            "Workload Req FTE" if pick.startswith("Computed") else "WFM Required FTE")
-
-    show_cols = ["LOB", "Week", "Days Covered"]
-    if vw is not None:
-        show_cols += ["Workload Req FTE", "WFM Required FTE", "Forecast Contacts",
-                      "Forecast AHT (sec)", "Actual AHT (sec)"]
-    if sw is not None:
-        show_cols += ["Actual Staffed FTE", "In-Office Shrink %"]
-    if vw is not None and sw is not None:
-        comb["Net (staffed − required)"] = (
-            comb["Actual Staffed FTE"] - comb[req_bench_col()]).round(1)
-        show_cols += ["Net (staffed − required)"]
+    show_cols = ["LOB", "Week", "Days Covered", "Actual Contacts",
+                 "Actual AHT (sec)", "Actual SL %", "Abandon %",
+                 "Actual ASA (sec)", "Occupancy % (actual)",
+                 "Plan Required FTE", "Actual Staffed FTE",
+                 "In-Office Shrink %", "Net (staffed − required)"]
     show = comb[[c for c in show_cols if c in comb.columns]]
-    fmt = {c: "{:,.0f}" for c in ["Forecast Contacts", "Forecast AHT (sec)",
-                                  "Actual AHT (sec)"] if c in show.columns}
-    fmt.update({c: "{:,.1f}" for c in ["Workload Req FTE", "WFM Required FTE",
-                                       "Actual Staffed FTE", "In-Office Shrink %",
-                                       "Net (staffed − required)"]
-                if c in show.columns})
+    fmt = {c: "{:,.0f}" for c in ["Actual Contacts", "Actual AHT (sec)",
+                                  "Actual ASA (sec)"] if c in show.columns}
+    fmt.update({c: "{:,.1f}" for c in
+                ["Plan Required FTE", "Actual Staffed FTE", "In-Office Shrink %",
+                 "Actual SL %", "Abandon %", "Occupancy % (actual)",
+                 "Net (staffed − required)"] if c in show.columns})
     st.dataframe(show.style.format(fmt, na_rep="—"), hide_index=True, width="stretch")
-    if vw is not None and sw is not None:
-        st.caption(f"Net = Actual Staffed FTE − **{req_bench_col()}** "
-                   "(pick the benchmark above).")
-        chart = comb.groupby("LOB")[[req_bench_col(), "Actual Staffed FTE"]] \
+    st.caption("Net = Actual Staffed FTE − the PLAN's Required FTE for that "
+               "week. Weeks outside the plan horizon show a dash rather than a "
+               "comparison the plan cannot make.")
+    if "Plan Required FTE" in comb.columns:
+        chart = comb.groupby("LOB")[["Plan Required FTE", "Actual Staffed FTE"]] \
             .sum(min_count=1)   # all-missing stays a gap, never a 0-height bar
         st.bar_chart(chart)
 
@@ -3223,7 +3092,7 @@ with st.sidebar:
 # glance; "43,269.0" is the same number pretending to a precision the forecast
 # does not have.
 _PLAN_COUNT_ROWS = frozenset({
-    "Model Forecast", "Forecast (final)", "WFM Forecast", "WFM Variance",
+    "Model Forecast", "Forecast (final)",
     "Actual Offered", "Actual Variance", "Volume Capacity",
 })
 # Hairlines that group the frame into demand / requirement / supply.
@@ -3261,26 +3130,18 @@ def render_plan_grid(plan: pd.DataFrame, note: str):
                      width="stretch")
 
 
-def req_bench_col() -> str:
-    """Which weekly FTE-requirement benchmark the team trusts (chosen on the
-    Real Data page). Defaults to the workload-based one: WFM's interval
-    Required_FTE sums per-15-min seat minimums, which inflates small queues
-    with long open hours."""
-    return st.session_state.get("req_bench_col", "Workload Req FTE")
-
-
 def plan_chart_with_benchmarks(plan: pd.DataFrame, lob: str | None):
-    """Model Required/Staffed FTE, plus WFM Required and ACD Actual overlays
-    for any weeks that overlap the loaded real data."""
+    """Model Required/Staffed FTE, plus the measured actual-staffed overlay for
+    any weeks that overlap the loaded ACD data.
+
+    The WFM feed's own Required FTE overlay was removed with that feed
+    (2026-07-31). It was per-15-min minimum staffing, which inflates small
+    queues roughly 2x (SMB 3.8 vs 1.9 on the sample) — the team already
+    distrusted it, and an operational requirement sitting on a long-range
+    capacity chart is exactly the confusion the removal was asked for."""
     weeks = plan["Week"].tolist()
     chart = plan.set_index("Week")[["Required FTE", "Staffed FTE"]].copy()
     overlaid = []
-    v = _bench_series("wfm_weekly", req_bench_col(), lob, weeks)
-    if v is not None:
-        label = ("WFM Required FTE" if req_bench_col() == "WFM Required FTE"
-                 else "Workload Req FTE (WFM fcst)")
-        chart[label] = v.values
-        overlaid.append(label)
     a = _bench_series("acd_weekly", "Actual Staffed FTE", lob, weeks)
     if a is not None:
         chart["Actual Staffed (ACD)"] = a.values
@@ -3290,12 +3151,12 @@ def plan_chart_with_benchmarks(plan: pd.DataFrame, lob: str | None):
         st.caption("Overlay from your real data: " + ", ".join(overlaid)
                    + " (only weeks that overlap the plan horizon).")
         _partial_note(lob)
-    elif st.session_state.get("wfm_weekly") is not None:
-        st.caption("ℹ️ WFM/ACD data is loaded, but none of its weeks fall inside "
-                   "the current plan horizon — export the forecast weeks to overlay them.")
+    elif st.session_state.get("acd_weekly") is not None:
+        st.caption("ℹ️ ACD data is loaded, but none of its weeks fall inside "
+                   "the current plan horizon — export the plan's weeks to overlay them.")
     else:
-        st.caption("Tip: load WFM/ACD on the Real Data page to overlay measured "
-                   "required and actual FTE here.")
+        st.caption("Tip: load the ACD export on the Real Data page to overlay "
+                   "measured actual FTE here.")
 
 
 def _model_members(lob: str | None, weeks) -> np.ndarray | None:
@@ -3337,21 +3198,22 @@ def _planned_cpm(lob: str | None, weeks) -> np.ndarray | None:
 
 
 def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataFrame:
-    """Append WFM Forecast / Actual Offered rows (+ variance vs the plan
-    forecast) for weeks that overlap the loaded WFM data. Rows are omitted
-    entirely when no weeks overlap, so the grid never shows a wall of blanks.
+    """Append Actual Offered rows (+ variance vs the plan forecast) for weeks
+    that overlap the loaded ACD data. Rows are omitted entirely when no weeks
+    overlap, so the grid never shows a wall of blanks.
 
-    Variance convention: benchmark − plan forecast (positive = the benchmark
-    ran higher than what the planner forecast, i.e. we under-forecast)."""
+    The WFM feed's own forecast rows were removed with that feed
+    (2026-07-31): a second forecast beside the plan's answered a question
+    nobody was asking, and this grid now compares the plan against MEASURED
+    contacts only.
+
+    Variance convention: actual − plan forecast (positive = more contacts
+    arrived than the planner forecast, i.e. we under-forecast)."""
     weeks = plan["Week"].tolist()
     df = plan.copy()
     fcst = plan["Forecast (final)"].to_numpy()
 
-    v = _bench_series("wfm_weekly", "Forecast Contacts", lob, weeks)
-    if v is not None:
-        df["WFM Forecast"] = v.to_numpy()
-        df["WFM Variance"] = (v.to_numpy() - fcst).round(0)
-    a = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+    a = _bench_series("acd_weekly", "Actual Contacts", lob, weeks)
     if a is not None:
         av = a.to_numpy()
         df["Actual Offered"] = av
@@ -3372,7 +3234,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
                 df["CPM (plan)"] = np.round(planned, 2)
 
     order = ["Week", "Model Forecast", "Forecast (final)",
-             "WFM Forecast", "WFM Variance", "Actual Offered", "Actual Variance",
+             "Actual Offered", "Actual Variance",
              "CPM (plan)", "CPM (actual)",
              "Workload (hrs)", "Available Hrs/FTE", "Required FTE",
              "Workload Req FTE", "Erlang Req FTE",
@@ -3405,38 +3267,42 @@ def build_reconciliation(plan: pd.DataFrame, lob_data: dict, lob: str) -> pd.Dat
         rows[f"{name} — Actual"] = act_s
         rows[f"{name} — Var"] = act_s - plan_s.reindex(weeks)
 
-    off = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+    # Every actual now comes from the ACD feed (2026-07-31). It measures all
+    # of these directly, and the plan reconciles against MEASURED reality —
+    # never against another system's forecast.
+    off = _bench_series("acd_weekly", "Actual Contacts", lob, weeks)
     if off is not None:
         triple("Contacts", pf["Forecast (final)"], off)
-    aht = _bench_series("wfm_weekly", "Actual AHT (sec)", lob, weeks)
+    aht = _bench_series("acd_weekly", "Actual AHT (sec)", lob, weeks)
     if aht is not None:
         triple("AHT (sec)", dem["AHT (sec)"], aht)
-    # No SL target lives in the plan model, so SL% reconciles WFM's own
-    # forecast against actual rather than plan-vs-actual.
-    sla = _bench_series("wfm_weekly", "Actual SL %", lob, weeks)
+    # SL% reconciles against the LOB's own target assumption. It used to
+    # reconcile against the WFM forecast's SL, which made this row a
+    # forecast-vs-forecast comparison the plan had no stake in; the target is
+    # policy the team actually sets and is answerable for.
+    sla = _bench_series("acd_weekly", "Actual SL %", lob, weeks)
     if sla is not None:
-        slf = _bench_series("wfm_weekly", "Forecast SL %", lob, weeks)
-        if slf is not None:
-            rows["SL % — Fcst"] = slf
-            rows["SL % — Actual"] = sla
-            rows["SL % — Var"] = sla - slf
-        else:
-            rows["SL % — Actual"] = sla
+        triple("SL %", const(a.get("sl_target_pct")), sla)
     stf = _bench_series("acd_weekly", "Actual Staffed FTE", lob, weeks)
     if stf is not None:
         triple("FTE (req vs staffed)", pf["Required FTE"], stf)
     shr = _bench_series("acd_weekly", "In-Office Shrink %", lob, weeks)
     if shr is not None:
         triple("Shrink %", const(a.get("shrinkage_pct")), shr)
-    occ = _bench_series("wfm_weekly", "Occupancy % (actual)", lob, weeks)
+    occ = _bench_series("acd_weekly", "Occupancy % (actual)", lob, weeks)
     if occ is not None:
         triple("Occupancy %", const(a.get("occupancy_pct")), occ)
-    asa = _bench_series("wfm_weekly", "Actual ASA (sec)", lob, weeks)
+    asa = _bench_series("acd_weekly", "Actual ASA (sec)", lob, weeks)
     if asa is not None:
         rows["ASA (sec) — Actual"] = asa
-    ab = _bench_series("wfm_weekly", "Abandon (actual)", lob, weeks)
+    # Abandon is a RATE now, and correct for the first time. The WFM feed's
+    # Actual_Abandonment is a per-interval COUNT (0-16 on the sample) which
+    # wfm_weekly ran a volume-weighted AVERAGE over — so the old
+    # "Abandon — Actual" was neither a rate nor a total. ARC read 0.70 where
+    # the truth is 19 abandons on 126 offered = 15.1%.
+    ab = _bench_series("acd_weekly", "Abandon %", lob, weeks)
     if ab is not None:
-        rows["Abandon — Actual"] = ab
+        rows["Abandon % — Actual"] = ab
 
     if not rows:
         return None
@@ -3530,8 +3396,8 @@ def _org_actual_aht(lobs: list[str], weeks: list[str]) -> tuple[float, int] | No
     num = den = 0.0
     covered: set = set()
     for lob in lobs:
-        a = _bench_series("wfm_weekly", "Actual AHT (sec)", lob, weeks)
-        c = _bench_series("wfm_weekly", "Actual Contacts", lob, weeks)
+        a = _bench_series("acd_weekly", "Actual AHT (sec)", lob, weeks)
+        c = _bench_series("acd_weekly", "Actual Contacts", lob, weeks)
         if a is None or c is None:
             continue
         a = pd.to_numeric(a, errors="coerce")
@@ -3705,7 +3571,7 @@ def render_executive_view():
     _ref_hc = (ref_.get("hc") if ref_ else None)
     _hd = (hc_now - _ref_hc[now_i]) if (_ref_hc and len(_ref_hc) == len(weeks)) else None
 
-    act_vol = _bench_series("wfm_weekly", "Actual Contacts", None, weeks)
+    act_vol = _bench_series("acd_weekly", "Actual Contacts", None, weeks)
     if act_vol is not None:
         _av = pd.to_numeric(act_vol, errors="coerce").dropna()
         act_vol = (float(_av.sum()), int(len(_av))) if len(_av) else None
@@ -3899,43 +3765,50 @@ def render_executive_view():
             tooltip=["Week", "Flow", alt.Tooltip("FTE:Q", format="+.2f")])
         brand.chart(sup_chart + _tr if _tr is not None else sup_chart, height=180)
 
-    # ---- service actuals vs forecast (WFM) --------------------------
-    vw = st.session_state.get("wfm_weekly")
-    if vw is not None and not vw.empty and "Actual SL %" in vw.columns:
-        with brand.section("svc", "Service level & AHT — actuals vs. WFM forecast"):
+    # ---- service actuals vs TARGET (ACD) -------------------------------
+    # Was "actuals vs WFM forecast" until 2026-07-31. Judging service
+    # against another system's FORECAST was always the weaker comparison —
+    # the forecast is not a commitment and nobody is answerable for missing
+    # it. The queue's SL TARGET is policy the team sets, so a miss means
+    # something. Same for AHT: the plan's own assumption is what a variance
+    # should be read against, since that is the number the plan was built on.
+    sw = st.session_state.get("acd_weekly")
+    if sw is not None and not sw.empty and "Actual SL %" in sw.columns:
+        with brand.section("svc", "Service level & AHT — actuals vs. plan"):
             svc_rows = []
-            for l, g in vw.groupby("LOB"):
+            for l, g in sw.groupby("LOB"):
                 def wavg(col, wcol):
+                    if col not in g:
+                        return np.nan
                     v, w = g[col], g[wcol].fillna(0)
                     m = v.notna() & (w > 0)
                     return float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else np.nan
+                _a = (st.session_state.lobs.get(l) or {}).get("assumptions") or {}
+                _dem = (st.session_state.lobs.get(l) or {}).get("demand")
+                _plan_aht = (float(pd.to_numeric(_dem["AHT (sec)"], errors="coerce").mean())
+                             if _dem is not None and "AHT (sec)" in _dem else np.nan)
                 svc_rows.append({
                     "LOB": l,
                     # min_count=1 + float: an all-missing week must SHOW missing
                     # (int(sum()) re-zeroed it — audit#2 2026-07-14; int(NaN) would crash)
-                    "Contacts (act)": float(g["Actual Contacts"].sum(min_count=1)),
-                    "SL% Target": wavg("SL Target %", "Actual Contacts")
-                                  if "SL Target %" in g else np.nan,
-                    "SL% Fcst": wavg("Forecast SL %", "Forecast Contacts"),
+                    "Contacts (act)": float(g["Actual Contacts"].sum(min_count=1))
+                                      if "Actual Contacts" in g else np.nan,
+                    "SL% Target": float(_a.get("sl_target_pct")) if _a.get("sl_target_pct") else np.nan,
                     "SL% Actual": wavg("Actual SL %", "Actual Contacts"),
-                    "AHT Fcst (sec)": wavg("Forecast AHT (sec)", "Forecast Contacts"),
+                    "Abandon %": wavg("Abandon %", "Actual Contacts"),
+                    "AHT Plan (sec)": _plan_aht,
                     "AHT Actual (sec)": wavg("Actual AHT (sec)", "Actual Contacts"),
                 })
             svc = pd.DataFrame(svc_rows).set_index("LOB")
-            svc["SL Δ"] = svc["SL% Actual"] - svc["SL% Fcst"]
-            svc["AHT Δ"] = svc["AHT Actual (sec)"] - svc["AHT Fcst (sec)"]
-            svc = svc[["Contacts (act)", "SL% Target", "SL% Fcst", "SL% Actual", "SL Δ",
-                       "AHT Fcst (sec)", "AHT Actual (sec)", "AHT Δ"]]
+            svc["SL Δ"] = svc["SL% Actual"] - svc["SL% Target"]
+            svc["AHT Δ"] = svc["AHT Actual (sec)"] - svc["AHT Plan (sec)"]
+            svc = svc[["Contacts (act)", "SL% Target", "SL% Actual", "SL Δ",
+                       "Abandon %", "AHT Plan (sec)", "AHT Actual (sec)", "AHT Δ"]]
 
             def shade_delta(col):
-                if col.name == "SL% Actual":       # judged against the queue's target
-                    tgt = svc["SL% Target"]
-                    return ["" if (pd.isna(v) or pd.isna(t))
-                            else f"color:{brand.PINK}" if v < t
-                            else f"color:{brand.GREEN}" for v, t in zip(col, tgt)]
                 if col.name not in ("SL Δ", "AHT Δ"):
                     return [""] * len(col)
-                bad_if_pos = col.name == "AHT Δ"   # heavier-than-forecast AHT is bad
+                bad_if_pos = col.name == "AHT Δ"   # heavier-than-planned AHT is bad
                 return ["" if pd.isna(v)
                         else f"color:{brand.PINK}" if (v > 0) == bad_if_pos
                         else f"color:{brand.GREEN}" for v in col]
@@ -3944,39 +3817,35 @@ def render_executive_view():
                          .format("{:,.1f}", na_rep="—")
                          .format("{:,.0f}", subset=["Contacts (act)"], na_rep="—"),
                          width="stretch")
-            if "Days Covered" in vw:   # full = the queue's MODAL norm, never 7
-                _n = (vw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
-                      - _holiday_allowance(vw["Week"]))
-                partial = int((vw["Days Covered"] < _n).sum())
+            if "Days Covered" in sw:   # full = the queue's MODAL norm, never 7
+                _n = (sw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
+                      - _holiday_allowance(sw["Week"]))
+                partial = int((sw["Days Covered"] < _n).sum())
             else:
                 partial = 0
-            cap = (f"Contact-weighted across {vw['Week'].nunique()} loaded WFM week(s). "
-                   "SL% = calls answered within threshold ÷ offered (WFM PCA); "
-                   "AHT includes hold time.")
+            cap = (f"Contact-weighted across {sw['Week'].nunique()} loaded ACD week(s). "
+                   "SL% = contacts answered within threshold ÷ offered; "
+                   "AHT includes hold time. AHT Plan is the LOB's own assumption.")
             if partial:
                 cap += (f" ⚠️ {partial} LOB-week(s) cover fewer days than their "
                         "queue's normal week — treat these figures as directional.")
             st.caption(cap)
 
     # ---- data health band ---------------------------------------------
-    vw, sw = st.session_state.get("wfm_weekly"), st.session_state.get("acd_weekly")
+    sw = st.session_state.get("acd_weekly")
     bits = []
-    if vw is not None and not vw.empty:
-        if "Days Covered" in vw:   # full = the queue's MODAL norm, never 7
-            _n = (vw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
-                  - _holiday_allowance(vw["Week"]))
-            full = int((vw["Days Covered"] >= _n).sum())
+    if sw is not None and not sw.empty:
+        if "Days Covered" in sw:   # full = the queue's MODAL norm, never 7
+            _n = (sw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
+                  - _holiday_allowance(sw["Week"]))
+            full = int((sw["Days Covered"] >= _n).sum())
         else:
             full = 0
-        bits.append(f"WFM: <b>{vw['Week'].nunique()} wk</b> loaded"
-                    + (f" (<b>{full}</b> full)" if full < vw["Week"].nunique()
+        bits.append(f"ACD actuals: <b>{sw['Week'].nunique()} wk</b> loaded"
+                    + (f" (<b>{full}</b> full)" if full < sw["Week"].nunique()
                        else " (all full)"))
     else:
-        bits.append("WFM: <b>not loaded</b> — plan is unreconciled")
-    if sw is not None and not sw.empty:
-        bits.append(f"ACD actuals: <b>{sw['Week'].nunique()} wk</b> loaded")
-    else:
-        bits.append("ACD actuals: <b>not loaded</b>")
+        bits.append("ACD actuals: <b>not loaded</b> — plan is unreconciled")
     _perf_line = _feed_perf_line()
     if _perf_line:
         bits.append(_perf_line)
@@ -4017,7 +3886,7 @@ This demo ships with a half-year of synthetic data telling one story: **Customer
 
 GUIDE_SECTIONS = [
     ("Every week — the plan review", """
-1. Open **Real Data**. The WFM and ACD feeds load from the remembered
+1. Open **Real Data**. The ACD feed loads from the remembered
    locations automatically — check the notes at the top for warnings.
 2. Look at **Days Covered** in the table. A week under 7 days is partial —
    don't treat its totals as a full week.
@@ -4265,31 +4134,31 @@ def page_help(page: str):
 def weekly_checklist():
     """Self-checking weekly review: every item is COMPUTED from live state, so
     it cannot go stale. Not documentation — a status panel."""
-    vw = st.session_state.get("wfm_weekly")
     sw = st.session_state.get("acd_weekly")
     act = collab.read_active(SCENARIO_DIR, _plan_year())
     lock = collab.read_lock(SCENARIO_DIR, _plan_year())
     items = []
 
-    # 1 — actuals loaded?
-    if vw is not None and not vw.empty:
-        wks = vw["Week"].nunique()
-        if "Days Covered" in vw.columns:
-            _n = (vw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
-                  - _holiday_allowance(vw["Week"]))
-            partial = int(vw[vw["Days Covered"] < _n]["Week"].nunique())
+    # 1 — actuals loaded? One feed carries all of it now (2026-07-31), so
+    # this is one item rather than two.
+    if sw is not None and not sw.empty:
+        wks = sw["Week"].nunique()
+        if "Days Covered" in sw.columns:
+            _n = (sw.groupby("LOB")["Days Covered"].transform(lambda x: x.mode().max())
+                  - _holiday_allowance(sw["Week"]))
+            partial = int(sw[sw["Days Covered"] < _n]["Week"].nunique())
         else:
             partial = 0
         items.append(("✅", f"Actuals loaded — **{wks}** week(s)"
                       + (f", ⚠️ **{partial}** partial (don't read as full weeks)"
                          if partial else ", all full weeks")))
+        if "Actual Contacts" not in sw.columns:
+            items.append(("⚠️", "The ACD export has **no volume columns** — measured "
+                                "CPM, seasonality-derive and reconciliation stay off "
+                                "until it includes them (Real Data → Column mapping)"))
     else:
         items.append(("⬜", "**Load actuals** — Real Data page "
                             "(remembered locations load them automatically)"))
-    items.append(("✅" if sw is not None and not sw.empty else "⬜",
-                  "ACD/ACD staffed-time feed loaded (measured shrinkage)"
-                  if sw is not None and not sw.empty
-                  else "**ACD feed not loaded** — shrinkage stays an assumption"))
 
     # 2 — does the plan cover the horizon?
     plans = {l: compute_plan(d) for l, d in st.session_state.lobs.items()}
@@ -4994,8 +4863,8 @@ else:
                                   f"actual contacts."):
                     lob["demand"]["CPM"] = round(float(_cpm_act), 2)
                     st.rerun()
-            elif st.session_state.get("wfm_weekly") is None:
-                st.caption("Measured CPM needs actual contacts — load the WFM feed on "
+            elif st.session_state.get("acd_weekly") is None:
+                st.caption("Measured CPM needs actual contacts — load the ACD feed on "
                            "the Real Data page (and enter **Members (actual)**).")
             else:
                 st.caption("Measured CPM needs **Members (actual)** weeks that overlap "
@@ -5037,14 +4906,14 @@ else:
 
                 st.divider()
                 st.caption(
-                    "**Or derive it from history:** each week's WFM actual volume ÷ "
+                    "**Or derive it from history:** each week's ACD actual volume ÷ "
                     "the average week = its index, averaged by week-of-year across the "
                     "loaded history. Self-maintaining once you export full-year actuals — "
                     "partial weeks are ignored.")
-                if st.button("Derive from WFM actuals", disabled=RO,
+                if st.button("Derive from ACD actuals", disabled=RO,
                              key=f"seas_hist_{view}"):
                     idx, msg = derive_seasonality_from_history(
-                        st.session_state.get("wfm_weekly"), view,
+                        st.session_state.get("acd_weekly"), view,
                         lob["demand"]["Week"].tolist())
                     if idx is None:
                         st.warning(msg)
@@ -5135,8 +5004,8 @@ else:
         with brand.section("plan", "Plan — weeks across, metrics down"):
             render_plan_grid(
                 plan_with_demand_benchmarks(plan, view),
-                "Net FTE shaded red where understaffed. WFM Forecast / Actual Offered "
-                "rows (+ variance vs plan) appear when the loaded WFM weeks overlap the "
+                "Net FTE shaded red where understaffed. Actual Offered "
+                "rows (+ variance vs plan) appear when the loaded ACD weeks overlap the "
                 "plan horizon. **CPM (actual)** is derived, never entered: actual contacts "
                 "× 52 ÷ that week's membership (the actual figure where you have entered "
                 "one, the forecast spread otherwise) — compare it against **CPM (plan)** "
@@ -5151,14 +5020,14 @@ else:
             if recon is not None:
                 render_reconciliation(recon)
                 st.caption(
-                    "Plan vs. measured actuals, for weeks that overlap loaded WFM/ACD "
+                    "Plan vs. measured actuals, for weeks that overlap loaded ACD "
                     "data. **Variance = Actual − Plan** (red = actual below plan). Shrink % "
                     "compares plan *total* shrinkage to measured *in-office* only — layer OOO "
                     "on before treating them as like-for-like.")
                 _partial_note(view)
             else:
                 st.caption(
-                    "Load WFM/ACD on the Real Data page to reconcile plan vs. actuals "
+                    "Load the ACD export on the Real Data page to reconcile plan vs. actuals "
                     "here — one Plan / Actual / Variance row per metric.")
 
 _autosave_draft()

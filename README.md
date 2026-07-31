@@ -35,7 +35,7 @@ lines of business with generated numbers, so every page shows itself.
 To plan real queues: put a `Skill_Mapping.csv` (columns: `Skill_ID`,
 `Line_of_Business`, `Queue_Name`) next to `capacity_planner.py` and relaunch —
 you get blank scaffolds named for your lines. Point the 🔌 Real Data page at
-your WFM/ACD export locations to load actuals; any vendor's export works via
+your ACD export location to load actuals; any vendor's export works via
 the built-in column mapper. Shared team state (published plan versions, the
 edit locks, drafts) is created in a `scenarios/` folder on first use — put the
 app folder on a network share and the whole team plans against one version
