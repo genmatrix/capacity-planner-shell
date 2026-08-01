@@ -86,6 +86,8 @@ def _payload_lobs(p: dict) -> dict:
                 ros[_col] = float(d["assumptions"].get(_legacy, 0.0) or 0.0)
         if "Attrition (actual)" not in ros.columns:   # pre-actualized-attrition plans
             ros["Attrition (actual)"] = np.nan
+        if "Mentors" not in ros.columns:              # pre-mentors plans
+            ros["Mentors"] = 0.0
         _nh = pd.read_json(StringIO(d["nh"]), orient="split")
         if "Actual Grads" not in _nh.columns:         # pre-actualized-grads plans
             _nh["Actual Grads"] = np.nan
@@ -323,6 +325,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
     )
     roster = pd.DataFrame(
         {"Week": weeks, "LOA": [round(hc * 0.04, 1)] * n_weeks,
+         "Mentors": [0.0] * n_weeks,
          "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [float(max(1, round(hc / 15)))] * n_weeks,
@@ -371,7 +374,8 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
         "Fcst Override": [np.nan] * n_weeks, "AHT (sec)": [float(aht)] * n_weeks,
     })
     roster = pd.DataFrame(
-        {"Week": weeks, "LOA": [0.0] * n_weeks, "Transfers +/-": [0.0] * n_weeks,
+        {"Week": weeks, "LOA": [0.0] * n_weeks, "Mentors": [0.0] * n_weeks,
+         "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [0.0] * n_weeks, "Leads/Project": [0.0] * n_weeks})
     nh = pd.DataFrame({
@@ -782,6 +786,14 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     loa_arr = pd.to_numeric(roster["LOA"], errors="coerce").fillna(0).to_numpy(dtype=float)
     xfer_arr = pd.to_numeric(roster["Transfers +/-"], errors="coerce") \
                  .fillna(0).to_numpy(dtype=float)
+    # Mentors: agents on roll but off the phones coaching new-hire classes.
+    # Learning & Development says how many they are taking; the planner types
+    # that number. Deliberately NOT derived from the NH grid — how many mentors
+    # a class needs is L&D's call, varies by class, and modelling it from class
+    # size would replace a measured input with a guess (backlog 2026-07-31).
+    ment_arr = (pd.to_numeric(roster["Mentors"], errors="coerce").fillna(0)
+                  .to_numpy(dtype=float)
+                if "Mentors" in roster.columns else np.zeros(n))
     hc = np.zeros(n)
     attrition = np.zeros(n)
     prev = float(a["starting_hc"] or 0)
@@ -828,7 +840,9 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                 if fresh > 0:
                     _ramp_cohort(j, fresh, t_ramp_w, t_start)
 
-    staffed = hc - loa_arr - ramp_discount
+    # Mentors are bodies on roll (they stay in Production HC and keep attriting)
+    # but deliver no phone capacity while they mentor — same shape as LOA.
+    staffed = hc - loa_arr - ment_arr - ramp_discount
     net = staffed - required_fte
     capacity_calls = staffed * prod_hrs_per_fte * 3600 / d["AHT (sec)"]
 
@@ -873,6 +887,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "NH Grads": adds.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "LOA": loa_arr,
+            "Mentors": ment_arr,
             "Staffed FTE": staffed.round(1),
             "Net FTE": net.round(1),
             "Volume Capacity": capacity_calls.round(0),
@@ -1233,6 +1248,10 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         new_ros = pd.DataFrame({
             "Week": new_weeks,
             "LOA": [last("LOA", ros)] * n,
+            # Classes straddling Dec 31 re-enter at week 1 (below), so the
+            # mentors coaching them are still off the phones on Jan 1.
+            "Mentors": [last("Mentors", ros)
+                        if "Mentors" in ros.columns else 0.0] * n,
             "Transfers +/-": [0.0] * n,
             "Attrition (actual)": [np.nan] * n,   # last year's departures are history
 
@@ -2797,8 +2816,9 @@ with st.sidebar:
         st.caption(
             f"Seeds a fresh **{_yr + 1}** working plan from what's on screen: ending "
             "production HC → starting HC, year-end members → starting members, last "
-            "CPM/AHT carry forward, the seasonality shape copies, anyone on LOA at "
-            "year-end stays out, and new-hire classes still in the pipeline graduate "
+            "CPM/AHT carry forward, the seasonality shape copies, anyone on LOA or "
+            "mentoring at year-end stays off the phones, and new-hire classes still "
+            "in the pipeline graduate "
             f"into the new year. Published {_yr} versions stay in the changelog and "
             "remain loadable — nothing is shared until you publish the new year.")
         # CPM for the new year: flat carry, or seeded from the measured trend.
@@ -3241,7 +3261,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Production HC", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "NH Grads", "Ramp Discount",
-             "LOA", "Staffed FTE", "Net FTE",
+             "LOA", "Mentors", "Staffed FTE", "Net FTE",
              "Volume Capacity"]
     return df[[c for c in order if c in df.columns]]
 
@@ -3913,6 +3933,22 @@ partial week (step 2) or an unmapped split — check the Real Data warnings.
 4. Check the plan tab: **Net FTE** shows what the absence costs. If it turns
    a small line red, see the interim recipe below.
 """),
+    ("Mentors pulled for a new-hire class", """
+Training a class costs the floor twice: the class isn't taking calls yet, and
+the agents mentoring it aren't either. The first half is already in the model
+(classes only add capacity when they graduate). The second half is this row.
+
+1. Ask **Learning & Development** how many agents they are taking, and for
+   which weeks. That number is theirs to give — the app does not guess it from
+   class size, because how many mentors a class needs varies by class.
+2. **Capacity Plan** → pick the LOB → **roster grid** → **Mentors**. On the
+   week they come off the phones, enter the count. It carries forward, exactly
+   like LOA.
+3. On the week they go back, set it to **0**. A mentor number left running is
+   the one way this row can quietly understate you all year.
+4. The plan grid gets a **Mentors** row; those FTE come out of **Staffed FTE**
+   but stay in **Production HC** — they are still employed, still attriting.
+"""),
     ("Covering a specialty shortfall with an interim", """
 When a specialty line runs short (an LOA, a leaver), we backfill by borrowing
 from Customer Support. The app prices this honestly:
@@ -3985,8 +4021,9 @@ from Customer Support. The app prices this honestly:
 1. Sidebar → **Roll into <next year>** (needs edit control).
 2. It seeds the new year from the current plan: ending headcount becomes
    starting headcount, year-end members become the new starting members, CPM
-   and AHT carry, the seasonality shape copies, people on LOA stay out, and
-   classes still in training graduate into the new year.
+   and AHT carry, the seasonality shape copies, people on LOA or mentoring
+   stay off the phones, and classes still in training graduate into the new
+   year.
 3. Enter the new year-end member forecast, review, then publish.
 4. **This year keeps running.** Each year is its own plan with its own versions
    and its own edit lock, so publishing next year does not disturb this one —
@@ -4044,8 +4081,8 @@ CPM or weekly Members (actual).
 2. Paste **raw numbers**: strip thousands separators, %, and $ first. A value
    that doesn't fit its column is dropped silently (the console may log a
    scary-looking ValueError — the app is fine; just re-check that cell).
-3. Step-change columns (CPM, LOA, Supervisors, Leads) carry the LAST pasted
-   value forward through later weeks.
+3. Step-change columns (CPM, LOA, Mentors, Supervisors, Leads) carry the LAST
+   pasted value forward through later weeks.
 4. New-Hire **Class Start Week** must be the ISO Monday exactly
    (2026-01-05) — format Excel date cells as text before copying.
 """),
@@ -4057,8 +4094,8 @@ CPM or weekly Members (actual).
    same year at once; read-only just means someone else has that year.
 3. **Nothing can be lost.** Every published version is permanent; drafts
    auto-save your unsaved edits and offer them back next session.
-4. **Step-change columns carry forward** on edit: CPM, LOA, Supervisors,
-   Leads. Transfers don't — they're one-time events.
+4. **Step-change columns carry forward** on edit: CPM, LOA, Mentors,
+   Supervisors, Leads. Transfers don't — they're one-time events.
 5. **Supervisors/Leads are informational** — they show span-of-control drift
    but never change Staffed or Net FTE.
 """),
@@ -4070,6 +4107,7 @@ CPM or weekly Members (actual).
 PAGE_HELP = {
     "Executive View": ["Reading the Executive View", "Five things worth knowing"],
     "Capacity Plan": ["Every week — the plan review", "Someone goes on LOA",
+                         "Mentors pulled for a new-hire class",
                          "Trying a what-if safely", "Pasting from Excel"],
     "Hiring Advisor": ["Covering a specialty shortfall with an interim",
                           "Planning hiring classes"],
@@ -4087,6 +4125,7 @@ RECIPE_PAGE = {
     "Building next year's budget": "Budget",
     "Every week — the plan review": "Real Data",
     "Someone goes on LOA": "Capacity Plan",
+    "Mentors pulled for a new-hire class": "Capacity Plan",
     "Covering a specialty shortfall with an interim": "Hiring Advisor",
     "Planning hiring classes": "Hiring Advisor",
     "Reading the Executive View": "Executive View",
@@ -4922,15 +4961,19 @@ else:
                         st.success(msg)
                         st.rerun()
 
-        with brand.section("roster", "Roster — LOA, transfers, attrition, support"):
+        with brand.section("roster", "Roster — LOA, mentors, transfers, attrition, support"):
             st.caption(
-                "Roster adjustments (weekly): LOA headcount, net transfers in/out, "
+                "Roster adjustments (weekly): LOA headcount, **Mentors** — agents "
+                "Learning & Development is taking off the phones to coach new-hire "
+                "classes (enter the number they tell you; they stay in Production HC "
+                "but deliver no capacity, exactly like LOA) — net transfers in/out, "
                 "**Attrition (actual)** — people who actually left that week (blank = "
                 "use the modelled rate; a filled cell **replaces** it, so past weeks "
                 "become truth and the walk self-corrects) — and support staff. "
-                "**LOA, Supervisors and Leads/Project carry forward** "
+                "**LOA, Mentors, Supervisors and Leads/Project carry forward** "
                 "from the week you edit until you edit a later week (a sup added in Q3 "
-                "is entered once). **Transfers** are one-time events and do not carry "
+                "is entered once — and set Mentors back to 0 the week they return to "
+                "the phones). **Transfers** are one-time events and do not carry "
                 "forward. Support staff are informational — the plan computes their "
                 "ratio rows against walking agent headcount; they never affect Net FTE.")
             prev_roster = lob["roster"]
@@ -4938,7 +4981,7 @@ else:
                 prev_roster, state_key=f"roster_{view}", width="stretch", num_rows="fixed",
                 disabled=True if RO else ["Week"], hide_index=True)
             filled = [forward_fill_step(prev_roster, edited_roster, c)
-                      for c in ("LOA", "Supervisors", "Leads/Project")]
+                      for c in ("LOA", "Mentors", "Supervisors", "Leads/Project")]
             lob["roster"] = edited_roster
             if any(filled):
                 st.rerun()  # redraw so the carried-forward cells show

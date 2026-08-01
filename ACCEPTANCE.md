@@ -41,9 +41,10 @@ per member — a multiplier, never a divisor; 52 is fixed, never the horizon).
   actual REPLACES that week's drip; an entered **0 means nobody left**; a
   BLANK fully-elapsed week also means 0 (past weeks are facts, not model);
   attrition never forward-fills.
-- **S3.** Step-change columns (contacts-per-member, LOA, support counts)
-  carry an edit forward to later weeks; **transfers do not** (one-time
-  events).
+- **S3.** Step-change columns (contacts-per-member, LOA, mentors, support
+  counts) carry an edit forward to later weeks; **transfers do not**
+  (one-time events). LOA and mentors leave the headcount walk untouched and
+  come out of staffed capacity only — they are on the roster, off the phones.
 
 ## 4. Hiring advisor
 
