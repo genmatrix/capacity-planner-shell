@@ -106,6 +106,211 @@ def _payload_lobs(p: dict) -> dict:
     return lobs
 
 
+# ---- Change log: field-level diffs between published versions ---------------
+# Manager ask 2026-08-01: track every field change, who made it, and why.
+#
+# The first two are COMPUTED, not collected. Every published version stores the
+# COMPLETE plan, so "what changed between v7 and v8" is a diff of two files —
+# no planner types anything, and it works retroactively on versions published
+# before this page existed. Attribution needs no per-edit tracking either: the
+# single-writer lock means everything between two versions was done by whoever
+# published the later one.
+#
+# WHY is the one part no system can derive, and it is captured PER PUBLISH
+# rather than per field (user decision 2026-08-01, taking the recommendation).
+# Twenty edits made for one reason produce one honest sentence; demanding
+# twenty justifications produces twenty copies of "updated" — an audit trail
+# that looks complete and says nothing. The publish note is REQUIRED for that
+# reason; see render_publish_panel.
+#
+# Everything here is PURE (no st.*) so the diff can be asserted directly from a
+# check script without booting the app.
+
+ASSUMPTION_LABELS = {
+    "starting_hc": "Starting headcount",
+    "annual_attrition_pct": "Attrition %/yr",
+    "shrinkage_pct": "Shrinkage %",
+    "occupancy_pct": "Target occupancy %",
+    "paid_hours_per_week": "Paid hours/week",
+    "workload_margin_pct": "Workload margin %",
+    "ft_pct": "Full-time %",
+    "req_basis": "Requirement basis",
+    "sl_target_pct": "Service level target %",
+    "sl_threshold_sec": "SL threshold (sec)",
+    "open_hrs_week": "Open hours/week",
+    "ramp_weeks": "NH ramp weeks",
+    "ramp_start_pct": "NH ramp start %",
+    "transfer_ramp_weeks": "Transfer ramp weeks",
+    "transfer_ramp_start_pct": "Transfer ramp start %",
+    "class_gap_weeks": "Hiring cadence gap (weeks)",
+    "class_min_size": "Min class size",
+    "class_max_size": "Max class size",
+    "one_class_at_a_time": "One class at a time",
+    "members_start": "Members — start",
+    "members_end": "Members — year-end",
+    "supervisors": "Supervisors (legacy flat)",
+    "leads": "Leads/Project (legacy flat)",
+}
+
+DIFF_COLS = ["LOB", "Area", "Field", "Week", "Was", "Now"]
+
+
+def _is_blank(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, float) and np.isnan(v):
+        return True
+    return isinstance(v, str) and not v.strip()
+
+
+def _cells_equal(a, b) -> bool:
+    """Blank-insensitive, float-noise-tolerant cell comparison. A JSON round
+    trip can turn 5 into 5.0 and None into NaN; neither is a planner edit, and
+    a change log full of those is a change log nobody reads."""
+    if _is_blank(a) and _is_blank(b):
+        return True
+    if _is_blank(a) or _is_blank(b):
+        return False
+    try:
+        return bool(abs(float(a) - float(b)) < 5e-7)
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
+def _fmt_cell(v) -> str:
+    """Display form: blank for empty, thousands-separated, no fake precision."""
+    if _is_blank(v):
+        return ""
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if abs(f - round(f)) < 5e-7:
+        return f"{int(round(f)):,}"
+    return f"{f:,.2f}"
+
+
+def _diff_grid(lob: str, area: str, o: pd.DataFrame, n: pd.DataFrame) -> list[dict]:
+    """Cell-level diff of two weekly grids, aligned on the Week column."""
+    out = []
+    keyed = ("Week" in o.columns and "Week" in n.columns
+             and o["Week"].is_unique and n["Week"].is_unique)
+    ow = o.set_index("Week") if keyed else o.reset_index(drop=True)
+    nw = n.set_index("Week") if keyed else n.reset_index(drop=True)
+    for c in nw.columns:
+        if c not in ow.columns:
+            out.append({"LOB": lob, "Area": area, "Field": c, "Week": "",
+                        "Was": "", "Now": "(column added)"})
+    for c in ow.columns:
+        if c not in nw.columns:
+            out.append({"LOB": lob, "Area": area, "Field": c, "Week": "",
+                        "Was": "(column removed)", "Now": ""})
+    shared = [c for c in nw.columns if c in ow.columns]
+    for wk in nw.index:
+        if wk not in ow.index:
+            out.append({"LOB": lob, "Area": area, "Field": "(row)",
+                        "Week": str(wk), "Was": "", "Now": "(week added)"})
+            continue
+        for c in shared:
+            a, b = ow.at[wk, c], nw.at[wk, c]
+            if not _cells_equal(a, b):
+                out.append({"LOB": lob, "Area": area, "Field": c,
+                            "Week": str(wk) if keyed else "",
+                            "Was": _fmt_cell(a), "Now": _fmt_cell(b)})
+    return out
+
+
+def _diff_nh(lob: str, o: pd.DataFrame, n: pd.DataFrame) -> list[dict]:
+    """New-hire classes have no stable key — they are rows a planner adds and
+    deletes. Group by start week (the one thing that identifies a class to a
+    human), then compare within the week and report the count difference as an
+    added/removed class rather than as a wall of shifted cells."""
+    out, area = [], "New-hire classes"
+
+    def by_week(df):
+        g = {}
+        for _, r in df.iterrows():
+            g.setdefault(str(r.get("Class Start Week", "")), []).append(r)
+        return g
+
+    og, ng = by_week(o), by_week(n)
+    fields = [c for c in n.columns if c != "Class Start Week"]
+    for wk in sorted(set(og) | set(ng)):
+        orows, nrows = og.get(wk, []), ng.get(wk, [])
+        for i in range(max(len(orows), len(nrows))):
+            if i >= len(orows):
+                size = _fmt_cell(nrows[i].get("Class Size"))
+                out.append({"LOB": lob, "Area": area, "Field": "Class",
+                            "Week": wk, "Was": "", "Now": f"added — {size} seats"})
+                continue
+            if i >= len(nrows):
+                size = _fmt_cell(orows[i].get("Class Size"))
+                out.append({"LOB": lob, "Area": area, "Field": "Class",
+                            "Week": wk, "Was": f"removed — {size} seats", "Now": ""})
+                continue
+            for c in fields:
+                a, b = orows[i].get(c), nrows[i].get(c)
+                if not _cells_equal(a, b):
+                    out.append({"LOB": lob, "Area": area, "Field": c, "Week": wk,
+                                "Was": _fmt_cell(a), "Now": _fmt_cell(b)})
+    return out
+
+
+def _diff_assumptions(lob: str, o: dict, n: dict) -> list[dict]:
+    out = []
+    for k in sorted(set(o) | set(n)):
+        a, b = o.get(k), n.get(k)
+        if _cells_equal(a, b):
+            continue
+        out.append({"LOB": lob, "Area": "Assumptions",
+                    "Field": ASSUMPTION_LABELS.get(k, k.replace("_", " ").capitalize()),
+                    "Week": "", "Was": _fmt_cell(a), "Now": _fmt_cell(b)})
+    return out
+
+
+def diff_payloads(old: dict, new: dict) -> list[dict]:
+    """Every field-level difference between two published snapshots.
+
+    Both sides go through `_payload_lobs`, so legacy-column migrations are
+    applied to BOTH before comparing — otherwise every column added since the
+    older version would read as a planner edit on the day the code shipped."""
+    rows: list[dict] = []
+    for key, label in (("n_weeks", "Planning horizon (weeks)"),
+                       ("plan_year", "Plan year"),
+                       ("members_start", "Members — start"),
+                       ("members_end", "Members — year-end")):
+        if not _cells_equal(old.get(key), new.get(key)):
+            rows.append({"LOB": "(plan)", "Area": "Plan", "Field": label,
+                         "Week": "", "Was": _fmt_cell(old.get(key)),
+                         "Now": _fmt_cell(new.get(key))})
+    oa, na = old.get("members_actual") or [], new.get("members_actual") or []
+    moved = sum(1 for i in range(max(len(oa), len(na)))
+                if not _cells_equal(oa[i] if i < len(oa) else None,
+                                    na[i] if i < len(na) else None))
+    if moved:
+        rows.append({"LOB": "(plan)", "Area": "Plan", "Field": "Members (actual)",
+                     "Week": "", "Was": "", "Now": f"{moved} week(s) recorded/changed"})
+
+    old_lobs, new_lobs = _payload_lobs(old), _payload_lobs(new)
+    for lob in sorted(set(old_lobs) | set(new_lobs)):
+        if lob not in old_lobs:
+            rows.append({"LOB": lob, "Area": "Plan", "Field": "Line of business",
+                         "Week": "", "Was": "", "Now": "added"})
+            continue
+        if lob not in new_lobs:
+            rows.append({"LOB": lob, "Area": "Plan", "Field": "Line of business",
+                         "Week": "", "Was": "removed", "Now": ""})
+            continue
+        o, n = old_lobs[lob], new_lobs[lob]
+        rows += _diff_grid(lob, "Demand", o["demand"], n["demand"])
+        rows += _diff_grid(lob, "Roster", o["roster"], n["roster"])
+        rows += _diff_nh(lob, o["nh"], n["nh"])
+        rows += _diff_assumptions(lob, o["assumptions"], n["assumptions"])
+    return rows
+
+
 def _apply_payload(p: dict):
     """Load a snapshot payload into session as the working plan."""
     st.session_state.n_weeks = p["n_weeks"]
@@ -2541,13 +2746,25 @@ def render_publish_panel(mode: str):
         default_name = (collab.read_active(SCENARIO_DIR, _plan_year())
                         or {}).get("name", "Current Outlook")
         name = st.text_input("Plan name", value=default_name, key="pub_name")
-        note = st.text_input("What changed? (note)", key="pub_note")
+        # REQUIRED (manager ask 2026-08-01). The Change log computes WHAT
+        # changed from the snapshots themselves; this line is the only place
+        # WHY can come from, and an optional field would be blank on exactly
+        # the versions anyone later needs explained.
+        note = st.text_input(
+            "What changed? (note) *", key="pub_note",
+            help="Required — one line on WHY, e.g. 'adopted measured attrition "
+                 "after the August reconciliation'. The Change log page lists "
+                 "every field that moved, so this only has to carry the reason.")
         parent = st.session_state.get("loaded_version")
         c1, c2 = st.columns(2)
         for label, col, release in [("Publish", c1, False), ("Publish & release", c2, True)]:
             if col.button(label, width="stretch", key=f"pub_{label}"):
-                if not collab.holds_lock(SCENARIO_DIR, _plan_year(), user,
-                                         st.session_state.get(f"lock_token_{_plan_year()}")):
+                if not (note or "").strip():
+                    st.error("Add a one-line note on what changed — it is the "
+                             "'why' column of the Change log, and nothing else "
+                             "can supply it.")
+                elif not collab.holds_lock(SCENARIO_DIR, _plan_year(), user,
+                                           st.session_state.get(f"lock_token_{_plan_year()}")):
                     st.error("You no longer hold edit control — can't publish.")
                 else:
                     meta, _ = collab.publish(SCENARIO_DIR, _serialize_lobs(),
@@ -2686,7 +2903,7 @@ if "lobs" not in st.session_state:
 autoload_feeds()
 
 ALL_PAGES = ["Executive View", "Capacity Plan", "Hiring Advisor",
-             "Budget", "Real Data", "ACD Shrinkage", "Guide"]
+             "Budget", "Real Data", "ACD Shrinkage", "Change log", "Guide"]
 
 # ---- Decommissioned pages: hidden from the product, kept in the code --------
 # Phased rollout (user decision 2026-07-29): show the plan first and land the
@@ -3984,6 +4201,26 @@ from Customer Support. The app prices this honestly:
    they're either inside the training lead time (no class can reach them) or
    between cadence slots (no sustainable class calendar lands grads in time).
 """),
+    ("Answering \"who changed this, and why?\"", """
+**Change log** page. Nothing has to be recorded for this to work — every
+published version stores the whole plan, so the app works out what moved.
+
+- **What changed**: a field-by-field diff of each version against the one
+  before it — line of business, area, field, week, old value, new value.
+- **Who and when**: stamped on the version at publish. Because only one
+  person can hold edit control at a time, everything between two versions
+  is theirs.
+- **Why**: the note written at publish. That is the only part the app cannot
+  work out, which is why the note is required.
+- **Download as CSV** hands the whole thing to anyone who needs it outside
+  the app.
+- It is complete for versions published *before* the page existed — the
+  diff is computed from the snapshots, not collected as you go.
+
+*Writing a useful note:* say why, not what. "Adopted measured attrition after
+the August reconciliation" beats "updated attrition" — the diff already shows
+the number moved from 6 to 33.
+"""),
     ("Trying a what-if safely", """
 - **Sandbox** (sidebar) is your private copy. Change anything — nothing the
   team sees is touched until *you* publish. Save it as a personal what-if to
@@ -4117,6 +4354,7 @@ PAGE_HELP = {
                "Working on next year while this year runs"],
     "Real Data": ["Every week — the plan review", "Data health warnings"],
     "ACD Shrinkage": ["Data health warnings"],
+    "Change log": ["Answering \"who changed this, and why?\""],
 }
 
 
@@ -4126,6 +4364,7 @@ RECIPE_PAGE = {
     "Every week — the plan review": "Real Data",
     "Someone goes on LOA": "Capacity Plan",
     "Mentors pulled for a new-hire class": "Capacity Plan",
+    "Answering \"who changed this, and why?\"": "Change log",
     "Covering a specialty shortfall with an interim": "Hiring Advisor",
     "Planning hiring classes": "Hiring Advisor",
     "Reading the Executive View": "Executive View",
@@ -4794,6 +5033,122 @@ def render_advisor_page(ro: bool):
         st.caption(f"{donor} stays green all horizon — no classes needed.")
 
 
+CHANGELOG_MAX_VERSIONS = 25   # newest N; anything dropped is NAMED, never silent
+
+
+def _changelog_rows(log: list[dict], limit: int) -> tuple[pd.DataFrame, int]:
+    """Full history: every consecutive pair of published versions, newest first.
+
+    Returns the flat audit frame plus the number of versions actually walked,
+    so the caller can say what it covered rather than implying "everything"."""
+    walk = log[:limit]                       # changelog() is already newest-first
+    rows = []
+    for newer, older in zip(walk, walk[1:]):
+        snap_new = collab.load_snapshot(SCENARIO_DIR, newer["_file"])
+        snap_old = collab.load_snapshot(SCENARIO_DIR, older["_file"])
+        if snap_new is None or snap_old is None:
+            continue
+        try:
+            diffs = diff_payloads(snap_old, snap_new)
+        except Exception as e:               # one unreadable old snapshot must
+            diffs = [{"LOB": "(plan)", "Area": "Plan",   # never blank the page
+                      "Field": "could not compare", "Week": "",
+                      "Was": f"v{older['version']}", "Now": str(e)[:80]}]
+        head = {"Version": f"v{newer['version']}",
+                "When": _hm(newer.get("published_at", "")),
+                "Who": newer.get("author", ""),
+                "Why": newer.get("note", "") or "(no note)"}
+        if not diffs:
+            rows.append({**head, "LOB": "", "Area": "", "Field": "(no field changes)",
+                         "Week": "", "Was": "", "Now": ""})
+        for d in diffs:
+            rows.append({**head, **d})
+    cols = ["Version", "When", "Who", "Why"] + DIFF_COLS
+    return pd.DataFrame(rows, columns=cols), len(walk)
+
+
+def render_changelog_page():
+    """Who changed what, when, and why — computed from the published versions.
+
+    Nothing here is collected from planners: the snapshots already contain the
+    complete plan, and the single-writer lock already attributes every edit
+    between two versions to whoever published the later one."""
+    _yr = _plan_year()
+    log = collab.changelog(SCENARIO_DIR, _yr)
+
+    with brand.section("cl_head", f"Change log — {_yr}",
+                       "Every published version, and exactly which fields moved "
+                       "between them. Computed from the snapshots, so it is "
+                       "complete for versions published before this page existed."):
+        if not log:
+            st.info(f"No {_yr} versions published yet — the log starts at the "
+                    "first publish.")
+            return
+        if len(log) < 2:
+            st.info(f"Only one {_yr} version so far (v{log[0]['version']} by "
+                    f"{log[0].get('author', '')}). A comparison needs two — the "
+                    "log fills in from the next publish.")
+            return
+        st.caption("**Who** and **when** are stamped on each version. **What** "
+                   "is a field-by-field diff of consecutive versions. **Why** is "
+                   "the note the planner wrote at publish — the one part no "
+                   "system can work out for itself.")
+
+    frame, walked = _changelog_rows(log, CHANGELOG_MAX_VERSIONS)
+    if len(log) > walked:
+        st.caption(f"Showing the newest {walked} of {len(log)} published "
+                   f"{_yr} versions. Older ones are still on disk and still "
+                   "loadable from Version history.")
+
+    with brand.section("cl_filter", "Filter"):
+        c1, c2 = st.columns(2)
+        lobs = sorted(x for x in frame["LOB"].unique() if x)
+        areas = sorted(x for x in frame["Area"].unique() if x)
+        pick_lob = c1.multiselect("Line of business", lobs, key="cl_lob")
+        pick_area = c2.multiselect("Area", areas, key="cl_area")
+    shown = frame
+    if pick_lob:
+        shown = shown[shown["LOB"].isin(pick_lob)]
+    if pick_area:
+        shown = shown[shown["Area"].isin(pick_area)]
+
+    with brand.section("cl_table", "Every change",
+                       f"{len(shown):,} row(s) across {walked} version(s)."):
+        st.dataframe(shown, width="stretch", hide_index=True)
+        st.download_button(
+            "Download as CSV", shown.to_csv(index=False).encode("utf-8"),
+            file_name=f"change-log-{_yr}.csv", mime="text/csv",
+            help="The whole table as filtered, for anyone who needs it outside "
+                 "the app.")
+
+    with brand.section("cl_compare", "Compare any two versions",
+                       "For a specific question — what moved between the "
+                       "version we budgeted from and today's."):
+        opts = {f"v{j['version']} · {j.get('name', '')} · {j.get('author', '')}": j
+                for j in log}
+        keys = list(opts)
+        c1, c2 = st.columns(2)
+        a = c1.selectbox("From", keys, index=min(1, len(keys) - 1), key="cl_from")
+        b = c2.selectbox("To", keys, index=0, key="cl_to")
+        ja, jb = opts[a], opts[b]
+        if ja["version"] == jb["version"]:
+            st.caption("Pick two different versions.")
+        else:
+            lo, hi = sorted((ja, jb), key=lambda j: j["version"])
+            sa = collab.load_snapshot(SCENARIO_DIR, lo["_file"])
+            sb = collab.load_snapshot(SCENARIO_DIR, hi["_file"])
+            if sa is None or sb is None:
+                st.warning("One of those snapshots could not be read.")
+            else:
+                d = pd.DataFrame(diff_payloads(sa, sb), columns=DIFF_COLS)
+                st.caption(f"v{lo['version']} → v{hi['version']} · "
+                           f"{len(d):,} field change(s)")
+                if d.empty:
+                    st.caption("No field-level differences between those two.")
+                else:
+                    st.dataframe(d, width="stretch", hide_index=True)
+
+
 # Push the org-wide member spread into every LOB (sidebar edits, loaded
 # scenarios, or horizon changes) before anything computes.
 apply_global_members()
@@ -4810,6 +5165,8 @@ elif page == "Real Data":
     render_real_data_page()
 elif page == "ACD Shrinkage":
     render_shrinkage_page()
+elif page == "Change log":
+    render_changelog_page()
 elif view == CONSOLIDATED:
     st.header("Consolidated — all LOBs")
     plan = consolidated_plan(st.session_state.lobs)

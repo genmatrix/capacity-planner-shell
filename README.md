@@ -11,6 +11,14 @@ immutable published versions) — no server, no database.
 and its own edit lock, so next year can be built while this year stays the
 operating plan. A one-click rollover seeds the new year from the current one.
 
+**A change log comes free with that.** Because every published version stores
+the complete plan, the app computes a field-by-field audit trail — which line
+of business, which field, which week, old value to new value — for every
+version, including versions published before the feature existed. Who and when
+are stamped at publish; the single-writer lock means everything between two
+versions belongs to whoever published the later one. The only thing anyone
+types is a one-line reason per publish, which is required.
+
 A hiring solver (when must classes start, and how big, to keep every week green
 — lead-time, survival and ramp aware, with real training-calendar constraints)
 ships in the code with its page hidden for a phased rollout;
