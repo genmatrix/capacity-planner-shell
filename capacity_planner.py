@@ -4709,6 +4709,103 @@ def budget_drift_headline(grain: str = "Monthly", lobs: dict | None = None
     }
 
 
+# Weekly DRIVERS live in the grids, not the assumptions dict, but a planner
+# calls them assumptions all the same — "we planned AHT 400" is a demand-grid
+# column. They are summarised as the mean across the horizon, with a count of
+# how many weeks actually moved, because a single number cannot say whether a
+# change was one week or the whole year.
+BUDGET_DRIVER_COLS = [("demand", "CPM"), ("demand", "AHT (sec)"),
+                      ("demand", "Seasonality"), ("demand", "Members"),
+                      ("roster", "LOA"), ("roster", "Mentors"),
+                      ("roster", "Supervisors"), ("roster", "Leads/Project")]
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return None if np.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def budget_assumption_drift(lobs: dict | None = None
+                            ) -> tuple[pd.DataFrame, dict] | None:
+    """What we PLANNED WITH, budget vs now — the assumptions behind the numbers.
+
+    The output table (contacts, FTE) says the year moved; this says WHY. Both
+    read the same locked snapshot: a published version already carries every
+    assumption and every weekly driver, so locking a budget captured all of
+    this from the start — only the view was missing (user 2026-08-02: "the
+    budget will need all the plan assumptions like AHT and shrinkage … my
+    manager means locking assumptions of what we planned for").
+
+    Columns: LOB, Assumption, Budget, Now, Δ, Weeks changed. Non-numeric
+    assumptions (requirement basis, one-class-at-a-time) carry a blank Δ rather
+    than a fabricated 0."""
+    ptr = budget_baseline()
+    if not ptr:
+        return None
+    snap = _budget_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
+    if not snap:
+        return None
+    b_lobs = _payload_lobs(snap)
+    w_lobs = st.session_state.lobs if lobs is None else lobs
+    rows = []
+
+    def add(lob, name, was, now, weeks=""):
+        a, b = _num(was), _num(now)
+        rows.append({
+            "LOB": lob, "Assumption": name,
+            "Budget": _fmt_cell(was), "Now": _fmt_cell(now),
+            "Δ": "" if (a is None or b is None) else round(b - a, 3),
+            "Weeks changed": weeks,
+            "_changed": not _cells_equal(was, now)})
+
+    # Plan-level drivers first — they are org-wide, so repeating them per LOB
+    # would read as six independent decisions.
+    for key, label in (("members_start", "Members — start"),
+                       ("members_end", "Members — year-end"),
+                       ("n_weeks", "Planning horizon (weeks)")):
+        add("(plan)", label, snap.get(key), _serialize_plan_scalar(key))
+
+    for lob in sorted(set(b_lobs) | set(w_lobs)):
+        if lob not in b_lobs:
+            add(lob, "Line of business", "", "added since the budget")
+            continue
+        if lob not in w_lobs:
+            add(lob, "Line of business", "in the budget", "removed")
+            continue
+        ba, wa = b_lobs[lob]["assumptions"], w_lobs[lob]["assumptions"]
+        for k in ASSUMPTION_LABELS:
+            if k in ("members_start", "members_end"):
+                continue                       # plan-level, already above
+            if k not in ba and k not in wa:
+                continue
+            add(lob, ASSUMPTION_LABELS[k], ba.get(k), wa.get(k))
+        for frame, col in BUDGET_DRIVER_COLS:
+            bf, wf = b_lobs[lob][frame], w_lobs[lob][frame]
+            if col not in bf.columns or col not in wf.columns:
+                continue
+            bs = pd.to_numeric(bf[col], errors="coerce")
+            ws = pd.to_numeric(wf[col], errors="coerce")
+            moved = ("" if len(bs) != len(ws)
+                     else int((~np.isclose(bs.to_numpy(dtype=float),
+                                           ws.to_numpy(dtype=float),
+                                           equal_nan=True)).sum()))
+            add(lob, f"{col} (weekly avg)", bs.mean(), ws.mean(), moved)
+
+    frame = pd.DataFrame(rows)
+    return frame, {"ptr": ptr}
+
+
+def _serialize_plan_scalar(key: str):
+    """Plan-level scalars as the payload serializer would write them, without
+    paying to serialize every LOB frame just to read three numbers."""
+    if key == "n_weeks":
+        return int(st.session_state.n_weeks)
+    return st.session_state.get(key)
+
+
 def _member_variant_payload(me_new: float) -> dict:
     """The working plan with ONLY the year-end member target changed. Members
     re-spread with the SAME linear rule as apply_global_members (org-wide,
@@ -5157,6 +5254,39 @@ def render_budget_baseline(grain: str, yr: int):
             f"Budget = v{meta['ptr'].get('version')}, recomputed through the same "
             "engine as the working plan — so a difference here is a real change "
             "in drivers or supply, never two systems disagreeing about arithmetic.")
+
+    # The table above says the year moved; this one says WHY it moved.
+    got_a = budget_assumption_drift()
+    if got_a is None:
+        return
+    aframe, _ = got_a
+    n_moved = int(aframe["_changed"].sum())
+    with brand.section(
+            "budget_assum", f"Assumptions vs budget — {yr}",
+            "What we planned WITH, then and now: shrinkage, occupancy, AHT, "
+            "attrition, ramp, and the weekly drivers. Locked with the version, "
+            "so this is what was actually committed to."):
+        if n_moved:
+            st.markdown(f"**{n_moved} assumption(s) have moved since the budget "
+                        "was locked.**")
+        else:
+            st.success("Every planning assumption still matches the budget.")
+        only = st.checkbox("Show only what changed", value=True, key="bl_changed")
+        show = aframe[aframe["_changed"]] if only else aframe
+        if show.empty:
+            st.caption("Nothing to show — tick off the filter to see every "
+                       "assumption the budget locked in.")
+        else:
+            st.dataframe(show.drop(columns=["_changed"]), width="stretch",
+                         hide_index=True)
+        st.download_button(
+            f"Download the {yr} assumption drift as CSV",
+            aframe.drop(columns=["_changed"]).to_csv(index=False),
+            file_name=f"budget_assumptions_{yr}.csv", mime="text/csv")
+        st.caption(
+            "**Weeks changed** counts how many of the horizon's weeks a weekly "
+            "driver actually moved in — an average alone cannot tell a one-week "
+            "correction from a re-plan of the whole year.")
 
 
 def render_guide_page():
