@@ -3572,32 +3572,35 @@ def render_reconciliation(df: pd.DataFrame):
                      width="stretch")
 
 
-def _reference_metrics() -> dict | None:
-    """Consolidated headline metrics of the last PUBLISHED version — the
-    baseline for the Executive View's Δ chips ("what changed since we last
-    published"). Cached per active version; recomputed only when the pointer
-    moves. None when nothing is published yet."""
+def _reference_metrics(scope: str | None = None) -> dict | None:
+    """Headline metrics of the last PUBLISHED version — the baseline for the
+    Executive View's Δ chips ("what changed since we last published").
+
+    `scope` is a LOB name to restrict to, or None for the consolidated figure.
+    It is part of the CACHE KEY, not just a filter: the Executive View's scope
+    selector must not be able to chart one LOB's today against every LOB's
+    last publish, and a cache keyed on the file alone would do exactly that
+    the moment the selector moved. Recomputed only when the pointer or the
+    scope moves; None when nothing is published yet."""
     act = collab.read_active(SCENARIO_DIR, _plan_year())
     if not act:
         return None
     cache = st.session_state.get("_ref_metrics")
-    if cache and cache.get("file") == act.get("file"):
+    if cache and cache.get("file") == act.get("file") \
+            and cache.get("scope") == scope:
         return cache
     snap = collab.load_snapshot(SCENARIO_DIR, act["file"])
     if not snap:
         return None
     try:
-        lobs = {}
-        for lob, d in snap["lobs"].items():
-            dem = pd.read_json(StringIO(d["demand"]), orient="split")
-            if "Seasonality" not in dem.columns:
-                dem.insert(dem.columns.get_loc("CPM") + 1, "Seasonality", 1.0)
-            lobs[lob] = {
-                "demand": dem,
-                "roster": pd.read_json(StringIO(d["roster"]), orient="split"),
-                "nh": pd.read_json(StringIO(d["nh"]), orient="split"),
-                "assumptions": d["assumptions"],
-            }
+        # Through the SHARED migration path — this used to hand-roll its own
+        # partial copy (Seasonality only), so every column added since
+        # (Members (actual), Attrition (actual), Mentors) was missing here
+        # while present everywhere else. `_payload_lobs` is the one path.
+        lobs = {l: d for l, d in _payload_lobs(snap).items()
+                if scope is None or l == scope}
+        if not lobs:            # the scoped LOB did not exist at publish time
+            return None
         plans = [compute_plan(v) for v in lobs.values()]
         req = sum(pl["Required FTE"].to_numpy() for pl in plans)
         stf = sum(pl["Staffed FTE"].to_numpy() for pl in plans)
@@ -3609,7 +3612,7 @@ def _reference_metrics() -> dict | None:
         # a change.
         fcst = sum(pl["Forecast (final)"].to_numpy() for pl in plans)
         hc = sum(pl["Production HC"].to_numpy() for pl in plans)
-        cache = {"file": act["file"], "version": act["version"],
+        cache = {"file": act["file"], "version": act["version"], "scope": scope,
                  "avg_req": float(req.mean()), "avg_stf": float(stf.mean()),
                  "coverage": float((net >= 0).mean() * 100),
                  "weeks_short": int((net < 0).sum()),
@@ -3736,7 +3739,36 @@ def render_executive_view():
     health cards → supply engine → data-health band. WFM house style."""
     import altair as alt
 
-    plans = {l: compute_plan(d) for l, d in st.session_state.lobs.items()}
+    # ---- scope: all lines, or one -------------------------------------
+    # Everything below derives from `plans`, so filtering HERE scopes the whole
+    # page — verdict, tiles, heatmap, walk, cards, supply engine and the
+    # service table all follow (user ask 2026-08-01). Default stays "all", so
+    # the page a planner already knows is unchanged until they pick.
+    #
+    # The two Δ-chip and actuals surfaces do NOT flow from `plans` and had to
+    # be told the scope explicitly: `_reference_metrics(scope)` (else one LOB's
+    # today would be charted against every LOB's last publish) and the ACD
+    # service table, which groups the feed rollup rather than the plan.
+    _ALL = "All lines of business"
+    _opts = [_ALL] + list(st.session_state.lobs)
+    # A LOB renamed or removed since this session last picked one would leave a
+    # value the widget has no option for. Safe to purge because `ev_scope` is
+    # written from ONE direction only (this widget) — unlike `plan_year`, whose
+    # two writers are why it needs the `_year_seen` dance instead.
+    if st.session_state.get("ev_scope") not in _opts:
+        st.session_state.pop("ev_scope", None)
+    _pick = st.selectbox(
+        "Show", _opts, key="ev_scope",
+        help="Narrow the whole page to one line of business — every number, "
+             "chart and card below follows, including the change vs the last "
+             "published version.")
+    scope = None if _pick == _ALL else _pick
+
+    plans = {l: compute_plan(d) for l, d in st.session_state.lobs.items()
+             if scope is None or l == scope}
+    if not plans:                      # scoped LOB vanished mid-rerun
+        st.warning(f"{_pick} is no longer in the plan.")
+        return
     lobs = list(plans)
     first = next(iter(plans.values()))
     weeks = first["Week"].tolist()
@@ -3757,7 +3789,8 @@ def render_executive_view():
     # The brand header is now global (above the nav bar). What stays here is
     # the scope detail, which only reads correctly this far down the script —
     # both values come from sidebar widgets.
-    st.caption(f"{len(lobs)} LOBs · {st.session_state.n_weeks}-week horizon")
+    st.caption((f"{lobs[0]} only" if scope else f"{len(lobs)} LOBs")
+               + f" · {st.session_state.n_weeks}-week horizon")
     pills = [(f"Plan v{act['version']} · {act['name']}" if act
               else "Unpublished working plan", "blue"),
              (f"{lock['user']} editing" if lock and not collab.lock_is_stale(lock)
@@ -3794,7 +3827,7 @@ def render_executive_view():
     brand.pill_row(pills)
 
     # ---- headline cards: what we forecast, what actually happened -----
-    ref_ = _reference_metrics()
+    ref_ = _reference_metrics(scope)
     cons_fcst = sum(p["Forecast (final)"].to_numpy() for p in plans.values())
     cons_hc = sum(p["Production HC"].to_numpy() for p in plans.values())
 
@@ -3859,7 +3892,7 @@ def render_executive_view():
     brand.stat_row(tiles)
 
     # ---- stat row: branded tiles, sparklines, Δ vs last published ------
-    ref = _reference_metrics()
+    ref = _reference_metrics(scope)
 
     def _delta(cur, prev, better, fmt="{:+.1f}"):
         if prev is None:
@@ -4013,7 +4046,12 @@ def render_executive_view():
     if sw is not None and not sw.empty and "Actual SL %" in sw.columns:
         with brand.section("svc", "Service level & AHT — actuals vs. plan"):
             svc_rows = []
+            # Grouped off the FEED rollup, not `plans`, so the page scope has
+            # to be applied by hand here — otherwise picking one LOB still
+            # showed every queue's service actuals.
             for l, g in sw.groupby("LOB"):
+                if scope is not None and l != scope:
+                    continue
                 def wavg(col, wcol):
                     if col not in g:
                         return np.nan
@@ -4070,6 +4108,8 @@ def render_executive_view():
 
     # ---- data health band ---------------------------------------------
     sw = st.session_state.get("acd_weekly")
+    if sw is not None and not sw.empty and scope is not None and "LOB" in sw.columns:
+        sw = sw[sw["LOB"] == scope]     # coverage for the line being looked at
     bits = []
     if sw is not None and not sw.empty:
         if "Days Covered" in sw:   # full = the queue's MODAL norm, never 7
