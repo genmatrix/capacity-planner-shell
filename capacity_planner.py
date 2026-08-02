@@ -1453,10 +1453,12 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         new_ros = pd.DataFrame({
             "Week": new_weeks,
             "LOA": [last("LOA", ros)] * n,
-            # Classes straddling Dec 31 re-enter at week 1 (below), so the
-            # mentors coaching them are still off the phones on Jan 1.
-            "Mentors": [last("Mentors", ros)
-                        if "Mentors" in ros.columns else 0.0] * n,
+            # Mentors RESET, like Transfers — they no longer forward-fill
+            # (2026-08-02), so carrying December's level would spread one week's
+            # value across all 52 of the new year, which is the very filling
+            # that was just removed. Classes straddling Dec 31 do re-enter at
+            # week 1 below, so their mentor weeks are re-entered with them.
+            "Mentors": [0.0] * n,
             "Transfers +/-": [0.0] * n,
             "Attrition (actual)": [np.nan] * n,   # last year's departures are history
 
@@ -3041,9 +3043,9 @@ with st.sidebar:
         st.caption(
             f"Seeds a fresh **{_yr + 1}** working plan from what's on screen: ending "
             "production HC → starting HC, year-end members → starting members, last "
-            "CPM/AHT carry forward, the seasonality shape copies, anyone on LOA or "
-            "mentoring at year-end stays off the phones, and new-hire classes still "
-            "in the pipeline graduate "
+            "CPM/AHT carry forward, the seasonality shape copies, anyone on LOA at "
+            "year-end stays out (mentors reset — re-enter them with the class), and "
+            "new-hire classes still in the pipeline graduate "
             f"into the new year. Published {_yr} versions stay in the changelog and "
             "remain loadable — nothing is shared until you publish the new year.")
         # CPM for the new year: flat carry, or seeded from the measured trend.
@@ -4219,11 +4221,11 @@ the agents mentoring it aren't either. The first half is already in the model
 1. Ask **Learning & Development** how many agents they are taking, and for
    which weeks. That number is theirs to give — the app does not guess it from
    class size, because how many mentors a class needs varies by class.
-2. **Capacity Plan** → pick the LOB → **roster grid** → **Mentors**. On the
-   week they come off the phones, enter the count. It carries forward, exactly
-   like LOA.
-3. On the week they go back, set it to **0**. A mentor number left running is
-   the one way this row can quietly understate you all year.
+2. **Capacity Plan** → pick the LOB → **roster grid** → **Mentors**. Enter the
+   count on **each week they are off the phones** — this column does not carry
+   forward, so nothing runs on past the class.
+3. Pasting a column from Excel is the fast way to do a whole class at once
+   (click the first week, Ctrl/Cmd-V).
 4. The plan grid gets a **Mentors** row; those FTE come out of **Staffed FTE**
    but stay in **Production HC** — they are still employed, still attriting.
 """),
@@ -4319,9 +4321,9 @@ the number moved from 6 to 33.
 1. Sidebar → **Roll into <next year>** (needs edit control).
 2. It seeds the new year from the current plan: ending headcount becomes
    starting headcount, year-end members become the new starting members, CPM
-   and AHT carry, the seasonality shape copies, people on LOA or mentoring
-   stay off the phones, and classes still in training graduate into the new
-   year.
+   and AHT carry, the seasonality shape copies, people on LOA stay out,
+   mentors reset (re-enter them alongside the carried-over class), and classes
+   still in training graduate into the new year.
 3. Enter the new year-end member forecast, review, then publish.
 4. **This year keeps running.** Each year is its own plan with its own versions
    and its own edit lock, so publishing next year does not disturb this one —
@@ -4379,8 +4381,9 @@ CPM or weekly Members (actual).
 2. Paste **raw numbers**: strip thousands separators, %, and $ first. A value
    that doesn't fit its column is dropped silently (the console may log a
    scary-looking ValueError — the app is fine; just re-check that cell).
-3. Step-change columns (CPM, LOA, Mentors, Supervisors, Leads) carry the LAST
-   pasted value forward through later weeks.
+3. Step-change columns (CPM, LOA, Supervisors, Leads) carry the LAST pasted
+   value forward through later weeks. **Mentors and Transfers do not** — what
+   you paste is exactly what you get.
 4. New-Hire **Class Start Week** must be the ISO Monday exactly
    (2026-01-05) — format Excel date cells as text before copying.
 """),
@@ -4392,8 +4395,9 @@ CPM or weekly Members (actual).
    same year at once; read-only just means someone else has that year.
 3. **Nothing can be lost.** Every published version is permanent; drafts
    auto-save your unsaved edits and offer them back next session.
-4. **Step-change columns carry forward** on edit: CPM, LOA, Mentors,
-   Supervisors, Leads. Transfers don't — they're one-time events.
+4. **Step-change columns carry forward** on edit: CPM, LOA, Supervisors,
+   Leads. **Mentors and Transfers don't** — both are bounded events, entered
+   for the weeks they actually cover.
 5. **Supervisors/Leads are informational** — they show span-of-control drift
    but never change Staffed or Net FTE.
 """),
@@ -5764,22 +5768,29 @@ else:
                 "Roster adjustments (weekly): LOA headcount, **Mentors** — agents "
                 "Learning & Development is taking off the phones to coach new-hire "
                 "classes (enter the number they tell you; they stay in Production HC "
-                "but deliver no capacity, exactly like LOA) — net transfers in/out, "
+                "but deliver no capacity, the same way LOA does) — net transfers in/out, "
                 "**Attrition (actual)** — people who actually left that week (blank = "
                 "use the modelled rate; a filled cell **replaces** it, so past weeks "
                 "become truth and the walk self-corrects) — and support staff. "
-                "**LOA, Mentors, Supervisors and Leads/Project carry forward** "
+                "**LOA, Supervisors and Leads/Project carry forward** "
                 "from the week you edit until you edit a later week (a sup added in Q3 "
-                "is entered once — and set Mentors back to 0 the week they return to "
-                "the phones). **Transfers** are one-time events and do not carry "
-                "forward. Support staff are informational — the plan computes their "
-                "ratio rows against walking agent headcount; they never affect Net FTE.")
+                "is entered once). **Mentors and Transfers do not carry forward** — "
+                "both are bounded events, so you enter the weeks they actually cover "
+                "and nothing runs on past them. Support staff are informational — the "
+                "plan computes their ratio rows against walking agent headcount; they "
+                "never affect Net FTE.")
             prev_roster = lob["roster"]
             edited_roster = stable_editor(
                 prev_roster, state_key=f"roster_{view}", width="stretch", num_rows="fixed",
                 disabled=True if RO else ["Week"], hide_index=True)
+            # Mentors deliberately does NOT fill (user 2026-08-02). It shipped
+            # LOA-shaped a day earlier on the reasoning that a mentoring stint
+            # is a step change you edit back down — using it says otherwise: a
+            # class is a bounded window, so filling means every entry runs to
+            # December until someone remembers to stop it, and a forgotten zero
+            # understates the line all year. Closer to Transfers than to LOA.
             filled = [forward_fill_step(prev_roster, edited_roster, c)
-                      for c in ("LOA", "Mentors", "Supervisors", "Leads/Project")]
+                      for c in ("LOA", "Supervisors", "Leads/Project")]
             lob["roster"] = edited_roster
             if any(filled):
                 st.rerun()  # redraw so the carried-forward cells show
