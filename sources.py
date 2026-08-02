@@ -233,10 +233,13 @@ FIELDS = {
         ("abncalls", False, ("abandoned calls", "abandons")),
         ("acceptable", False, ("calls answered in service level", "within sl")),
         ("servicelevel", False, ("service level threshold", "sl threshold")),
-        # ASA's numerator. Occupancy needs no new column — it comes from
-        # i_acdtime/i_acwtime over i_stafftime, all already above. Both were
-        # WFM-only readings until 2026-07-31; deriving them here is what let
-        # the WFM feed go without quietly losing two metrics off the
+        # ASA's numerator. Occupancy needs no new column either — it is
+        # (i_stafftime − i_availtime − i_auxtime) / (i_stafftime − i_auxtime),
+        # all three already above; `i_availtime` is the one that makes it
+        # right, so an export without it OMITS occupancy rather than falling
+        # back to a different definition under the same name. Both readings
+        # were WFM-only until 2026-07-31; deriving them here is what let the
+        # WFM feed go without quietly losing two metrics off the
         # reconciliation.
         ("anstime", False, ("answer time", "total answer time")),
     ],
@@ -497,16 +500,43 @@ def split_weekly(df: pd.DataFrame, assumptions: dict | None = None
         answer_t = tot("anstime")
         if pd.notna(answer_t) and pd.notna(answered) and answered > 0:
             row["Actual ASA (sec)"] = round(float(answer_t) / float(answered), 1)
-        # Occupancy = productive time / staffed time, from columns the feed
-        # already carried. Note this is a MEASUREMENT of what occupancy ran at,
-        # not the `occupancy_pct` ASSUMPTION the engine sizes with — same word,
-        # two different things, and only one of them is evidence.
-        talk_i = g["i_acdtime"].sum(min_count=1) if "i_acdtime" in df.columns else np.nan
-        acw_i = g["i_acwtime"].sum(min_count=1) if "i_acwtime" in df.columns else np.nan
-        if pd.notna(talk_i) and pd.notna(staff_hrs) and staff_hrs > 0:
-            productive = float(talk_i) + float(acw_i if pd.notna(acw_i) else 0.0)
-            row["Occupancy % (actual)"] = round(
-                productive / (float(staff_hrs) * 3600) * 100, 1)
+        # Occupancy — the share of ON-PHONE time actually spent working:
+        #
+        #     (i_stafftime − i_availtime − i_auxtime)
+        #     ----------------------------------------
+        #             (i_stafftime − i_auxtime)
+        #
+        # Definition given by the user 2026-08-01 (WFM professional; this is the
+        # standard ACD derivation) and it CORRECTS the first attempt, which was
+        # (i_acdtime + i_acwtime) / i_stafftime. That was wrong twice over:
+        #   * the DENOMINATOR carried AUX, so time an agent was never available
+        #     for counted against them — MS runs 38% AUX, so it alone dragged
+        #     the figure down by a third;
+        #   * the NUMERATOR enumerated only talk + ACW, missing hold, ringing
+        #     and everything in i_othertime (335k seconds on MS in one day).
+        # On the sample it read Customer Support at 44.0% against a truth of
+        # 78.2% — the difference between "we are half idle" and "we are running
+        # just under target", which is a staffing decision.
+        #
+        # Writing it as a RESIDUAL is the point: anything that is not idle and
+        # not AUX is occupied, so hold, ringing and any future state are counted
+        # without anyone having to remember to add a column for them.
+        #
+        # NB this is a MEASUREMENT of what occupancy ran at, not the
+        # `occupancy_pct` ASSUMPTION the engine sizes with — same word, two
+        # different things, and only one of them is evidence.
+        avail = (g["i_availtime"].sum(min_count=1)
+                 if "i_availtime" in df.columns else np.nan)
+        if pd.notna(avail) and pd.notna(staff_hrs) and pd.notna(aux_hrs):
+            staff_s, aux_s = float(staff_hrs) * 3600, float(aux_hrs) * 3600
+            on_phone = staff_s - aux_s            # logged in and not in AUX
+            if on_phone > 0:
+                # Deliberately NOT clamped to [0, 100]: a negative or >100
+                # reading means the export's own time buckets do not reconcile,
+                # and that is a data-health finding the planner should see, not
+                # something to round away into a plausible-looking number.
+                row["Occupancy % (actual)"] = round(
+                    (on_phone - float(avail)) / on_phone * 100, 1)
         if "servicelevel" in have:
             # The SL THRESHOLD in seconds (20/40/120) — a label for the SL%
             # above, not a measurement. It is a per-queue setting, so a week
