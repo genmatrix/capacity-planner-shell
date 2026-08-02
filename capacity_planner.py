@@ -5076,6 +5076,33 @@ def render_advisor_page(ro: bool):
 CHANGELOG_MAX_VERSIONS = 25   # newest N; anything dropped is NAMED, never silent
 
 
+# Both caches key on FILENAME ALONE, with no mtime and no invalidation, and
+# that is correct rather than sloppy: a published `vNNNN` snapshot is IMMUTABLE
+# by design — restoring one republishes it under a NEW name rather than
+# rewriting it. So the diff between two versions is a pure function of two
+# filenames and can be cached for the life of the process.
+#
+# Measured before adding these (25 versions, 6 LOBs, 52 weeks): 1.9 s to build
+# the page, on EVERY rerun — every filter click, every widget touch — because
+# 24 pairs x 2 sides x 6 LOBs x 3 frames is 864 read_json calls. The row count
+# was irrelevant (449 rows); parsing is the whole cost. On the network share
+# the file reads dominate instead, which is why the raw JSON is cached
+# separately from the diff: consecutive pairs share a file, so each snapshot
+# would otherwise be READ twice per build.
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_snapshot(scen_dir: str, fname: str):
+    return collab.load_snapshot(scen_dir, fname)
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _cached_version_diff(scen_dir: str, older_file: str, newer_file: str) -> list[dict]:
+    a = _cached_snapshot(scen_dir, older_file)
+    b = _cached_snapshot(scen_dir, newer_file)
+    if a is None or b is None:
+        return []
+    return diff_payloads(a, b)
+
+
 def _changelog_rows(log: list[dict], limit: int) -> tuple[pd.DataFrame, int]:
     """Full history: every consecutive pair of published versions, newest first.
 
@@ -5084,12 +5111,9 @@ def _changelog_rows(log: list[dict], limit: int) -> tuple[pd.DataFrame, int]:
     walk = log[:limit]                       # changelog() is already newest-first
     rows = []
     for newer, older in zip(walk, walk[1:]):
-        snap_new = collab.load_snapshot(SCENARIO_DIR, newer["_file"])
-        snap_old = collab.load_snapshot(SCENARIO_DIR, older["_file"])
-        if snap_new is None or snap_old is None:
-            continue
         try:
-            diffs = diff_payloads(snap_old, snap_new)
+            diffs = _cached_version_diff(str(SCENARIO_DIR), older["_file"],
+                                         newer["_file"])
         except Exception as e:               # one unreadable old snapshot must
             diffs = [{"LOB": "(plan)", "Area": "Plan",   # never blank the page
                       "Field": "could not compare", "Week": "",
@@ -5134,7 +5158,11 @@ def render_changelog_page():
                    "the note the planner wrote at publish — the one part no "
                    "system can work out for itself.")
 
-    frame, walked = _changelog_rows(log, CHANGELOG_MAX_VERSIONS)
+    # First visit of a session pays the parse (~2 s for 25 versions x 6 LOBs);
+    # after that the pair cache makes it instant, and a NEW publish invalidates
+    # exactly ONE pair — the other 24 stay warm.
+    with st.spinner("Building the change log…"):
+        frame, walked = _changelog_rows(log, CHANGELOG_MAX_VERSIONS)
     if len(log) > walked:
         st.caption(f"Showing the newest {walked} of {len(log)} published "
                    f"{_yr} versions. Older ones are still on disk and still "
@@ -5175,12 +5203,13 @@ def render_changelog_page():
             st.caption("Pick two different versions.")
         else:
             lo, hi = sorted((ja, jb), key=lambda j: j["version"])
-            sa = collab.load_snapshot(SCENARIO_DIR, lo["_file"])
-            sb = collab.load_snapshot(SCENARIO_DIR, hi["_file"])
-            if sa is None or sb is None:
+            # Through the same cache — an arbitrary pair is as immutable as a
+            # consecutive one, and picking the same two twice is the norm here.
+            pair = _cached_version_diff(str(SCENARIO_DIR), lo["_file"], hi["_file"])
+            if not pair and _cached_snapshot(str(SCENARIO_DIR), lo["_file"]) is None:
                 st.warning("One of those snapshots could not be read.")
             else:
-                d = pd.DataFrame(diff_payloads(sa, sb), columns=DIFF_COLS)
+                d = pd.DataFrame(pair, columns=DIFF_COLS)
                 st.caption(f"v{lo['version']} → v{hi['version']} · "
                            f"{len(d):,} field change(s)")
                 if d.empty:
