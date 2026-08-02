@@ -2806,9 +2806,17 @@ def render_publish_panel(mode: str):
                        f" · {j.get('author','')} · {_hm(j.get('published_at',''))}"
                        + (f" — {j['note']}" if j.get("note") else ""))
             cols = st.columns(2)
+            # Keys come from the FILENAME, not the version number. `next_version`
+            # is global and monotonic so numbers are unique in practice, but only
+            # by convention — two files claiming one number (a hand-copied
+            # snapshot, a folder merged by hand) made Streamlit raise on the
+            # duplicate key and took down the WHOLE SIDEBAR, not just this panel.
+            # A filename is unique by construction. Found 2026-08-02 by a check
+            # that hand-wrote a snapshot and hit it accidentally.
+            _k = j["_file"]
             # View/edit any version privately — e.g. revisit 2026 while the
             # team's active plan is 2027 — without touching the shared pointer.
-            if cols[0].button("Sandbox", key=f"sb_open_{j['version']}",
+            if cols[0].button("Sandbox", key=f"sb_open_{_k}",
                               width="stretch",
                               help="Open this version privately. Nothing shared "
                                    "changes; publish deliberately if you want it live."):
@@ -2817,7 +2825,7 @@ def render_publish_panel(mode: str):
                 st.session_state.loaded_version = None
                 st.rerun()
             if mode == "editor" and cols[1].button("Restore", width="stretch",
-                                                   key=f"restore_{j['version']}"):
+                                                   key=f"restore_{_k}"):
                 payload = {k: j[k] for k in ("n_weeks", "members_start", "members_end", "lobs")}
                 payload["plan_year"] = j.get("plan_year", DEFAULT_PLAN_YEAR)
                 meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
@@ -3824,6 +3832,19 @@ def render_executive_view():
     _vtone = "pink" if (short_lobs or weeks_under) else "green"
     pills.append((verdict, _vtone))
     pills.append((f"{box[0]} {box[1]} · {box[2]}", _vtone))
+    # Drift from the locked budget — the landing page should be able to answer
+    # "how far are we from what we committed to" without a trip to Budget. Only
+    # when a baseline exists and only at CONSOLIDATED scope: the headline
+    # aggregates the whole plan, so showing it beside one LOB's numbers would
+    # invite reading it as that LOB's drift.
+    if scope is None:
+        _bd = budget_drift_headline()
+        if _bd:
+            _req = _bd["req"]
+            pills.append(
+                (f"vs budget v{_bd['version']}: Required {_req:+.1f} FTE · "
+                 f"Contacts {_bd['contacts']:+,.0f}",
+                 "amber" if abs(_req) >= 1.0 else "green"))
     brand.pill_row(pills)
 
     # ---- headline cards: what we forecast, what actually happened -----
@@ -4597,6 +4618,97 @@ def budget_table(grain: str, lobs: dict | None = None) -> tuple[pd.DataFrame, pd
     return long, order
 
 
+# ---- budget baseline: the locked-in plan, and how far we have drifted -------
+# `active` is the latest published truth; `budget` is what was committed to
+# before the year started. Both point at immutable snapshots, so "drift" is a
+# recomputation of two payloads through ONE engine — never a stored number that
+# could disagree with the plan it claims to describe.
+BUDGET_DRIFT_COLS = ["Contacts", "Avg Required FTE", "Peak Required FTE",
+                     "Avg Staffed FTE", "Worst Net FTE", "Avg Overall HC"]
+
+
+def budget_baseline(year: int | None = None) -> dict | None:
+    """The locked budget pointer for `year`, or None if nothing is locked."""
+    return collab.read_budget(SCENARIO_DIR, plan_year() if year is None else year)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _budget_snapshot(scen_dir: str, fname: str):
+    """Published snapshots are immutable, so the filename is a complete key —
+    same reasoning as the Change log's caches."""
+    return collab.load_snapshot(scen_dir, fname)
+
+
+def budget_drift(grain: str, lobs: dict | None = None
+                 ) -> tuple[pd.DataFrame, dict] | None:
+    """(per-LOB-per-period drift frame, meta) for working plan vs locked budget.
+
+    Δ = working − budget, so a POSITIVE Required FTE drift means the year is
+    asking for more people than were budgeted. Returns None when no budget is
+    locked, when its snapshot is unreadable, or when the two cannot be lined up
+    (different plan year or horizon) — a misaligned comparison is refused, not
+    approximated, the same rule scenario compare already follows.
+
+    `lobs` defaults to the working plan, mirroring `budget_table`; passing it
+    explicitly is how read-only consumers (and headless checks, which run
+    OUTSIDE a script run where `st.session_state` is not the app's) compare
+    frames they already hold."""
+    ptr = budget_baseline()
+    if not ptr:
+        return None
+    snap = _budget_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
+    if not snap:
+        return None
+    b_lobs, b_meta = _scenario_frames(snap)
+    w_lobs, w_meta = _scenario_frames(None)
+    if lobs is not None:
+        w_lobs = lobs
+        w_meta = {**w_meta, "n_weeks": b_meta["n_weeks"]
+                  if all(len(d["demand"]) == b_meta["n_weeks"] for d in lobs.values())
+                  else w_meta["n_weeks"]}
+    if (b_meta["plan_year"] != w_meta["plan_year"]
+            or b_meta["n_weeks"] != w_meta["n_weeks"]):
+        return None, {"misaligned": True, "ptr": ptr,
+                      "budget": b_meta, "working": w_meta}
+    b_long, b_order = budget_table(grain, lobs=b_lobs)
+    w_long, _ = budget_table(grain, lobs=w_lobs)
+    if b_long.empty or w_long.empty:
+        return None
+    keys = ["LOB", "Period"]
+    m = w_long.merge(b_long, on=keys, how="outer", suffixes=(" (plan)", " (budget)"))
+    for c in BUDGET_DRIFT_COLS:
+        m[f"{c} Δ"] = m[f"{c} (plan)"] - m[f"{c} (budget)"]
+    return m, {"misaligned": False, "ptr": ptr, "order": b_order,
+               "budget": b_meta, "working": w_meta}
+
+
+def budget_drift_headline(grain: str = "Monthly", lobs: dict | None = None
+                          ) -> dict | None:
+    """One-line drift for the Executive View: totals across the year, so the
+    landing page can say how far we are from budget without opening Budget."""
+    got = budget_drift(grain, lobs=lobs)
+    if not got or got[0] is None:
+        return None
+    m, meta = got
+    order = meta["order"]
+    per = m.groupby("Period", sort=False)
+    return {
+        "version": meta["ptr"].get("version"),
+        "name": meta["ptr"].get("name", ""),
+        "contacts": float(m["Contacts Δ"].sum()),
+        "contacts_pct": (float(m["Contacts Δ"].sum())
+                         / float(m["Contacts (budget)"].sum()) * 100
+                         if float(m["Contacts (budget)"].sum()) else np.nan),
+        # FTE is a LEVEL, so the year figure is the mean of period sums — the
+        # same aggregation the Budget page's own stat row uses. Summing an
+        # average across twelve months would report twelve times the drift.
+        "req": float(per["Avg Required FTE (plan)"].sum().reindex(order).mean()
+                     - per["Avg Required FTE (budget)"].sum().reindex(order).mean()),
+        "stf": float(per["Avg Staffed FTE (plan)"].sum().reindex(order).mean()
+                     - per["Avg Staffed FTE (budget)"].sum().reindex(order).mean()),
+    }
+
+
 def _member_variant_payload(me_new: float) -> dict:
     """The working plan with ONLY the year-end member target changed. Members
     re-spread with the SAME linear rule as apply_global_members (org-wide,
@@ -4634,8 +4746,13 @@ def _scenario_candidates() -> dict:
 
     for j in collab.personal_snapshots(SCENARIO_DIR, st.session_state.user):
         add(f"{j.get('name', 'what-if')} · {_hm(j.get('published_at', ''))}", j)
+    # The locked budget is just a published version, but it is the one people
+    # come here to compare against — mark it so it is findable in a long list.
+    _b = collab.read_budget(SCENARIO_DIR, plan_year()) or {}
+    _bver = _b.get("version")
     for j in collab.changelog(SCENARIO_DIR):
-        add(f"v{j['version']} {j.get('name', '')} · "
+        _star = "★ Budget · " if j["version"] == _bver else ""
+        add(f"{_star}v{j['version']} {j.get('name', '')} · "
             f"{j.get('plan_year', DEFAULT_PLAN_YEAR)}", j)
     return cands
 
@@ -4914,7 +5031,132 @@ def render_budget_page():
         file_name=f"budget_{yr}_{grain.lower()}.csv", mime="text/csv")
     st.caption("Every figure is derived from the published plan's drivers — nothing "
                "here is entered separately, so the budget cannot drift from the plan.")
+    render_budget_baseline(grain, yr)
     render_scenario_compare(grain, metric)
+
+
+def render_budget_baseline(grain: str, yr: int):
+    """Lock a published version as the year's official budget, and show how far
+    the working plan has drifted from it (manager ask 2026-08-02)."""
+    ptr = budget_baseline(yr)
+    RO = not st.session_state.get("editable", False)
+
+    with brand.section(
+            "budget_lock", f"Budget baseline — {yr}",
+            "The plan as it was committed to, held still, so the year can be "
+            "measured against it."):
+        if ptr:
+            st.markdown(
+                f"**Locked: v{ptr.get('version')} · {ptr.get('name', '')}** — "
+                f"locked by {ptr.get('locked_by', '?')} "
+                f"{_hm(ptr.get('locked_at', ''))}"
+                + (f" · _{ptr['note']}_" if ptr.get("note") else ""))
+            if ptr.get("history"):
+                with st.expander(f"Re-baselined {len(ptr['history'])} time(s)"):
+                    # Append-only: the ORIGINAL baseline is always the first
+                    # row, so a re-lock can never quietly erase the number the
+                    # year was actually committed to.
+                    for h in ptr["history"]:
+                        st.caption(f"was v{h.get('version')} · {h.get('name', '')} "
+                                   f"— {h.get('locked_by', '?')} "
+                                   f"{_hm(h.get('locked_at', ''))}"
+                                   + (f" · {h['note']}" if h.get("note") else ""))
+        else:
+            st.info(f"No {yr} budget locked yet. Pick the published version that "
+                    "was approved and lock it — nothing else changes, and the "
+                    "version stays editable as the working plan.")
+
+        # Only versions of THIS plan year: a 2027 snapshot cannot be 2026's
+        # budget, and letting one be picked would produce a drift table whose
+        # periods do not line up.
+        vers = collab.changelog(SCENARIO_DIR, yr)
+        if not vers:
+            st.caption(f"Nothing published for {yr} yet — publish the approved "
+                       "plan first, then lock it here.")
+        elif RO:
+            st.caption("Take control (sidebar) to lock or change the baseline.")
+        else:
+            opts = {f"v{j['version']} · {j.get('name', '')} · "
+                    f"{_hm(j.get('published_at', ''))}": j for j in vers}
+            c1, c2 = st.columns([2, 1])
+            pick = c1.selectbox("Version to lock as the budget", list(opts),
+                                key="bl_pick")
+            note = c2.text_input("Note (optional)", key="bl_note",
+                                 placeholder="approved by Finance")
+            b1, b2 = st.columns(2)
+            _label = "Re-baseline the budget" if ptr else "Lock as the budget"
+            _sure = True
+            if ptr:
+                # Re-baselining resets what "drift" means, which is the whole
+                # point of having a baseline — so it takes a deliberate tick,
+                # never a single stray click.
+                _sure = st.checkbox(
+                    f"Yes — replace v{ptr.get('version')} as the {yr} baseline",
+                    key="bl_confirm")
+            if b1.button(_label, width="stretch", disabled=not _sure,
+                         key="bl_lock"):
+                j = opts[pick]
+                collab.write_budget(SCENARIO_DIR, yr, {
+                    "file": j["_file"], "version": j["version"],
+                    "name": j.get("name", ""), "locked_by": st.session_state.user,
+                    "locked_at": collab._iso(collab._now()), "note": note})
+                st.success(f"v{j['version']} is now the {yr} budget baseline.")
+                st.rerun()
+            if ptr and b2.button("Clear the baseline", width="stretch",
+                                 disabled=not _sure, key="bl_clear"):
+                collab.clear_budget(SCENARIO_DIR, yr)
+                st.success("Baseline cleared — the published version is untouched.")
+                st.rerun()
+
+    if not ptr:
+        return
+    got = budget_drift(grain)
+    if got is None:
+        st.warning("The locked budget snapshot could not be read.")
+        return
+    frame, meta = got
+    if meta.get("misaligned"):
+        st.warning(
+            f"The {yr} budget was built on a "
+            f"{meta['budget']['n_weeks']}-week horizon and the working plan is "
+            f"{meta['working']['n_weeks']} — the periods do not line up, so a "
+            "drift table would be misleading. Comparison refused.")
+        return
+
+    with brand.section("budget_drift", f"Plan vs budget — {yr} drift",
+                       "Δ = working plan − budget. Positive Required FTE means "
+                       "the year is asking for more people than were budgeted."):
+        head = budget_drift_headline(grain)
+        if head:
+            _c = head["contacts"]
+            _pct = ("" if np.isnan(head["contacts_pct"])
+                    else f" ({head['contacts_pct']:+.1f}%)")
+            brand.stat_row([
+                {"label": "Contacts vs budget", "value": f"{_c:+,.0f}",
+                 "sub": f"for the year{_pct}"},
+                {"label": "Avg Required FTE", "value": f"{head['req']:+.1f}",
+                 "sub": "more people needed" if head["req"] > 0
+                        else "fewer people needed"},
+                {"label": "Avg Staffed FTE", "value": f"{head['stf']:+.1f}",
+                 "sub": "vs the budgeted supply"},
+            ])
+        show_lob = st.checkbox("Break out by line of business", key="bl_bylob")
+        cols = ["Period"] + (["LOB"] if show_lob else [])
+        if show_lob:
+            grid = frame[cols + [f"{c} Δ" for c in BUDGET_DRIFT_COLS]]
+        else:
+            agg = {f"{c} Δ": "sum" for c in BUDGET_DRIFT_COLS}
+            grid = frame.groupby("Period", sort=False).agg(agg).reindex(
+                meta["order"]).reset_index()
+        st.dataframe(grid.round(1), width="stretch", hide_index=True)
+        st.download_button(
+            f"Download the {yr} budget drift ({grain.lower()}) as CSV",
+            frame.round(2).to_csv(index=False),
+            file_name=f"budget_drift_{yr}_{grain.lower()}.csv", mime="text/csv")
+        st.caption(
+            f"Budget = v{meta['ptr'].get('version')}, recomputed through the same "
+            "engine as the working plan — so a difference here is a real change "
+            "in drivers or supply, never two systems disagreeing about arithmetic.")
 
 
 def render_guide_page():

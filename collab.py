@@ -140,6 +140,51 @@ def write_active(d, year, meta: dict):
         _atomic_write(legacy_active_path(dd), json.dumps(meta))
 
 
+# --------------------------------------------------------------- budget pointer
+# The year's LOCKED-IN official plan — what was committed to before the year
+# started, as opposed to `active`, which is the latest published working truth
+# (manager ask 2026-08-02, relayed by the user: "we need a budget locked in vs
+# the working plan ... so we can see how we have drifted compared to budget").
+#
+# Deliberately a SECOND pointer at the same immutable snapshots rather than a
+# copy of the plan: the budget IS a published version, so locking one costs
+# nothing, can never disagree with what was actually published, and keeps the
+# whole audit chain (version number, author, note, the Change log's diffs).
+#
+# Re-baselining is ALLOWED but never silent. Mid-year re-forecasts are real,
+# and a system that forbids them gets worked around with a spreadsheet — but a
+# budget you can quietly move is not a budget. So `write_budget` PUSHES the
+# previous designation onto `history`, which is append-only: the original
+# baseline survives every re-lock and the UI can always show what it was.
+def budget_path(d, year) -> Path:
+    return Path(d) / f"budget-{int(year)}.json"
+
+
+def read_budget(d, year):
+    return _read_json(budget_path(d, year))
+
+
+def write_budget(d, year, meta: dict):
+    """Point `year`'s budget at a published version. Carries the previous
+    designation into `history` (oldest first) so a re-baseline is additive."""
+    prev = read_budget(d, year)
+    hist = list(prev.get("history", [])) if prev else []
+    if prev:
+        hist.append({k: v for k, v in prev.items() if k != "history"})
+    _atomic_write(budget_path(_dir(d), int(year)),
+                  json.dumps({**meta, "plan_year": int(year), "history": hist}))
+
+
+def clear_budget(d, year) -> bool:
+    """Remove the designation. The SNAPSHOT is untouched — this unpicks a
+    pointer, it never deletes a published version."""
+    p = budget_path(_dir(d), int(year))
+    if p.exists():
+        p.unlink()
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- edit lock
 def lock_path(d, year) -> Path:
     return Path(d) / f"edit-{int(year)}.lock"
