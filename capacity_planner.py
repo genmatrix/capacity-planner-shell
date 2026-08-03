@@ -391,10 +391,24 @@ def _draft_path(year=None) -> Path:
     return SCENARIO_DIR / "drafts" / f"{st.session_state.user}-{y}.json"
 
 
+def _resume_path(year=None) -> Path:
+    """Where an OFFERED draft is parked while the planner decides. Separate
+    from the live draft so autosave can keep protecting new work without
+    overwriting the offer — see _startup_draft_check."""
+    y = _plan_year() if year is None else int(year)
+    return SCENARIO_DIR / "drafts" / f"{st.session_state.user}-{y}.resume.json"
+
+
 def _live_draft_path() -> Path:
     """The draft file to READ. Falls back to the pre-per-year name (no year
     suffix) for the legacy year, so the first launch after the update still
     offers a resume instead of silently abandoning someone's work."""
+    # An un-answered offer outranks the live draft: it is the older, unpublished
+    # work, and the live draft may since have been overwritten with the active
+    # plan by an ordinary session.
+    rp = _resume_path()
+    if rp.exists():
+        return rp
     p = _draft_path()
     if not p.exists() and _plan_year() == DEFAULT_PLAN_YEAR:
         legacy = SCENARIO_DIR / "drafts" / f"{st.session_state.user}.json"
@@ -453,8 +467,26 @@ def _startup_draft_check():
     if json.dumps(mine, sort_keys=True, default=str) == json.dumps(ref, sort_keys=True, default=str):
         src.unlink(missing_ok=True)   # everything was published — clean up
         return
+    # Park the offered work in its OWN file before anything else can touch it
+    # (fixed 2026-08-03). Previously this left the payload in memory only: the
+    # session goes on to load the ACTIVE plan, and the first autosave wrote
+    # THAT over the draft — so closing the tab without clicking Resume
+    # destroyed the work, in the feature whose whole purpose is that closing a
+    # tab never loses work.
+    #
+    # Suppressing the autosave instead was the wrong fix and briefly shipped:
+    # it protects the offered draft by leaving NEW edits unprotected, which is
+    # the same failure moved. A separate file lets both be true at once — the
+    # offer survives, and the live draft keeps saving whatever is typed next.
+    rp = _resume_path()
+    try:
+        if src != rp:
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            collab._atomic_write(rp, json.dumps(d))
+    except OSError:
+        rp = src                       # share hiccup: fall back to the original
     st.session_state["_draft_pending"] = d
-    st.session_state["_draft_file"] = str(src)   # discard must delete what we READ
+    st.session_state["_draft_file"] = str(rp)   # discard must delete what we OFFER
 
 
 def _purge_assumption_widgets():
@@ -2731,6 +2763,15 @@ def render_team_status() -> tuple[bool, str]:
             st.rerun()
         return True, "sandbox"
 
+    # Taking control pulled a colleague's newer version over work we were
+    # holding — say where that work went, once.
+    if st.session_state.get("_rescued_whatif"):
+        st.info("The plan had advanced, so taking control loaded the published "
+                "version. What you were holding was saved as the what-if "
+                "**“before taking control”** (sidebar → My what-ifs) — open it "
+                "in Sandbox to copy anything across.")
+        st.session_state.pop("_rescued_whatif", None)
+
     # --- We hold edit control ----------------------------------------
     if i_edit:
         if not collab.heartbeat(SCENARIO_DIR, year, user, tok):
@@ -2775,6 +2816,20 @@ def render_team_status() -> tuple[bool, str]:
         # (2026-07-31). Same-version case: keep what we have.
         _act = collab.read_active(SCENARIO_DIR, year)
         if _act and _act.get("version") != st.session_state.get("loaded_version"):
+            # A colleague published while we were away, so their version wins —
+            # otherwise we would republish over their work. But the session may
+            # hold UNPUBLISHED edits (resumed from a draft, say), and replacing
+            # every frame destroys them: the draft file is rewritten on the next
+            # autosave, so they are gone from disk too. Park them as a personal
+            # what-if FIRST. It costs one small file in the rare case and keeps
+            # the app's promise that nothing is ever silently lost.
+            try:
+                _, _f = collab.save_personal(
+                    SCENARIO_DIR, _serialize_lobs(),
+                    f"before taking control of {year}", user)
+                st.session_state["_rescued_whatif"] = _f
+            except OSError:
+                pass
             _load_active_into_session()
         st.session_state[_we_key] = True
         st.rerun()
@@ -3044,6 +3099,10 @@ with st.sidebar:
             st.session_state.sandbox = bool(_d.get("sandbox"))
             st.session_state.loaded_version = _d.get("base_version")
             st.session_state["_draft_pending"] = None
+            # The offer is answered — drop the parked copy, or every future
+            # boot re-offers work the planner already took back.
+            _resume_path().unlink(missing_ok=True)
+            st.session_state.pop("_draft_blob", None)   # force a fresh autosave
             st.rerun()
         if _c2.button("Discard", width="stretch", key="draft_discard"):
             # Delete the file the check actually READ — which may be the
