@@ -68,6 +68,33 @@ def _serialize_lobs() -> dict:
     }
 
 
+# The only genuinely textual grid columns; everything else is a number.
+TEXT_GRID_COLS = ("Week", "Class Start Week")
+
+
+def _float_cols(df: pd.DataFrame, keep_text) -> pd.DataFrame:
+    """Force every non-text grid column to float64.
+
+    The SECOND half of the read_json inference bug (field report 2026-08-03:
+    "I can't paste AHT into the weekly inputs"). The index half was fixed in
+    July; dtypes were not. `pd.read_json` infers a column's type from its
+    VALUES, so a column that happens to hold only whole numbers — AHT in whole
+    seconds, CPM 0 on a blank line, Seasonality all 1.0 — comes back as int64.
+    Streamlit then renders an INTEGER column, and the grid refuses anything
+    fractional: no 412.5 AHT, no 1.15 seasonality, and pasting a column of
+    decimals fails silently.
+
+    It bites only AFTER a publish/reload, which is every session after the
+    first, and it depends on the VALUES rather than the code — which is why it
+    survived so long and why it must be forced here rather than trusted."""
+    for c in df.columns:
+        if c in keep_text:
+            continue
+        if df[c].dtype != "float64":
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    return df
+
+
 def _payload_lobs(p: dict) -> dict:
     """Parse a snapshot payload's LOB frames into the {lob: {demand, roster, nh,
     assumptions}} shape compute_plan takes, applying every legacy-column
@@ -98,9 +125,9 @@ def _payload_lobs(p: dict) -> dict:
         # and vanished on navigation (diagnosed live 2026-07-14). Grid rows
         # are positional; the index carries nothing — normalize it at load.
         lobs[lob] = {
-            "demand": dem.reset_index(drop=True),
-            "roster": ros.reset_index(drop=True),
-            "nh": _nh.reset_index(drop=True),
+            "demand": _float_cols(dem.reset_index(drop=True), TEXT_GRID_COLS),
+            "roster": _float_cols(ros.reset_index(drop=True), TEXT_GRID_COLS),
+            "nh": _float_cols(_nh.reset_index(drop=True), TEXT_GRID_COLS),
             "assumptions": d["assumptions"],
         }
     return lobs
