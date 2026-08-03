@@ -334,7 +334,58 @@ def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9 _-]", "", name or "").strip()[:60] or "scenario"
 
 
+# Listing snapshots must NOT read their plan payloads (perf, 2026-08-03).
+#
+# Measured on a 30-version folder: the app pulled ~100 files and 3.2 MB off the
+# share on EVERY RERUN — and in Streamlit a rerun is every keystroke in a grid,
+# every widget touch, every page change. The Budget page cost 189 reads / 6.5 MB.
+# All of it to render "v3 · name · author · date" in a list, because
+# `_all_snapshots` parsed each version's ENTIRE plan just to reach its header.
+# On a slow network share that is the difference between usable and not
+# (user: "the network share is super slow ... cumbersome to navigate even
+# through just pages").
+#
+# So listings carry METADATA ONLY, cached per file. A published `vNNNN` is
+# immutable, but the cache is keyed on (path, mtime, size) anyway so a pointer
+# file — which does change — can share the same path, and a hand-edited folder
+# cannot serve a stale header. Callers that genuinely need the plan (Sandbox,
+# Restore, scenario compare) call `load_snapshot(d, meta["_file"])`, which is
+# the one place the payload is paid for.
+#
+# Negative results are cached too: `active-*.json` and `budget-*.json` match the
+# glob, carry no "lobs", and were being re-read and discarded every rerun.
+_SNAP_META_KEYS = ("version", "name", "author", "published_at", "saved_at",
+                   "parent_version", "note", "kind", "plan_year", "n_weeks",
+                   "members_start", "members_end")
+_SNAP_CACHE: dict[tuple, dict | None] = {}
+
+
+def _snapshot_meta(p: Path) -> dict | None:
+    """One snapshot's listing header, WITHOUT its plan payload. None when the
+    file is not a snapshot (a pointer, a stray json) or cannot be read."""
+    try:
+        stt = p.stat()
+    except OSError:
+        return None
+    key = (str(p), stt.st_mtime_ns, stt.st_size)
+    if key in _SNAP_CACHE:
+        return _SNAP_CACHE[key]
+    j = _read_json(p)
+    meta = None
+    if isinstance(j, dict) and "lobs" in j:
+        meta = {k: j[k] for k in _SNAP_META_KEYS if k in j}
+        meta["_file"] = p.name
+    if len(_SNAP_CACHE) > 4000:        # a share that large is already a problem
+        _SNAP_CACHE.clear()            # — bound the dict rather than grow forever
+    _SNAP_CACHE[key] = meta
+    return meta
+
+
 def _all_snapshots(d) -> list[dict]:
+    """Every snapshot's METADATA, newest-first ordering left to callers.
+
+    Deliberately no `lobs` — see the note above. Anything needing the plan
+    itself calls `load_snapshot` with the entry's `_file`."""
     dd = Path(d)
     if not dd.exists():
         return []
@@ -342,10 +393,9 @@ def _all_snapshots(d) -> list[dict]:
     for p in sorted(dd.glob("*.json")):
         if p.name == "active.json":
             continue
-        j = _read_json(p)
-        if isinstance(j, dict) and "lobs" in j:
-            j["_file"] = p.name
-            out.append(j)
+        meta = _snapshot_meta(p)
+        if meta is not None:
+            out.append(meta)
     return out
 
 

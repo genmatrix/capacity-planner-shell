@@ -311,6 +311,24 @@ def diff_payloads(old: dict, new: dict) -> list[dict]:
     return rows
 
 
+# One home for "read a published snapshot", and it is CACHED (perf, 2026-08-03).
+#
+# A `vNNNN` snapshot is immutable, so its filename is a complete cache key — no
+# mtime, no invalidation. That matters because several surfaces re-read the
+# ACTIVE snapshot on EVERY RERUN: the auto-draft comparison (twice), the
+# published-vs-working drift caption, the weekly checklist, the Executive
+# View's reference metrics. Each read is the whole plan. Measured on the share
+# path: an edit while holding the lock cost 13 reads / 73 KB, most of it the
+# same file fetched repeatedly. On a slow network share that is felt as lag on
+# every keystroke.
+#
+# st.cache_data returns a COPY per call, so callers can treat the result as
+# theirs without a shared-mutation hazard.
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_snapshot(scen_dir: str, fname: str):
+    return collab.load_snapshot(scen_dir, fname)
+
+
 def _apply_payload(p: dict):
     """Load a snapshot payload into session as the working plan."""
     st.session_state.n_weeks = p["n_weeks"]
@@ -399,7 +417,7 @@ def _startup_draft_check():
     # string-comparable; frames reloaded from JSON re-serialize with dtype
     # drift and would false-positive every boot.
     act = collab.read_active(SCENARIO_DIR, _plan_year())
-    snap = collab.load_snapshot(SCENARIO_DIR, act["file"]) if act else None
+    snap = _cached_snapshot(str(SCENARIO_DIR), act["file"]) if act else None
     if snap is not None:
         ref = {k: snap.get(k) for k in keys if k in snap}
     else:   # nothing published yet — compare to the freshly built session
@@ -477,7 +495,7 @@ def _switch_year(year: int) -> None:
 def _load_active_into_session():
     """Point the working plan at the current shared active version (if any)."""
     act = collab.read_active(SCENARIO_DIR, _plan_year())
-    snap = collab.load_snapshot(SCENARIO_DIR, act["file"]) if act else None
+    snap = _cached_snapshot(str(SCENARIO_DIR), act["file"]) if act else None
     if snap:
         _apply_payload(snap)
         st.session_state.loaded_version = act["version"]
@@ -2822,12 +2840,20 @@ def render_publish_panel(mode: str):
                               width="stretch",
                               help="Open this version privately. Nothing shared "
                                    "changes; publish deliberately if you want it live."):
-                st.session_state.sandbox = True
-                _apply_payload(j)
-                st.session_state.loaded_version = None
-                st.rerun()
+                # changelog() entries are METADATA ONLY (see collab._all_snapshots)
+                # — the plan payload is fetched here, on the click, instead of
+                # for every version on every rerun.
+                _full = collab.load_snapshot(SCENARIO_DIR, j["_file"])
+                if _full is None:
+                    st.error("That version could not be read.")
+                else:
+                    st.session_state.sandbox = True
+                    _apply_payload(_full)
+                    st.session_state.loaded_version = None
+                    st.rerun()
             if mode == "editor" and cols[1].button("Restore", width="stretch",
                                                    key=f"restore_{_k}"):
+                j = collab.load_snapshot(SCENARIO_DIR, j["_file"]) or j
                 payload = {k: j[k] for k in ("n_weeks", "members_start", "members_end", "lobs")}
                 payload["plan_year"] = j.get("plan_year", DEFAULT_PLAN_YEAR)
                 meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
@@ -2890,9 +2916,13 @@ def render_publish_panel(mode: str):
             labels = {f"{j.get('name')} · {_hm(j.get('published_at',''))}": j for j in mine}
             pick = st.selectbox("Load one (opens in sandbox)", list(labels), key="load_whatif")
             if st.button("Load what-if"):
-                st.session_state.sandbox = True
-                _apply_payload(labels[pick])
-                st.rerun()
+                _full = collab.load_snapshot(SCENARIO_DIR, labels[pick]["_file"])
+                if _full is None:
+                    st.error("That what-if could not be read.")
+                else:
+                    st.session_state.sandbox = True
+                    _apply_payload(_full)
+                    st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -3101,7 +3131,7 @@ with st.sidebar:
         _unpub = False
         try:
             _act_now = collab.read_active(SCENARIO_DIR, _yr)
-            _snap_now = (collab.load_snapshot(SCENARIO_DIR, _act_now["file"])
+            _snap_now = (_cached_snapshot(str(SCENARIO_DIR), _act_now["file"])
                          if _act_now else None)
             if _snap_now is None:
                 _unpub = True
@@ -3599,7 +3629,7 @@ def _reference_metrics(scope: str | None = None) -> dict | None:
     if cache and cache.get("file") == act.get("file") \
             and cache.get("scope") == scope:
         return cache
-    snap = collab.load_snapshot(SCENARIO_DIR, act["file"])
+    snap = _cached_snapshot(str(SCENARIO_DIR), act["file"])
     if not snap:
         return None
     try:
@@ -4557,7 +4587,7 @@ def weekly_checklist():
     if act:
         lv = st.session_state.get("loaded_version")
         try:
-            snap = collab.load_snapshot(SCENARIO_DIR, act["file"]) or {}
+            snap = _cached_snapshot(str(SCENARIO_DIR), act["file"]) or {}
             keys = ("n_weeks", "plan_year", "members_start", "members_end", "lobs")
             cur = {k: v for k, v in _serialize_lobs().items() if k in keys}
             ref = {k: snap.get(k) for k in keys if k in snap}
@@ -4636,13 +4666,6 @@ def budget_baseline(year: int | None = None) -> dict | None:
     return collab.read_budget(SCENARIO_DIR, plan_year() if year is None else year)
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
-def _budget_snapshot(scen_dir: str, fname: str):
-    """Published snapshots are immutable, so the filename is a complete key —
-    same reasoning as the Change log's caches."""
-    return collab.load_snapshot(scen_dir, fname)
-
-
 def budget_drift(grain: str, lobs: dict | None = None
                  ) -> tuple[pd.DataFrame, dict] | None:
     """(per-LOB-per-period drift frame, meta) for working plan vs locked budget.
@@ -4660,7 +4683,7 @@ def budget_drift(grain: str, lobs: dict | None = None
     ptr = budget_baseline()
     if not ptr:
         return None
-    snap = _budget_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
+    snap = _cached_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
     if not snap:
         return None
     b_lobs, b_meta = _scenario_frames(snap)
@@ -4749,7 +4772,7 @@ def budget_assumption_drift(lobs: dict | None = None
     ptr = budget_baseline()
     if not ptr:
         return None
-    snap = _budget_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
+    snap = _cached_snapshot(str(SCENARIO_DIR), ptr.get("file", ""))
     if not snap:
         return None
     b_lobs = _payload_lobs(snap)
@@ -4859,8 +4882,14 @@ def _scenario_candidates() -> dict:
 
 
 def _scenario_frames(payload) -> tuple[dict, dict]:
-    """(lobs dict for budget_table, scenario meta). None = the working plan."""
-    if payload is None:
+    """(lobs dict for budget_table, scenario meta). None = the working plan.
+
+    Accepts either a full payload or a listing entry — `_scenario_candidates`
+    holds METADATA now, so the plan is fetched here, for the two-to-four
+    scenarios actually picked, rather than for every version on every rerun."""
+    if payload is not None and "lobs" not in payload and payload.get("_file"):
+        payload = collab.load_snapshot(SCENARIO_DIR, payload["_file"]) or payload
+    if payload is None or "lobs" not in payload:
         return st.session_state.lobs, {
             "plan_year": plan_year(),
             "n_weeks": int(st.session_state.n_weeks),
@@ -5465,11 +5494,6 @@ CHANGELOG_MAX_VERSIONS = 25   # newest N; anything dropped is NAMED, never silen
 # the file reads dominate instead, which is why the raw JSON is cached
 # separately from the diff: consecutive pairs share a file, so each snapshot
 # would otherwise be READ twice per build.
-@st.cache_data(show_spinner=False, max_entries=64)
-def _cached_snapshot(scen_dir: str, fname: str):
-    return collab.load_snapshot(scen_dir, fname)
-
-
 @st.cache_data(show_spinner=False, max_entries=256)
 def _cached_version_diff(scen_dir: str, older_file: str, newer_file: str) -> list[dict]:
     a = _cached_snapshot(scen_dir, older_file)
