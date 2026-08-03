@@ -60,12 +60,28 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
   wait for that before relying on the new version.
 
   This matters more than it sounds. There is ONE copy of the app on the share, so
-  an update reaches everyone at once — except a session someone left OPEN, whose
-  Python process keeps the old code until it is relaunched. That is the only way
-  two versions of the app can ever be reading the same `scenarios/` folder, and
-  it is why the update instruction is about correctness, not tidiness.
-  Per-PC copies of the app folder have the same effect permanently: four
-  planners, four different apps, four private plans.
+  an update reaches everyone at once — except a session someone left OPEN. That
+  session does not simply keep running the old version, which would at least be
+  consistent. Streamlit re-reads the MAIN script from disk on every interaction,
+  while the modules beside it (`collab.py`, `sources.py`, `brand.py`) are loaded
+  once when the app starts and stay in memory until relaunch. So an open session
+  ends up running the NEW main script against the OLD supporting modules — a
+  combination that has never existed anywhere and has never been tested. Changes
+  routinely span both at once.
+
+  That is the only way two versions of the app can ever be reading the same
+  `scenarios/` folder, and it is why the update instruction is about
+  correctness, not tidiness. Per-PC copies of the app folder have the same
+  effect permanently: four planners, four different apps, four private plans.
+
+  **The tell**: if the console says *"An update to the [server] config option
+  section was detected... please restart"*, the update landed while your app was
+  running. Nothing is broken and the message itself is harmless — the config
+  file is usually unchanged and only its timestamp moved — but it means you are
+  in the mixed state above. Close and relaunch before trusting anything.
+
+  **To close it properly**: shut the browser tab AND the black console window
+  (or press Ctrl+C in it). Closing only the tab leaves the app running.
 - **Package updates**: change `requirements.txt` (and refresh `wheels\` if used).
   The launcher detects the change and re-syncs each person's environment
   automatically on next launch.
