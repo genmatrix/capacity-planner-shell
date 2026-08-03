@@ -66,6 +66,15 @@ if not exist "%USERPROFILE%\.streamlit\credentials.toml" (
   >>"%USERPROFILE%\.streamlit\credentials.toml" echo email = ""
 )
 
-"%PYEXE%" -m streamlit run capacity_planner.py
+rem --server.fileWatcherType=none: Streamlit otherwise WATCHES the app's source
+rem files for edits so it can offer "Rerun". Without the watchdog package that
+rem is POLLING, and here the files being polled live on the network share — a
+rem steady drip of round trips, forever, on the slowest link in the setup.
+rem Planners never edit the code, and updates are picked up by relaunching
+rem (see TEAM_SETUP "Updates"), so the watcher buys nothing here and costs on
+rem every rerun. Passed on the command line rather than put in config.toml
+rem because that file is shared with local development, where hot reload IS
+rem wanted.
+"%PYEXE%" -m streamlit run capacity_planner.py --server.fileWatcherType=none
 popd
 pause

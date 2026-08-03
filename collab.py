@@ -87,8 +87,10 @@ def _atomic_write(path: Path, text: str):
 
 
 def _read_json(path: Path):
-    if not path.exists():
-        return None
+    # No `exists()` pre-check: on a network share that is a SECOND round trip
+    # for every pointer read, and the missing-file case is already handled by
+    # the except. Pointers (active-, budget-, the lock) are read uncached on
+    # every rerun, so this halves the fixed cost of each one.
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -360,13 +362,18 @@ _SNAP_META_KEYS = ("version", "name", "author", "published_at", "saved_at",
 _SNAP_CACHE: dict[tuple, dict | None] = {}
 
 
-def _snapshot_meta(p: Path) -> dict | None:
+def _snapshot_meta(p: Path, stt=None) -> dict | None:
     """One snapshot's listing header, WITHOUT its plan payload. None when the
-    file is not a snapshot (a pointer, a stray json) or cannot be read."""
-    try:
-        stt = p.stat()
-    except OSError:
-        return None
+    file is not a snapshot (a pointer, a stray json) or cannot be read.
+
+    `stt` is the caller's already-obtained stat result — `_all_snapshots` gets
+    it free from `os.scandir`, and re-statting here would put back exactly the
+    per-file round trip that scandir exists to avoid."""
+    if stt is None:
+        try:
+            stt = p.stat()
+        except OSError:
+            return None
     key = (str(p), stt.st_mtime_ns, stt.st_size)
     if key in _SNAP_CACHE:
         return _SNAP_CACHE[key]
@@ -385,15 +392,33 @@ def _all_snapshots(d) -> list[dict]:
     """Every snapshot's METADATA, newest-first ordering left to callers.
 
     Deliberately no `lobs` — see the note above. Anything needing the plan
-    itself calls `load_snapshot` with the entry's `_file`."""
-    dd = Path(d)
-    if not dd.exists():
+    itself calls `load_snapshot` with the entry's `_file`.
+
+    Enumerated with `os.scandir`, and that is the whole point on a network
+    share: a DirEntry carries the size and mtime the cache key needs, taken
+    from the directory listing ITSELF. `glob()` + `p.stat()` costs one round
+    trip PER FILE; scandir costs one for the directory. Measured on the real
+    deployment (user 2026-08-03: "every change takes like 15-20 seconds"): ONE
+    roster edit was 274 filesystem round trips against a 40-version folder,
+    258 of them stats. At the ~50-70 ms round trip a slow SMB share gives you,
+    that is the 15-20 seconds — the reads were already cached; it was the
+    METADATA calls that had not been.
+    """
+    try:
+        entries = list(os.scandir(d))
+    except OSError:
         return []
     out = []
-    for p in sorted(dd.glob("*.json")):
-        if p.name == "active.json":
+    for e in sorted(entries, key=lambda x: x.name):
+        if e.name == "active.json" or not e.name.endswith(".json"):
             continue
-        meta = _snapshot_meta(p)
+        try:
+            if not e.is_file():
+                continue
+            stt = e.stat()          # from the directory listing — no round trip
+        except OSError:
+            continue
+        meta = _snapshot_meta(Path(e.path), stt)
         if meta is not None:
             out.append(meta)
     return out
