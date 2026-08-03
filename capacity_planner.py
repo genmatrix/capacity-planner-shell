@@ -4031,16 +4031,39 @@ def render_executive_view():
         hm_long = pd.concat([
             pd.DataFrame({"Week": weeks, "LOB": l, "Net FTE": p["Net FTE"]})
             for l, p in plans.items()])
-        brand.chart(
-            alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
+        # Numbers IN the cells, so the grid reads without hovering every one
+        # (user ask 2026-08-03). A toggle rather than always-on: at a 52-week
+        # horizon the cells are ~15px wide and 3-character labels crowd, which
+        # is a fair trade for some planners and not for others.
+        show_n = st.checkbox("Show numbers", value=True, key="heat_labels",
+                             help="Print each week's Net FTE in the cell. Turn "
+                                  "off if a full-year horizon looks crowded.")
+        heat = alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
+            x=alt.X("Week:O", sort=None, axis=_month_axis()),
+            y=alt.Y("LOB:N", sort=lobs, title=None),
+            color=alt.Color("Net FTE:Q",
+                            scale=alt.Scale(domainMid=0,
+                                            range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
+                            legend=alt.Legend(title="Net FTE")),
+            tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f")])
+        if show_n:
+            # Ink on the pale middle, white on the saturated ends — no single
+            # colour clears both (white on NEUTRAL is 1.2:1, ink on SHORT is
+            # 2.0:1). The switch points are COMPUTED, not eyeballed: walking
+            # the diverging ramp, white overtakes ink at 62% toward SHORT and
+            # 83% toward COVERED. Different per side because the two endpoints
+            # differ in lightness, so one threshold would misjudge one of them.
+            _mx = float(np.nanmax(np.abs(hm_long["Net FTE"].to_numpy())) or 0.0) or 1.0
+            _dark = (f"datum['Net FTE'] <= {-0.62 * _mx} || "
+                     f"datum['Net FTE'] >= {0.83 * _mx}")
+            heat = heat + alt.Chart(hm_long).mark_text(
+                fontSize=9, fontWeight=500).encode(
                 x=alt.X("Week:O", sort=None, axis=_month_axis()),
                 y=alt.Y("LOB:N", sort=lobs, title=None),
-                color=alt.Color("Net FTE:Q",
-                                scale=alt.Scale(domainMid=0,
-                                                range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
-                                legend=alt.Legend(title="Net FTE")),
-                tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f")]),
-            height=32 * len(lobs) + 60)
+                text=alt.Text("Net FTE:Q", format="+.0f"),
+                color=alt.condition(_dark, alt.value("#ffffff"),
+                                    alt.value(brand.TEXT)))
+        brand.chart(heat, height=32 * len(lobs) + 60)
 
     # ---- demand vs supply walk ----------------------------------------
     with brand.section("walk", "Demand vs. supply — consolidated"):
