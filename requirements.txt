@@ -11,5 +11,14 @@ streamlit==1.57.0
 pandas==3.0.3
 numpy==2.4.6
 altair==6.1.0
-openpyxl==3.1.5
+# pyarrow is a TRANSITIVE dependency (streamlit requires it, to ship DataFrames
+# to the browser) and is pinned here on purpose, not by accident: the version
+# matters — newer pandas/numpy/pyarrow wheels segfaulted the demo host — and the
+# rule for this file is pin what you tested. Removing the line would not remove
+# the package, only the control over which build lands.
 pyarrow==24.0.0
+# NOT here on purpose: openpyxl. It is reachable only through data_io.py, which
+# is deliberately never imported (manual entry is the model, user decision
+# 2026-07-10). Verified 2026-08-04 by running the whole suite against a 3.11.4
+# venv without it: all 24 green. Wiring data_io later means adding it back —
+# pandas raises a clear "Missing optional dependency 'openpyxl'" if you forget.

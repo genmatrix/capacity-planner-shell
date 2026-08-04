@@ -17,6 +17,10 @@ planner exactly what happened instead of a stack trace.
 """
 from __future__ import annotations
 
+# NB wiring this module back in ALSO means adding `openpyxl` to
+# requirements.txt — it was dropped 2026-08-04 because nothing imports
+# this file, so nothing needed the Excel engine. pandas raises a clear
+# "Missing optional dependency 'openpyxl'" if it is forgotten.
 import io
 from dataclasses import dataclass, field
 from datetime import date, datetime
