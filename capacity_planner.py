@@ -4436,16 +4436,7 @@ def render_executive_view():
 
 
 # Demo builds replace None with a guided-tour section via the publish pipeline.
-DEMO_TOUR_MD = """
-This demo ships with a half-year of synthetic data telling one story: **Customer Support is slowly losing the staffing race.** Follow it:
-
-1. **Executive View** — the verdict flags the shortfall; watch the heatmap turn red for Customer Support through Q2, with the dashed *today* line marking where actuals end.
-2. **Real Data** — the actuals agree: service level slides from ~88% to the 50s in exactly the weeks occupancy pins near 90% and abandons climb. Try the *requirement benchmark* toggle while you're there.
-3. **Capacity Plan** — open Customer Support: the reconciliation table shows plan vs actual per week. Press *Derive from actuals* to build a seasonality curve from 26 weeks of history.
-4. **Hiring Advisor** — the payoff: it recommends the exact classes (lead-time and ramp aware) that would have prevented the June hole.
-
-*Everything here is synthetic and private to your session — edit, publish, sandbox freely; it resets when you leave.*
-"""
+DEMO_TOUR_MD = None
 
 GUIDE_SECTIONS = [
     ("Every week — the plan review", """
