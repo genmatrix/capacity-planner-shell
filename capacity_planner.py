@@ -4520,9 +4520,9 @@ CPM or weekly Members (actual).
 2. Paste **raw numbers**: strip thousands separators, %, and $ first. A value
    that doesn't fit its column is dropped silently (the console may log a
    scary-looking ValueError — the app is fine; just re-check that cell).
-3. Step-change columns (CPM, LOA, Supervisors, Leads) carry the LAST pasted
-   value forward through later weeks. **Mentors and Transfers do not** — what
-   you paste is exactly what you get.
+3. Step-change columns (CPM, AHT, LOA, Supervisors, Leads) carry the LAST
+   pasted value forward through later weeks. **Seasonality, Mentors and
+   Transfers do not** — what you paste is exactly what you get.
 4. New-Hire **Class Start Week** must be the ISO Monday exactly
    (2026-01-05) — format Excel date cells as text before copying.
 """),
@@ -4534,9 +4534,10 @@ CPM or weekly Members (actual).
    same year at once; read-only just means someone else has that year.
 3. **Nothing can be lost.** Every published version is permanent; drafts
    auto-save your unsaved edits and offer them back next session.
-4. **Step-change columns carry forward** on edit: CPM, LOA, Supervisors,
-   Leads. **Mentors and Transfers don't** — both are bounded events, entered
-   for the weeks they actually cover.
+4. **Step-change columns carry forward** on edit: CPM, AHT, LOA, Supervisors,
+   Leads — set once, holds until you change it. **Seasonality, Mentors and
+   Transfers don't** — a seasonal index is a different number every week, and
+   the other two are bounded events entered for the weeks they cover.
 5. **Supervisors/Leads are informational** — they show span-of-control drift
    but never change Staffed or Net FTE.
 """),
@@ -5784,7 +5785,7 @@ else:
                 "**Members** is the shared org-wide base (set in the sidebar, same for every "
                 "LOB). Expected weekly calls = **Members × CPM ÷ 52** (CPM = annual "
                 "**Calls Per Member**), so this LOB's **CPM** sizes its demand. "
-                "Editing a week's **CPM carries "
+                "Editing a week's **CPM or AHT carries "
                 "forward** to later weeks until you edit a later week. "
                 "**Seasonality** is a weekly index (1.0 = average, 1.15 = +15%) that "
                 "reshapes the year but keeps the annual total fixed — peaks pull volume "
@@ -5811,7 +5812,15 @@ else:
                     "Fcst Override": st.column_config.NumberColumn(format="localized"),
                     "AHT (sec)": st.column_config.NumberColumn(format="localized"),
                 })
-            cpm_filled = forward_fill_step(prev_demand, edited_demand, "CPM")
+            # AHT fills like CPM (user 2026-08-03). Both are planning
+            # ASSUMPTIONS held until revised — you decide handle time is 420s
+            # and it stays 420s until something changes it — so they are step
+            # changes, not per-week facts. Seasonality still does NOT fill: its
+            # whole job is a different value every week. Same rule that took
+            # the fill OFF Mentors a day earlier, applied in the other
+            # direction: step changes fill, bounded events do not.
+            cpm_filled = any([forward_fill_step(prev_demand, edited_demand, c)
+                              for c in ("CPM", "AHT (sec)")])
             members_changed = capture_members_actual(edited_demand)
             lob["demand"] = edited_demand
             if cpm_filled or members_changed:
