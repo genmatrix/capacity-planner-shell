@@ -1271,6 +1271,126 @@ def _drop_partial_weeks(b: pd.DataFrame) -> pd.DataFrame:
     return b[dc >= norm]
 
 
+CARD_RECENT_WEEKS = 4      # smooth enough that one quiet week on a thin queue
+                           # does not swing SL; recent enough to show drift
+
+
+def _plan_vs_actual(lob: str, plan: pd.DataFrame) -> dict | None:
+    """Volume / AHT / SL — actual against plan, over the last
+    `CARD_RECENT_WEEKS` complete weeks AND year to date (user ask 2026-08-04:
+    both, so a card shows drift and the running position together).
+
+    Only COMPLETE weeks count, through `_drop_partial_weeks` — the one choke
+    point that judges a week against its own queue's operating pattern minus
+    holiday closures. A truncated export week compared against a full plan week
+    manufactures a volume miss that never happened.
+
+    SL is measured against the LOB's TARGET, not a plan: the plan carries no
+    forecast service level, and the target is the thing the team actually
+    commits to. Volume and AHT are against the plan's own numbers for the SAME
+    weeks, weighted by the SAME contacts, so neither side is an average of a
+    different set of weeks.
+
+    None when there is no usable history — the card must print an em dash
+    rather than a fabricated 0%."""
+    sw = st.session_state.get("acd_weekly")
+    if sw is None or sw.empty or "Actual Contacts" not in sw.columns:
+        return None
+    b = _drop_partial_weeks(sw[sw["LOB"] == lob])
+    if b.empty:
+        return None
+    pf = plan.set_index("Week")
+    d = (st.session_state.lobs.get(lob) or {}).get("demand")
+    if d is None or "AHT (sec)" not in d.columns:
+        return None
+    dem = d.set_index("Week")
+    b = b[b["Week"].isin(pf.index)]
+    if b.empty:
+        return None
+    b = b.groupby("Week", as_index=False).sum(numeric_only=True) \
+         if b["Week"].duplicated().any() else b
+    b = b.sort_values("Week")
+    tgt = float((st.session_state.lobs[lob]["assumptions"] or {})
+                .get("sl_target_pct") or 0) or np.nan
+
+    def _w(vals, wts):
+        v = pd.to_numeric(pd.Series(list(vals)), errors="coerce")
+        w = pd.to_numeric(pd.Series(list(wts)), errors="coerce").fillna(0)
+        m = v.notna() & (w > 0)
+        return float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else np.nan
+
+    def agg(rows):
+        wks = rows["Week"].tolist()
+        if not wks:
+            return None
+        wt = pd.to_numeric(rows["Actual Contacts"], errors="coerce").fillna(0)
+        act_vol = float(pd.to_numeric(rows["Actual Contacts"],
+                                      errors="coerce").sum(min_count=1))
+        plan_vol = float(pd.to_numeric(pf.loc[wks, "Forecast (final)"],
+                                       errors="coerce").sum())
+        aht_a = _w(rows.get("Actual AHT (sec)", []), wt)
+        aht_p = _w(dem.loc[wks, "AHT (sec)"], wt)
+        return {
+            "weeks": len(wks),
+            "vol_pct": ((act_vol - plan_vol) / plan_vol * 100
+                        if plan_vol else np.nan),
+            "aht_d": aht_a - aht_p if pd.notna(aht_a) and pd.notna(aht_p) else np.nan,
+            "sl": _w(rows.get("Actual SL %", []), wt),
+        }
+
+    return {"recent": agg(b.tail(CARD_RECENT_WEEKS)), "ytd": agg(b),
+            "sl_target": tgt}
+
+
+def _pva_html(pva: dict | None) -> str:
+    """The card's actual-vs-plan block: recent in ink, YTD muted beside it.
+
+    Deliberately NOT colour-coded except SL. On a card sitting next to a
+    'Short — 3 wks' pill, red has to keep meaning UNDERSTAFFED; volume running
+    5% over forecast is information, not a failure. SL is the exception because
+    it is the one number the team commits to."""
+    if not pva or not pva.get("ytd"):
+        return ('<div class="cc-sec-note" style="margin-top:8px">'
+                'Plan vs actual — <b>no complete ACD weeks yet</b></div>')
+    r, y, tgt = pva["recent"], pva["ytd"], pva["sl_target"]
+
+    # With less history than the recent window, both figures are the SAME
+    # weeks — printing "+3% / +3%" twice reads as two findings that agree
+    # rather than one number shown twice.
+    same = bool(r) and r["weeks"] == y["weeks"]
+
+    def two(key, fmt):
+        def f(v):
+            if v is None or pd.isna(v):
+                return "—"
+            v = 0.0 if abs(v) < 0.5 else v      # no "-0s"
+            return fmt.format(v)
+        a = f(r.get(key)) if r else "—"
+        if same:
+            return f"<b>{a}</b>"
+        return (f"<b>{a}</b> <span style='color:{brand.MUTED}'>"
+                f"/ {f(y.get(key))}</span>")
+
+    sl_now = (r or {}).get("sl", np.nan)
+    sl_tone = ""
+    if pd.notna(sl_now) and pd.notna(tgt):
+        sl_tone = f"color:{brand.SHORT}" if sl_now < tgt else f"color:{brand.COVERED}"
+    sl_txt = ("—" if pd.isna(sl_now) else f"{sl_now:.0f}%")
+    sl_ytd = ("—" if pd.isna(y.get("sl", np.nan)) else f"{y['sl']:.0f}%")
+    sl_pair = (f'<b style="{sl_tone}">{sl_txt}</b>' if same else
+               f'<b style="{sl_tone}">{sl_txt}</b> '
+               f'<span style="color:{brand.MUTED}">/ {sl_ytd}</span>')
+    tgt_txt = "" if pd.isna(tgt) else f" · target {tgt:.0f}%"
+    head = (f'{y["weeks"]} complete wk' if same
+            else f'<b>last {r["weeks"]} wk</b> / YTD {y["weeks"]} wk')
+    return (
+        f'<div class="cc-sec-note" style="margin-top:8px">Actual vs plan · '
+        f'{head}</div>'
+        f'Volume {two("vol_pct", "{:+.0f}%")}<br>'
+        f'AHT {two("aht_d", "{:+.0f}s")}<br>'
+        f'SL {sl_pair}{tgt_txt}')
+
+
 def _partial_bench_weeks(lob: str | None) -> list[str]:
     """The distinct partial feed weeks _drop_partial_weeks is hiding for this
     LOB (or all LOBs) — so pages can SAY they excluded them, never silently."""
@@ -4175,7 +4295,11 @@ def render_executive_view():
                 f"Avg required <b>{avg_req:.1f}</b> vs staffed "
                 f"<b>{float(p['Staffed FTE'].mean()):.1f}</b><br>"
                 f"Attrition <b>−{attr:.1f}</b> vs NH grads <b>+{grads:.1f}</b> "
-                f"{'⚠️ pipeline behind' if grads < attr and avg_req > 0 else ''}")
+                f"{'⚠️ pipeline behind' if grads < attr and avg_req > 0 else ''}"
+                # Everything above is the FORWARD outlook; this is measured
+                # past. They are different time frames, so the block labels
+                # itself rather than running on from the lines above.
+                + _pva_html(_plan_vs_actual(l, p)))
         with cols[i % 3]:
             brand.lob_card(l, f"{st.session_state.n_weeks}-week outlook",
                            pill, tone, body, brand.accent_for(i))
