@@ -53,6 +53,28 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
   team on ONE Python version — a mixed team means the folder must carry every
   version in use.
 
+## How it actually runs (for the questions IT will ask)
+
+- **Nothing is hosted.** Each person's launcher starts a web server **on their
+  own PC**, and their browser talks to that. Streamlit brings the server with it
+  (Starlette + uvicorn, pulled in automatically by `pip install streamlit`) —
+  there is nothing to install, configure, or administer.
+- **It listens on `127.0.0.1` only** (set in `.streamlit/config.toml`). That is
+  the loopback address: reachable from that machine and nowhere else. No other
+  PC can connect to it, and it needs no firewall exception. Streamlit's own
+  default is every interface, which is why this is pinned.
+- **Planners never talk to each other over the network.** Collaboration happens
+  entirely through files in `scenarios/` on the share — the published versions,
+  the per-year edit lock, the drafts. There is no server-to-server anything.
+- **A `__pycache__` folder appearing on the share is normal and safe.** Python
+  caches compiled bytecode next to the modules it imports. Several people doing
+  that at once is fine: CPython writes each file to a uniquely-named temporary
+  and then renames it atomically, so a reader never sees a half-written file and
+  concurrent writers produce identical content. If the share is read-only for
+  some people, Python silently skips caching rather than failing. Leave it
+  alone — deleting it or setting `PYTHONDONTWRITEBYTECODE` just makes every
+  launch recompile those files over the network.
+
 ## Updates
 
 - **App updates**: just edit the `.py` files on the share — everyone gets them
