@@ -4465,7 +4465,11 @@ partial week (step 2) or an unmapped split — check the Real Data warnings.
    It carries forward automatically — no retyping every week.
 3. On the **return week**, set it back down. Done.
 4. Check the plan tab: **Net FTE** shows what the absence costs. If it turns
-   a small line red, see the interim recipe below.
+   a small line red, cover it by hand on the **roster grid**: put `+n` in
+   **Transfers +/-** on the short line for the weeks it needs the help, and
+   `−n` on the line the people come from. Transfers do not carry forward, so
+   enter only the weeks the cover actually runs — and the arriving agents
+   ramp briefly on the new line, which the plan already prices in.
 """),
     ("Mentors pulled for a new-hire class", """
 Training a class costs the floor twice: the class isn't taking calls yet, and
