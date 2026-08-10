@@ -442,14 +442,22 @@ def _autosave_draft():
         pass
 
 
+def _read_draft(src: Path) -> dict | None:
+    """One reader for draft files. A missing or half-written draft must never
+    take the app down — the share can vanish mid-read."""
+    try:
+        return json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _startup_draft_check():
     """If a previous session left a draft that differs from the freshly loaded
     plan, offer Resume/Discard (sidebar banner). A draft matching the loaded
     plan means everything was published — silently clean it up."""
-    try:
-        src = _live_draft_path()
-        d = json.loads(src.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    src = _live_draft_path()
+    d = _read_draft(src)
+    if d is None:
         return
     payload = d.get("payload", {})
     keys = ("n_weeks", "plan_year", "members_start", "members_end", "lobs")
@@ -537,16 +545,37 @@ def _switch_year(year: int) -> None:
     announced that you had been "taken over by" yourself (reported 2026-07-29)."""
     st.session_state.plan_year = int(year)
     _purge_assumption_widgets()
-    if not _load_active_into_session():
-        # Nothing published for that year yet (a fresh rollover). Keep the
-        # frames on screen — they ARE that year's working plan.
-        st.session_state.loaded_version = None
-    # That year may hold unpublished work: drafts are per-year, so the year you
-    # left kept its own. Offer it HERE rather than only at the next boot —
-    # someone who added classes, rolled over, and came back found the year
-    # apparently empty with no hint the work still existed (field report
-    # 2026-07-30). Same Resume/Discard banner the startup check raises.
     st.session_state.pop("_draft_pending", None)
+    if not _load_active_into_session():
+        # Nothing published for that year yet — a fresh rollover, typically.
+        # It used to KEEP the frames on screen and call them that year's
+        # working plan. They are not: after "roll into 2027, close, reopen",
+        # switching to 2027 left 2026's WEEK LABELS in the grid under a 2027
+        # heading (field report 2026-08-10 — "the dates on the weekly inputs
+        # are not changing to reflect 2027"). Worse than confusing: typing
+        # into that grid and publishing would have stored a 2027 plan whose
+        # weeks say 2026.
+        #
+        # The year's real working plan is its DRAFT, so load it outright
+        # rather than showing the wrong year and hoping the planner notices a
+        # Resume banner. Nothing is lost either way — the draft is the same
+        # file the banner would have offered.
+        st.session_state.loaded_version = None
+        d = _read_draft(_live_draft_path())
+        if d and int(d.get("payload", {}).get("plan_year", 0)) == int(year):
+            _apply_payload(d["payload"])
+            st.session_state.loaded_version = d.get("base_version")
+            st.session_state.pop("_draft_blob", None)   # re-arm the autosave
+            st.rerun()
+        # No draft either: the year genuinely has nothing. Give it its own
+        # blank scaffold rather than another year's numbers.
+        init_state(int(st.session_state.n_weeks))
+        st.session_state.plan_year = int(year)
+        st.rerun()
+    # A year WITH a published version may still hold unpublished work on top
+    # of it — offer that the way boot does (field report 2026-07-30: someone
+    # who added classes, rolled over and came back found the year apparently
+    # empty with no hint the work still existed).
     _startup_draft_check()
     st.rerun()
 
@@ -1126,7 +1155,13 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     # but deliver no phone capacity while they mentor — same shape as LOA.
     staffed = hc - loa_arr - ment_arr - ramp_discount
     net = staffed - required_fte
-    capacity_calls = staffed * prod_hrs_per_fte * 3600 / d["AHT (sec)"]
+    # A cleared AHT (0) is a legitimate state — it is what a fresh rollover
+    # leaves behind — so guard the division rather than emitting NaN and a
+    # RuntimeWarning into the planner's console on every rerun.
+    _aht_v = pd.to_numeric(d["AHT (sec)"], errors="coerce").to_numpy(dtype=float)
+    capacity_calls = np.where(
+        _aht_v > 0, staffed * prod_hrs_per_fte * 3600 / np.where(_aht_v > 0, _aht_v, 1.0),
+        np.nan)
 
     # Support staff (the legacy plan rows): flat per-LOB counts the planner enters; the
     # RATIO rows are computed (walking agents ÷ count) so drift stays visible
@@ -1633,19 +1668,30 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
             v = pd.to_numeric(df[col], errors="coerce").iloc[-1]
             return float(v) if pd.notna(v) else 0.0
 
-        seas = pd.to_numeric(dem["Seasonality"], errors="coerce").fillna(1.0).to_numpy()
         _seed = (cpm_seed or {}).get(name)
+        # DEMAND DRIVERS START CLEAN (user decision 2026-08-10: "I want it to
+        # start as mostly a clean slate"). Carrying last year's CPM, AHT and
+        # seasonality forward made the new year LOOK planned before anyone had
+        # thought about it — a full set of numbers nobody chose, which is worse
+        # than an obviously empty one. Supply is different and still carries:
+        # ending headcount, supervisors/leads and in-flight classes are FACTS
+        # about January, not assumptions to revisit.
+        #
+        # CPM 0 is the app's own "no demand yet" signal — compute_plan guards
+        # CPM <= 0 to a zero forecast and the Budget page says so in words.
+        # Seasonality resets to the neutral 1.0; "Derive from ACD actuals"
+        # rebuilds a real curve in one click, from more history than last year
+        # had. The measured CPM TREND seed still wins when the planner opts in,
+        # because that is evidence rather than habit.
         new_dem = pd.DataFrame({
             "Week": new_weeks,
             "Members": [last("Members")] * n,   # apply_global_members re-spreads
             "Members (actual)": [np.nan] * n,   # last year's membership is history
-            # CPM: flat carry by default; the planner can seed the new year from
-            # the measured trend instead (rollover expander) — evidence, not habit.
             "CPM": (list(np.resize(_seed, n)) if _seed is not None
-                    else [last("CPM")] * n),
-            "Seasonality": np.resize(seas, n),
+                    else [0.0] * n),
+            "Seasonality": [1.0] * n,
             "Fcst Override": [np.nan] * n,
-            "AHT (sec)": [last("AHT (sec)")] * n,
+            "AHT (sec)": [0.0] * n,
         })
         new_ros = pd.DataFrame({
             "Week": new_weeks,
@@ -3279,9 +3325,11 @@ with st.sidebar:
         st.caption(
             f"Seeds a fresh **{_yr + 1}** working plan from what's on screen: ending "
             "production HC → starting HC, year-end members → starting members, last "
-            "CPM/AHT carry forward, the seasonality shape copies, anyone on LOA at "
-            "year-end stays out (mentors reset — re-enter them with the class), and "
-            "new-hire classes still in the pipeline graduate "
+            "**the demand drivers start clean** — CPM, AHT and Seasonality reset "
+            "so next year's assumptions are chosen, not inherited (press *Derive "
+            "from ACD actuals* to rebuild the curve from history). Supply carries: "
+            "anyone on LOA at year-end stays out, supervisors and leads carry, "
+            "mentors reset, and new-hire classes still in the pipeline graduate "
             f"into the new year. Published {_yr} versions stay in the changelog and "
             "remain loadable — nothing is shared until you publish the new year.")
         # CPM for the new year: flat carry, or seeded from the measured trend.
@@ -4579,9 +4627,13 @@ the number moved from 6 to 33.
 1. Sidebar → **Roll into <next year>** (needs edit control).
 2. It seeds the new year from the current plan: ending headcount becomes
    starting headcount, year-end members become the new starting members, CPM
-   and AHT carry, the seasonality shape copies, people on LOA stay out,
-   mentors reset (re-enter them alongside the carried-over class), and classes
-   still in training graduate into the new year.
+   **the demand drivers start clean**: CPM, AHT and Seasonality reset, so you
+   enter next year's assumptions deliberately instead of inheriting this
+   year's. Supply carries — people on LOA stay out, supervisors and leads
+   carry, mentors reset, and classes still in training graduate into the new
+   year.
+4. Rebuild seasonality in one click with **Derive from ACD actuals** (Capacity
+   Plan) — it now has a full extra year of history to learn from.
 3. Enter the new year-end member forecast, review, then publish.
 4. **This year keeps running.** Each year is its own plan with its own versions
    and its own edit lock, so publishing next year does not disturb this one —
