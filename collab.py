@@ -444,6 +444,24 @@ def _snapshot_meta(p: Path, stt=None) -> dict | None:
     return meta
 
 
+def list_names(d) -> list[str]:
+    """Entry names in a shared directory, via ONE scandir, memoized per run.
+
+    `Path.glob` is the trap here: CPython 3.13 rewrote pathlib to walk with
+    scandir, while 3.11 — the oldest version this app supports — stats every
+    entry. Identical code measured 9 network round trips per edit on 3.14 and
+    15 on 3.11, entirely from globs. Benchmark on the OLDEST supported
+    interpreter, not the newest. Callers filter the returned names in Python,
+    which costs nothing.
+    """
+    def _load():
+        try:
+            return [e.name for e in os.scandir(d)]
+        except OSError:
+            return []
+    return _memo(("names", str(d)), _load)
+
+
 def _all_snapshots(d) -> list[dict]:
     return _memo(("snaps", str(d)), lambda: _all_snapshots_uncached(d))
 

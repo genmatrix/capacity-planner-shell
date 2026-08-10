@@ -528,7 +528,10 @@ def _available_years() -> list[int]:
     yrs.add(_plan_year())
     try:
         user = st.session_state.user
-        for p in (SCENARIO_DIR / "drafts").glob(f"{user}-*.json"):
+        for _n in collab.list_names(SCENARIO_DIR / "drafts"):
+            if not (_n.startswith(f"{user}-") and _n.endswith(".json")):
+                continue
+            p = Path(_n)
             tail = p.stem.rsplit("-", 1)[-1]
             if tail.isdigit():
                 yrs.add(int(tail))
@@ -2873,10 +2876,11 @@ def render_team_status() -> tuple[bool, str]:
     lock = collab.read_lock(SCENARIO_DIR, year)
     act = collab.read_active(SCENARIO_DIR, year)
     # both spellings: edit.lock.corrupt-* (pre-per-year) and edit-<year>.lock.corrupt-*
-    _corrupt = sorted(Path(SCENARIO_DIR).glob("edit*.lock.corrupt-*"))
+    _corrupt = sorted(n for n in collab.list_names(SCENARIO_DIR)
+                      if n.startswith("edit") and ".lock.corrupt-" in n)
     if _corrupt:
         st.caption(f"⚠️ A corrupted lock file was set aside as "
-                   f"`{_corrupt[-1].name}` (crash/share hiccup mid-write). "
+                   f"`{_corrupt[-1]}` (crash/share hiccup mid-write). "
                    "Editing works normally; delete the file after a look.")
     # Ownership is SESSION-level (user + acquisition token, audit 2026-07-14):
     # user alone let two tabs of the same Windows login both edit silently.
