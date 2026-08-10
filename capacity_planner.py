@@ -38,6 +38,11 @@ CONSOLIDATED = "— Consolidated (all LOBs) —"
 # skipped a run (page navigation destroys the widget's edit state; the base
 # must then re-seed from the stored frame or the planner's edits are erased).
 st.session_state["_run_seq"] = st.session_state.get("_run_seq", 0) + 1
+# Pointers and the lock are read live so a colleague's publish shows up
+# without a refresh — but re-reading the SAME file 3-5 times inside ONE run
+# is pure round-trip cost on a slow share. collab memoizes for the duration
+# of a run; this drops it as the next one starts, so liveness is unchanged.
+collab.new_run()
 
 
 

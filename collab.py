@@ -33,6 +33,9 @@ from datetime import datetime
 from pathlib import Path
 
 LOCK_STALE_MIN = 5  # a lock older than this (no heartbeat) may be taken over
+# Refresh the heartbeat at most this often. Comfortably inside LOCK_STALE_MIN,
+# and it turns a per-rerun share WRITE into roughly one per minute.
+HEARTBEAT_MIN_SEC = 45
 
 
 # ---------------------------------------------------------------- identity
@@ -84,6 +87,37 @@ def _atomic_write(path: Path, text: str):
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)  # atomic rename on the same volume
+    # Any write to shared state invalidates the per-run memo — otherwise a read
+    # later in the SAME run would serve the pre-write value (take-control read
+    # back a stale lock and stayed read-only: 11 checks red, 2026-08-10).
+    _RUN_MEMO.clear()
+
+
+# ---------------------------------------------------------------- per-run memo
+# Pointers and the lock are read UNCACHED by design — that is how a colleague's
+# publish or takeover becomes visible without a refresh button. But within ONE
+# script run the same file was being fetched three to five times (measured
+# 2026-08-10: 6 pointer reads, 5 directory scans and 3 existence checks for a
+# single grid edit), and its value cannot change mid-run. On a slow SMB share
+# every one of those is a round trip, and round trips are what the planner
+# feels — 20 of them at ~250 ms is the 5-7 second freeze they reported.
+#
+# So: memoize for the DURATION of a run, and drop it when the next run starts.
+# Liveness across reruns is unchanged, which is the property that matters.
+# Every writer below clears the memo, so a read after a write in the same run
+# still sees the write.
+_RUN_MEMO: dict = {}
+
+
+def new_run() -> None:
+    """Drop the per-run memo. Called once at the top of each script run."""
+    _RUN_MEMO.clear()
+
+
+def _memo(key, produce):
+    if key not in _RUN_MEMO:
+        _RUN_MEMO[key] = produce()
+    return _RUN_MEMO[key]
 
 
 def _read_json(path: Path):
@@ -129,10 +163,12 @@ def legacy_active_path(d) -> Path:
 
 
 def read_active(d, year):
-    j = _read_json(active_path(d, year))
-    if j is None and int(year) == LEGACY_YEAR:
-        j = _read_json(legacy_active_path(d))      # pre-per-year share
-    return j
+    def _load():
+        j = _read_json(active_path(d, year))
+        if j is None and int(year) == LEGACY_YEAR:
+            j = _read_json(legacy_active_path(d))      # pre-per-year share
+        return j
+    return _memo(("active", str(d), int(year)), _load)
 
 
 def write_active(d, year, meta: dict):
@@ -163,7 +199,8 @@ def budget_path(d, year) -> Path:
 
 
 def read_budget(d, year):
-    return _read_json(budget_path(d, year))
+    return _memo(("budget", str(d), int(year)),
+                 lambda: _read_json(budget_path(d, year)))
 
 
 def write_budget(d, year, meta: dict):
@@ -183,6 +220,7 @@ def clear_budget(d, year) -> bool:
     p = budget_path(_dir(d), int(year))
     if p.exists():
         p.unlink()
+        _RUN_MEMO.clear()
         return True
     return False
 
@@ -208,16 +246,19 @@ def _live_lock_path(d, year) -> Path:
     two files would need an atomic O_EXCL race across both. Once anyone acquires
     through this code the year-scoped file exists and wins from then on; the
     stranded legacy lock ages out at LOCK_STALE_MIN and stops mattering."""
-    p = lock_path(d, year)
-    if not p.exists() and int(year) == LEGACY_YEAR:
-        legacy = legacy_lock_path(d)
-        if legacy.exists():
-            return legacy
-    return p
+    def _resolve():
+        p = lock_path(d, year)
+        if not p.exists() and int(year) == LEGACY_YEAR:
+            legacy = legacy_lock_path(d)
+            if legacy.exists():
+                return legacy
+        return p
+    return _memo(("lockpath", str(d), int(year)), _resolve)
 
 
 def read_lock(d, year):
-    return _read_json(_live_lock_path(d, year))
+    return _memo(("lock", str(d), int(year)),
+                 lambda: _read_json(_live_lock_path(d, year)))
 
 
 def lock_is_stale(info: dict | None) -> bool:
@@ -272,12 +313,18 @@ def acquire_lock(d, year, user: str, force: bool = False):
                 f"{p.name}.corrupt-{_now().strftime('%Y%m%d-%H%M%S')}"))
         except OSError:
             pass
+        _RUN_MEMO.clear()          # the rename changed what _live_lock_path resolves to
         cur = read_lock(d, year)   # a valid lock may have appeared meanwhile
     if cur is None:
         try:  # atomic create — wins the race against another new acquirer
             fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(_lock_record(user), f)
+            # This path writes DIRECTLY (the O_EXCL create is what makes the
+            # race safe), so it bypasses _atomic_write's invalidation — clear
+            # by hand or the read below serves the memoized "no lock" and the
+            # caller gets no token, i.e. stays read-only after taking control.
+            _RUN_MEMO.clear()
             return True, read_lock(d, year)
         except FileExistsError:
             cur = read_lock(d, year)  # lost the race; fall through
@@ -304,6 +351,14 @@ def heartbeat(d, year, user: str, token: str | None = None) -> bool:
     because its own heartbeat/ownership check fails."""
     cur = read_lock(d, year)
     if owns_lock(cur, user, token):
+        # Ownership is re-checked EVERY rerun — that is how a takeover is
+        # detected — but the WRITE is throttled. A lock goes stale at
+        # LOCK_STALE_MIN (5 min), so refreshing more often than
+        # HEARTBEAT_MIN_SEC bought nothing and cost a share write on every
+        # rerun, i.e. every keystroke in a grid (measured 2026-08-10).
+        if age_min(cur.get("heartbeat") or cur.get("acquired_at") or "") * 60 \
+                < HEARTBEAT_MIN_SEC:
+            return True
         cur["heartbeat"] = _iso(_now())
         # write back to the file we READ — which may still be the legacy
         # edit.lock during a transition (see _live_lock_path)
@@ -320,6 +375,7 @@ def release_lock(d, year, user: str, token: str | None = None,
             _live_lock_path(d, year).unlink()
         except FileNotFoundError:
             pass
+        _RUN_MEMO.clear()
         return True
     return False
 
@@ -389,6 +445,10 @@ def _snapshot_meta(p: Path, stt=None) -> dict | None:
 
 
 def _all_snapshots(d) -> list[dict]:
+    return _memo(("snaps", str(d)), lambda: _all_snapshots_uncached(d))
+
+
+def _all_snapshots_uncached(d) -> list[dict]:
     """Every snapshot's METADATA, newest-first ordering left to callers.
 
     Deliberately no `lobs` — see the note above. Anything needing the plan
