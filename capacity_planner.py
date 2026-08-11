@@ -112,6 +112,11 @@ def _payload_lobs(p: dict) -> dict:
             dem.insert(dem.columns.get_loc("CPM") + 1, "Seasonality", 1.0)
         if "Members (actual)" not in dem.columns:   # pre-actual-members plans
             dem.insert(dem.columns.get_loc("Members") + 1, "Members (actual)", np.nan)
+        if "Shrinkage %" not in dem.columns:        # pre-weekly-shrinkage plans
+            # Seed every week from the scalar the plan was built with, so a
+            # migrated plan computes IDENTICALLY to before — the column is new,
+            # the numbers are not.
+            dem["Shrinkage %"] = float(d["assumptions"].get("shrinkage_pct", 32.0) or 0.0)
         ros = pd.read_json(StringIO(d["roster"]), orient="split")
         for _col, _legacy in (("Supervisors", "supervisors"), ("Leads/Project", "leads")):
             if _col not in ros.columns:   # plan saved before support columns existed
@@ -161,7 +166,10 @@ def _payload_lobs(p: dict) -> dict:
 ASSUMPTION_LABELS = {
     "starting_hc": "Starting headcount",
     "annual_attrition_pct": "Attrition %/yr",
-    "shrinkage_pct": "Shrinkage %",
+    # Vestigial for a migrated plan — the weekly column drives the engine —
+    # but it still seeds a new plan and still drives a pre-column snapshot,
+    # so a change to it is real and belongs in the audit trail.
+    "shrinkage_pct": "Shrinkage % (seed)",
     "occupancy_pct": "Target occupancy %",
     "paid_hours_per_week": "Paid hours/week",
     "workload_margin_pct": "Workload margin %",
@@ -640,6 +648,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
             "Seasonality": [1.0] * n_weeks,
             "Fcst Override": [np.nan] * n_weeks,
             "AHT (sec)": np.round(rng.normal(aht, 6, n_weeks), 0),
+            "Shrinkage %": [32.0] * n_weeks,
         }
     )
     roster = pd.DataFrame(
@@ -691,6 +700,7 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
         "CPM": [0.0] * n_weeks,
         "Seasonality": [1.0] * n_weeks,
         "Fcst Override": [np.nan] * n_weeks, "AHT (sec)": [float(aht)] * n_weeks,
+        "Shrinkage %": [32.0] * n_weeks,
     })
     roster = pd.DataFrame(
         {"Week": weeks, "LOA": [0.0] * n_weeks, "Mentors": [0.0] * n_weeks,
@@ -1017,6 +1027,18 @@ def erlang_c_agents(calls_per_hr: float, aht_sec: float, sl_target_pct: float,
         s += 1
 
 
+def _weekly_assumption(d: pd.DataFrame, col: str, scalar, n: int) -> np.ndarray:
+    """A per-week assumption column, falling back to the scalar assumption.
+
+    Blank cells fall back too, not to zero: a planner clearing one cell means
+    "unchanged", and a 0% shrinkage would silently understate Required FTE for
+    that week — the one direction a staffing model must never guess in."""
+    if col not in d.columns:
+        return np.full(n, float(scalar))
+    v = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
+    return np.where(np.isnan(v), float(scalar), v)
+
+
 def compute_plan(lob_data: dict) -> pd.DataFrame:
     d = lob_data["demand"].copy()
     roster, nh, a = lob_data["roster"], lob_data["nh"], lob_data["assumptions"]
@@ -1051,10 +1073,28 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     forecast = d["Fcst Override"].fillna(model_fcst)
     workload_hrs = forecast * d["AHT (sec)"] / 3600 * (1 + a["workload_margin_pct"] / 100)
 
-    prod_hrs_per_fte = (
-        a["paid_hours_per_week"] * (1 - a["shrinkage_pct"] / 100) * (a["occupancy_pct"] / 100)
-    )
-    workload_req = workload_hrs / prod_hrs_per_fte
+    # Shrinkage is PER WEEK (user 2026-08-11: "we keep the previous weeks with
+    # the old numbers and update future weeks with the new numbers" — a step
+    # change held until revised, exactly like CPM and AHT). The scalar
+    # assumption remains the seed and the fallback for plans saved before the
+    # column existed.
+    #
+    # Why not just average it: shrinkage sits in the DENOMINATOR, so Required
+    # FTE is convex in it and an average always understates slightly (~0.1% at
+    # a realistic spread — ignorable). The real cost is per WEEK. Modelled
+    # against a 32/35.5/38% trended year, a single average was within 0.11% on
+    # the annual figure but individual weeks landed between -10.6 and +12.8
+    # FTE out — so the heatmap and the worst-week verdict, which are the whole
+    # point of the page, pointed at the wrong weeks.
+    shr_arr = _weekly_assumption(d, "Shrinkage %", a["shrinkage_pct"], n)
+    prod_hrs_per_fte_arr = (
+        a["paid_hours_per_week"] * (1 - shr_arr / 100) * (a["occupancy_pct"] / 100))
+    # A 100% shrinkage entry would divide by zero; treat it as "no productive
+    # time" and let Required FTE go NaN rather than infinite.
+    workload_req = workload_hrs / np.where(prod_hrs_per_fte_arr > 0,
+                                           prod_hrs_per_fte_arr, np.nan)
+    # The displayed "Available Hrs/FTE" row follows the same weekly series.
+    prod_hrs_per_fte = prod_hrs_per_fte_arr
 
     # Erlang C basis: concurrent agents to hit the SL target during open hours,
     # converted to on-roll FTE. Occupancy is NOT re-applied as a divisor here —
@@ -1063,16 +1103,19 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     open_hrs = float(a.get("open_hrs_week", 60.0))
     sl_t = float(a.get("sl_target_pct", 80.0))
     sl_sec = float(a.get("sl_threshold_sec", 40.0))
-    seat_hrs_per_fte = a["paid_hours_per_week"] * (1 - a["shrinkage_pct"] / 100)
+    seat_hrs_arr = a["paid_hours_per_week"] * (1 - shr_arr / 100)
     aht_arr = pd.to_numeric(d["AHT (sec)"], errors="coerce").fillna(0).to_numpy()
     fcst_arr = pd.to_numeric(forecast, errors="coerce").fillna(0).to_numpy()
     erlang_req = np.zeros(n)
-    if open_hrs > 0 and seat_hrs_per_fte > 0:
+    if open_hrs > 0:
         for i in range(n):
+            if seat_hrs_arr[i] <= 0:
+                erlang_req[i] = np.nan
+                continue
             cph = fcst_arr[i] * (1 + a["workload_margin_pct"] / 100) / open_hrs
             agents = erlang_c_agents(cph, aht_arr[i], sl_t, sl_sec,
                                      max_occ_pct=a["occupancy_pct"])
-            erlang_req[i] = agents * open_hrs / seat_hrs_per_fte
+            erlang_req[i] = agents * open_hrs / seat_hrs_arr[i]
 
     required_fte = (pd.Series(erlang_req, index=d.index)
                     if a.get("req_basis", "workload") == "erlang" else workload_req)
@@ -1194,7 +1237,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Model Forecast": model_fcst.round(0),
             "Forecast (final)": forecast.round(0),
             "Workload (hrs)": workload_hrs.round(1),
-            "Available Hrs/FTE": round(prod_hrs_per_fte, 1),
+            "Available Hrs/FTE": np.round(prod_hrs_per_fte_arr, 1),
             "Required FTE": pd.Series(required_fte).round(1).to_numpy(),
             "Workload Req FTE": workload_req.round(1),
             "Erlang Req FTE": np.round(erlang_req, 1),
@@ -1700,6 +1743,12 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
             "Seasonality": [1.0] * n,
             "Fcst Override": [np.nan] * n,
             "AHT (sec)": [0.0] * n,
+            # Shrinkage CARRIES, unlike the volume drivers. Clearing it has no
+            # safe empty value: 0% would silently understate Required FTE all
+            # year, which is the one direction a staffing model must never
+            # guess in. It is also an operating reality that does not reset on
+            # Jan 1 — closer to the LOA level than to next year's CPM.
+            "Shrinkage %": [last("Shrinkage %")] * n,
         })
         new_ros = pd.DataFrame({
             "Week": new_weeks,
@@ -3477,15 +3526,25 @@ with st.sidebar:
                     a["annual_attrition_pct"] = round(float(_pct), 1)
                     st.session_state.pop(f"as_attr_{view}", None)   # let the widget re-seed
                     st.rerun()
-            a["shrinkage_pct"] = st.number_input(
-                "Shrinkage %", 0.0, 90.0, float(a["shrinkage_pct"]), 0.5, disabled=RO,
-                key=f"as_shrink_{view}",
-                help="Share of paid time NOT available on the phones — total: "
-                     "out-of-office (PTO, sick, LOA) **plus** in-office (breaks, "
-                     "meetings, coaching, training). Raises Required FTE: at 32%, one "
-                     "FTE delivers 40 × 0.68 = 27.2 seated hours. The Shrinkage page "
-                     "measures the **in-office** half from real AUX data — layer OOO on "
-                     "top of that before setting this.")
+            # Shrinkage moved to a WEEKLY column (2026-08-11) because the team
+            # trends it: "we keep the previous weeks with the old numbers and
+            # update future weeks with the new numbers". Leaving the old
+            # number_input here would have been worse than removing it — the
+            # engine reads the column, so the control would have looked live
+            # and silently done nothing. A readout instead, pointing at the
+            # grid, which is also where CPM and AHT have always lived.
+            _shr_now = pd.to_numeric(
+                st.session_state.lobs[view]["demand"].get("Shrinkage %"),
+                errors="coerce") if view in st.session_state.lobs else None
+            if _shr_now is not None and _shr_now.notna().any():
+                _lo, _hi = float(_shr_now.min()), float(_shr_now.max())
+                st.caption(
+                    f"**Shrinkage** {_lo:.4g}%" + (f"–{_hi:.4g}%" if _hi - _lo > 0.005
+                                                   else "")
+                    + " — per week, in the demand grid. Type it on the week it "
+                      "changes and it carries forward. Out-of-office (PTO, sick, "
+                      "LOA) **plus** in-office (breaks, meetings, coaching); the "
+                      "Shrinkage page measures the in-office half from AUX data.")
             basis = st.selectbox(
                 "Required FTE basis",
                 ["Workload (volume × AHT ÷ occupancy)", "Erlang C (service-level staffing)"],
@@ -3828,7 +3887,9 @@ def build_reconciliation(plan: pd.DataFrame, lob_data: dict, lob: str) -> pd.Dat
         triple("FTE (req vs staffed)", pf["Required FTE"], stf)
     shr = _bench_series("acd_weekly", "In-Office Shrink %", lob, weeks)
     if shr is not None:
-        triple("Shrink %", const(a.get("shrinkage_pct")), shr)
+        # Plan side is the weekly column now, not one scalar for the year.
+        triple("Shrink %", dem.get("Shrinkage %",
+                                   const(a.get("shrinkage_pct"))), shr)
     occ = _bench_series("acd_weekly", "Occupancy % (actual)", lob, weeks)
     if occ is not None:
         triple("Occupancy %", const(a.get("occupancy_pct")), occ)
@@ -5032,6 +5093,7 @@ def budget_drift_headline(grain: str = "Monthly", lobs: dict | None = None
 # how many weeks actually moved, because a single number cannot say whether a
 # change was one week or the whole year.
 BUDGET_DRIVER_COLS = [("demand", "CPM"), ("demand", "AHT (sec)"),
+                      ("demand", "Shrinkage %"),
                       ("demand", "Seasonality"), ("demand", "Members"),
                       ("roster", "LOA"), ("roster", "Mentors"),
                       ("roster", "Supervisors"), ("roster", "Leads/Project")]
@@ -5965,7 +6027,7 @@ else:
                 "**Members** is the shared org-wide base (set in the sidebar, same for every "
                 "LOB). Expected weekly calls = **Members × CPM ÷ 52** (CPM = annual "
                 "**Calls Per Member**), so this LOB's **CPM** sizes its demand. "
-                "Editing a week's **CPM or AHT carries "
+                "Editing a week's **CPM, AHT or Shrinkage carries "
                 "forward** to later weeks until you edit a later week. "
                 "**Seasonality** is a weekly index (1.0 = average, 1.15 = +15%) that "
                 "reshapes the year but keeps the annual total fixed — peaks pull volume "
@@ -5991,6 +6053,13 @@ else:
                              "weeks drive the model AND the measured-CPM readout."),
                     "Fcst Override": st.column_config.NumberColumn(format="localized"),
                     "AHT (sec)": st.column_config.NumberColumn(format="localized"),
+                    "Shrinkage %": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=99.0, format="%.2f",
+                        help="Paid time that is not seat time, for THIS week. "
+                             "Enter it on the week it changes — it carries "
+                             "forward until you change it again, so a mid-year "
+                             "revision is one edit. The sidebar value seeds a "
+                             "new plan; this column is what the engine uses."),
                 })
             # AHT fills like CPM (user 2026-08-03). Both are planning
             # ASSUMPTIONS held until revised — you decide handle time is 420s
@@ -6000,7 +6069,7 @@ else:
             # the fill OFF Mentors a day earlier, applied in the other
             # direction: step changes fill, bounded events do not.
             cpm_filled = any([forward_fill_step(prev_demand, edited_demand, c)
-                              for c in ("CPM", "AHT (sec)")])
+                              for c in ("CPM", "AHT (sec)", "Shrinkage %")])
             members_changed = capture_members_actual(edited_demand)
             lob["demand"] = edited_demand
             if cpm_filled or members_changed:
