@@ -3702,6 +3702,11 @@ _PLAN_RULES = frozenset({"Workload (hrs)", "Production HC", "Staffed FTE"})
 _PLAN_PRECISION = {"CPM (plan)": 2, "CPM (actual)": 2}
 
 
+def _safe_name(x) -> str:
+    """Filename-safe LOB name for an export."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", str(x or "plan")).strip("-") or "plan"
+
+
 def render_plan_grid(plan: pd.DataFrame, note: str):
     grid = plan.set_index("Week").T
     grid.columns = [c[5:] for c in grid.columns]
@@ -3727,6 +3732,22 @@ def render_plan_grid(plan: pd.DataFrame, note: str):
     with st.expander("Open as a sortable grid — sort, resize, copy to Excel"):
         st.dataframe(grid.style.apply(shade_net, axis=1).format("{:,.1f}", na_rep="—"),
                      width="stretch")
+        # WEEKS DOWN, metrics across — the orientation a spreadsheet (or an
+        # assistant reading one) can line up against a workbook. The on-screen
+        # table is weeks-across because that reads better; a file that has to
+        # be JOINED wants the week as a key column, one row per week.
+        _flat = plan.copy()
+        _flat.insert(0, "Line of business", st.session_state.get("lob_view", ""))
+        st.download_button(
+            "Download this plan as CSV (weeks down — for comparing to a workbook)",
+            _flat.round(3).to_csv(index=False).encode("utf-8"),
+            file_name=f"plan_{_plan_year()}_"
+                      f"{_safe_name(st.session_state.get('lob_view', 'plan'))}.csv",
+            mime="text/csv",
+            help="Every computed row for every week: forecast, workload, "
+                 "required, the headcount walk, staffed and net. Rounded to 3 "
+                 "decimals rather than the 1 shown above, so a comparison is "
+                 "not chasing display rounding.")
 
 
 def plan_chart_with_benchmarks(plan: pd.DataFrame, lob: str | None):
