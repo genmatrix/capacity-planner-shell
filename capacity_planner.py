@@ -789,6 +789,31 @@ def init_state(n_weeks: int):
 # ----------------------------------------------------------------------
 # The calculation engine (this is what the scheduled job would run)
 # ----------------------------------------------------------------------
+def _incomplete_classes(nh: pd.DataFrame) -> list[str]:
+    """Human-readable reasons the engine is skipping a new-hire row.
+
+    Mirrors exactly what `nh_production_adds` skips, so the warning cannot
+    claim a row counts when it does not (or vice versa)."""
+    out = []
+    if nh is None or nh.empty:
+        return out
+    for i, r in nh.iterrows():
+        wk = r.get("Class Start Week")
+        if wk is None or (isinstance(wk, float) and pd.isna(wk)) or str(wk).strip() == "":
+            continue                      # a wholly blank row is just the add-row
+        size = pd.to_numeric(r.get("Class Size"), errors="coerce")
+        tr = pd.to_numeric(r.get("Training Wks"), errors="coerce")
+        co = pd.to_numeric(r.get("Coaching Wks"), errors="coerce")
+        why = []
+        if pd.isna(size) or float(size) <= 0:
+            why.append("no class size")
+        if pd.isna(tr) and pd.isna(co):
+            why.append("no training/coaching weeks")
+        if why:
+            out.append(f"**{wk}** ({', '.join(why)})")
+    return out
+
+
 def nh_production_adds(weeks: list[str], nh: pd.DataFrame) -> np.ndarray:
     """Production adds per week from new-hire classes. `Actual Grads`, when
     filled, REPLACES the modelled survivor calculation for that class (same
@@ -811,6 +836,19 @@ def nh_production_adds(weeks: list[str], nh: pd.DataFrame) -> np.ndarray:
         size = _num(r.get("Class Size"))
         if size <= 0:
             continue                      # row not filled in yet — nothing to add
+        # A class with NO pipeline length entered is INCOMPLETE, not instant
+        # (audit 2026-08-12). `_num` defaults blanks to 0 so a half-typed row
+        # cannot crash the engine — but that made blank stage weeks mean
+        # "graduates the week it starts", so the bodies landed in Production HC
+        # AND Staffed FTE immediately. A planner mid-typing saw headcount jump;
+        # a row pasted without stage weeks inflated staffing from its start
+        # week to year end, silently. Blank is not zero here: an explicitly
+        # typed 0 still means "no training stage", which is a real thing to
+        # say, and is distinguishable because it is not NaN.
+        _tr_raw = pd.to_numeric(r.get("Training Wks"), errors="coerce")
+        _co_raw = pd.to_numeric(r.get("Coaching Wks"), errors="coerce")
+        if pd.isna(_tr_raw) and pd.isna(_co_raw):
+            continue                      # no pipeline entered yet — not a class
         actual = pd.to_numeric(r.get("Actual Grads"), errors="coerce")
         if pd.notna(actual):
             survived = float(actual)      # actuals replace the modelled survivors
@@ -819,8 +857,8 @@ def nh_production_adds(weeks: list[str], nh: pd.DataFrame) -> np.ndarray:
                         * (1 - _num(r.get("Training Attr %")) / 100)
                         * (1 - _num(r.get("Coaching Attr %")) / 100))
         grad_wk = (idx[r["Class Start Week"]]
-                   + int(_num(r.get("Training Wks")))
-                   + int(_num(r.get("Coaching Wks"))))
+                   + int(_num(_tr_raw))
+                   + int(_num(_co_raw)))
         if 0 <= grad_wk < len(weeks):
             adds[grad_wk] += survived
     return adds
@@ -6247,6 +6285,20 @@ else:
                         help="People who actually reached production from this class. "
                              "Blank = use the Training/Coaching attrition %."),
                 })
+            # Say which rows the engine is IGNORING. Both skips are correct —
+            # a row with no size or no pipeline length is not yet a class — but
+            # they were SILENT, and a silently ignored class reads exactly like
+            # a class that is being counted (audit 2026-08-12).
+            _ig = _incomplete_classes(lob["nh"])
+            if _ig:
+                st.warning(
+                    f"**{len(_ig)} class row(s) are not in the plan yet** — "
+                    + "; ".join(_ig[:4])
+                    + ("; …" if len(_ig) > 4 else "")
+                    + ". Fill the missing cells and they start counting. Until "
+                      "then they add no headcount, which is deliberate: a class "
+                      "with no training length would otherwise graduate the week "
+                      "it starts.")
             _wash = measured_nh_washout(lob["nh"])
             if _wash is not None:
                 _act, _plan, _cls, _size = _wash
