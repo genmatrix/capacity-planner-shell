@@ -112,6 +112,12 @@ def _payload_lobs(p: dict) -> dict:
             dem.insert(dem.columns.get_loc("CPM") + 1, "Seasonality", 1.0)
         if "Members (actual)" not in dem.columns:   # pre-actual-members plans
             dem.insert(dem.columns.get_loc("Members") + 1, "Members (actual)", np.nan)
+        _as = d["assumptions"]
+        if "pt_hours_per_week" not in _as:
+            # Seed EQUAL to full-time hours: a plan saved before this existed
+            # counted part-timers as whole FTE, so that is what it must keep
+            # computing until someone enters the real number.
+            _as["pt_hours_per_week"] = float(_as.get("paid_hours_per_week", 40.0) or 40.0)
         if "Shrinkage %" not in dem.columns:        # pre-weekly-shrinkage plans
             # Seed every week from the scalar the plan was built with, so a
             # migrated plan computes IDENTICALLY to before — the column is new,
@@ -172,6 +178,7 @@ ASSUMPTION_LABELS = {
     "shrinkage_pct": "Shrinkage % (seed)",
     "occupancy_pct": "Target occupancy %",
     "paid_hours_per_week": "Paid hours/week",
+    "pt_hours_per_week": "Part-time hours/week",
     "workload_margin_pct": "Workload margin %",
     "ft_pct": "Full-time %",
     "req_basis": "Requirement basis",
@@ -676,6 +683,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
         "shrinkage_pct": 32.0,
         "occupancy_pct": 85.0,
         "paid_hours_per_week": 40.0,
+        "pt_hours_per_week": 40.0,
         "workload_margin_pct": 5.0,
         "ft_pct": 82.0,
         "req_basis": "workload", "sl_target_pct": 80.0,
@@ -716,7 +724,8 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
     })
     assumptions = {
         "starting_hc": 0.0, "annual_attrition_pct": 28.0, "shrinkage_pct": 32.0,
-        "occupancy_pct": 85.0, "paid_hours_per_week": 40.0, "workload_margin_pct": 5.0,
+        "occupancy_pct": 85.0, "paid_hours_per_week": 40.0,
+        "pt_hours_per_week": 40.0, "workload_margin_pct": 5.0,
         "ft_pct": 82.0, "req_basis": "workload", "sl_target_pct": 80.0,
         "sl_threshold_sec": 40.0, "open_hrs_week": 60.0,
         "ramp_weeks": 0, "ramp_start_pct": 60.0,
@@ -1242,7 +1251,26 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
 
     # Mentors are bodies on roll (they stay in Production HC and keep attriting)
     # but deliver no phone capacity while they mentor — same shape as LOA.
-    staffed = hc - loa_arr - ment_arr - ramp_discount
+    # Part-time heads deliver less than an FTE (user confirmed 2026-08-12 that
+    # starting headcount is PEOPLE, not FTE). `ft_pct` used to split the
+    # Production HC display and nothing else — a half-timer counted as a full
+    # 1.0 of capacity in Staffed, Net and Volume Capacity alike.
+    #
+    # The discount applies to heads that are actually AVAILABLE (after LOA and
+    # mentors), not to raw headcount: if 2% of the line is part-time then
+    # roughly 2% of the people on leave are too, and discounting the whole roll
+    # would subtract them twice.
+    #
+    # Ratio is CLAMPED at 1.0. The migration seeds pt hours equal to full-time
+    # so existing plans are unchanged, and a later cut to `paid_hours_per_week`
+    # must not leave part-timers worth MORE than a full-timer.
+    ft = a.get("ft_pct", 100.0) / 100
+    _paid = float(a.get("paid_hours_per_week", 40.0) or 0.0)
+    _pt_hrs = float(a.get("pt_hours_per_week", _paid) or 0.0)
+    _pt_ratio = min(1.0, _pt_hrs / _paid) if _paid > 0 else 1.0
+    _available = hc - loa_arr - ment_arr
+    pt_discount = _available * (1 - ft) * (1 - _pt_ratio)
+    staffed = _available - pt_discount - ramp_discount
     net = staffed - required_fte
     # A cleared AHT (0) is a legitimate state — it is what a fresh rollover
     # leaves behind — so guard the division rather than emitting NaN and a
@@ -1268,7 +1296,6 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
 
     # Available Hours = productive hours one FTE delivers per week (the Required-FTE
     # denominator). FT/PT split mirrors the legacy model's Full-time/Part-time rows.
-    ft = a.get("ft_pct", 100.0) / 100
     return pd.DataFrame(
         {
             "Week": weeks,
@@ -1292,6 +1319,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Attrition (actual)": np.round(attr_actual, 2),   # blank where modelled
             "NH Grads": adds.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
+            "PT Discount": np.round(pt_discount, 1),
             "LOA": loa_arr,
             "Mentors": ment_arr,
             "Staffed FTE": staffed.round(1),
@@ -3645,7 +3673,24 @@ with st.sidebar:
                      "32% shrink / 85% occ / 5% margin, one hour of contact work costs "
                      "~1.82 paid hours. Don't also pad AHT or the forecast by hand — "
                      "that's the same fear, priced three times.")
-            a["ft_pct"] = st.number_input("Full-time %", 0.0, 100.0, float(a.get("ft_pct", 100.0)), 1.0, disabled=RO, key=f"as_ft_{view}")
+            a["ft_pct"] = st.number_input(
+                "Full-time %", 0.0, 100.0, float(a.get("ft_pct", 100.0)), 1.0,
+                disabled=RO, key=f"as_ft_{view}",
+                help="Share of the HEADCOUNT that is full-time. Headcount is "
+                     "counted in PEOPLE, so the rest are discounted to the "
+                     "part-time hours below.")
+            a["pt_hours_per_week"] = st.number_input(
+                "Part-time hours/week", 0.0, 80.0,
+                float(a.get("pt_hours_per_week",
+                            a.get("paid_hours_per_week", 40.0))), 0.5,
+                disabled=RO, key=f"as_pthrs_{view}",
+                help="What a part-time agent is paid for in an average week. "
+                     "Set it EQUAL to paid hours/week and part-timers count as "
+                     "whole FTE — that is the default, and what every plan did "
+                     "before this existed. Set it lower and their capacity is "
+                     "discounted in Staffed FTE, Net FTE and Volume Capacity "
+                     "(shown as the plan's 'PT Discount' row). Production HC "
+                     "stays in PEOPLE either way.")
             a["ramp_weeks"] = st.number_input(
                 "NH ramp — weeks to full productivity", 0, 26,
                 int(a.get("ramp_weeks", 0) or 0), 1, disabled=RO, key=f"as_rampw_{view}",
@@ -3899,6 +3944,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Production HC", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "NH Grads", "Ramp Discount",
+             "PT Discount",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
              "Volume Capacity"]
     return df[[c for c in order if c in df.columns]]
