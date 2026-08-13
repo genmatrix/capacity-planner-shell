@@ -29,6 +29,8 @@ import json
 import os
 import re
 import socket
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -83,8 +85,13 @@ def _dir(d) -> Path:
     return p
 
 
-def _atomic_write(path: Path, text: str):
-    """Write via temp + os.replace so readers never see a half-written file."""
+def _atomic_write(path: Path, text: str, _count: bool = True):
+    """Write via temp + os.replace so readers never see a half-written file.
+
+    `_count=False` keeps the background draft writer's time out of IO_PERF —
+    that tally is "share I/O the planner WAITED on this run", and the whole
+    point of the async writer is that nobody waits on it."""
+    t0 = time.perf_counter()
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)  # atomic rename on the same volume
@@ -92,6 +99,9 @@ def _atomic_write(path: Path, text: str):
     # read later in the SAME run would serve the pre-write value (take-control
     # read back a stale lock and stayed read-only: 11 checks red, 2026-08-10).
     _invalidate(path)
+    if _count:
+        IO_PERF["s"] += time.perf_counter() - t0
+        IO_PERF["n"] += 1
 
 
 # ---------------------------------------------------------------- per-run memo
@@ -110,9 +120,19 @@ def _atomic_write(path: Path, text: str):
 _RUN_MEMO: dict = {}
 
 
+# Share-I/O cost of the CURRENT script run, for the sidebar's timing line —
+# the user cannot see round trips, so the app tells them (2026-08-13, after
+# an assumption change measured at 15 seconds on the real share while the
+# dev model said 2-3: stop estimating, let each deployment report itself).
+IO_PERF = {"s": 0.0, "n": 0}
+
+
 def new_run() -> None:
-    """Drop the per-run memo. Called once at the top of each script run."""
+    """Drop the per-run memo and the I/O tally. Called once at the top of
+    each script run."""
     _RUN_MEMO.clear()
+    IO_PERF["s"] = 0.0
+    IO_PERF["n"] = 0
 
 
 def _memo(key, produce):
@@ -168,20 +188,25 @@ def _invalidate(path: Path):
 def _read_json_pointer(path: Path):
     """Pointer-file reader (active-, budget-, the lock): one os.stat when the
     file is unchanged since the last rerun, a full read only when it moved."""
-    key = str(path)
+    t0 = time.perf_counter()
     try:
-        stt = os.stat(path)
-    except OSError:
-        _STAT_CACHE.pop(key, None)
-        return None
-    hit = _STAT_CACHE.get(key)
-    if hit and hit[0] == stt.st_mtime_ns and hit[1] == stt.st_size:
-        return copy.deepcopy(hit[2])
-    val = _read_json(path)
-    if val is None:
-        return None                 # unreadable ≠ missing: never cache a fluke
-    _STAT_CACHE[key] = (stt.st_mtime_ns, stt.st_size, val)
-    return copy.deepcopy(val)
+        key = str(path)
+        try:
+            stt = os.stat(path)
+        except OSError:
+            _STAT_CACHE.pop(key, None)
+            return None
+        hit = _STAT_CACHE.get(key)
+        if hit and hit[0] == stt.st_mtime_ns and hit[1] == stt.st_size:
+            return copy.deepcopy(hit[2])
+        val = _read_json(path)
+        if val is None:
+            return None             # unreadable ≠ missing: never cache a fluke
+        _STAT_CACHE[key] = (stt.st_mtime_ns, stt.st_size, val)
+        return copy.deepcopy(val)
+    finally:
+        IO_PERF["s"] += time.perf_counter() - t0
+        IO_PERF["n"] += 1
 
 
 def _dir_entries(d) -> tuple:
@@ -189,31 +214,120 @@ def _dir_entries(d) -> tuple:
     shared by every listing consumer (version history, drafts, the corrupt-
     lock caption), revalidated across reruns by the directory's own mtime."""
     def _load():
-        key = str(d)
+        t0 = time.perf_counter()
         try:
-            dstt = os.stat(d)
-        except OSError:
-            _DIR_CACHE.pop(key, None)
-            return ()
-        hit = _DIR_CACHE.get(key)
-        if hit and hit[0] == dstt.st_mtime_ns:
-            return hit[1]
-        try:
-            with os.scandir(d) as it:
-                ents = []
-                for e in it:
-                    try:
-                        stt = e.stat()   # free on Windows: rides the listing
-                        ents.append((e.name, stt.st_mtime_ns, stt.st_size,
-                                     e.is_file()))
-                    except OSError:
-                        continue
-        except OSError:
-            return ()
-        ents = tuple(ents)
-        _DIR_CACHE[key] = (dstt.st_mtime_ns, ents)
-        return ents
+            key = str(d)
+            try:
+                dstt = os.stat(d)
+            except OSError:
+                _DIR_CACHE.pop(key, None)
+                return ()
+            hit = _DIR_CACHE.get(key)
+            if hit and hit[0] == dstt.st_mtime_ns:
+                return hit[1]
+            try:
+                with os.scandir(d) as it:
+                    ents = []
+                    for e in it:
+                        try:
+                            stt = e.stat()  # free on Windows: rides the listing
+                            ents.append((e.name, stt.st_mtime_ns, stt.st_size,
+                                         e.is_file()))
+                        except OSError:
+                            continue
+            except OSError:
+                return ()
+            ents = tuple(ents)
+            _DIR_CACHE[key] = (dstt.st_mtime_ns, ents)
+            return ents
+        finally:
+            IO_PERF["s"] += time.perf_counter() - t0
+            IO_PERF["n"] += 1
     return _memo(("dirents", str(d)), _load)
+
+
+# ---------------------------------------------------- background draft writer
+# The auto-draft is the one share WRITE on the hot path: it ran inside the
+# rerun, so every change waited on the share (plus whatever antivirus adds on
+# writes). Now the rerun hands the payload to a single daemon worker and
+# finishes; the worker writes on its own time.
+#
+#   * LATEST WINS, one slot per path: three quick edits while the share is
+#     slow write once, with the newest payload — the queue cannot back up.
+#   * Writes stay ATOMIC (temp + replace via _atomic_write), so a crash
+#     mid-write still leaves the previous complete draft, never a torn one.
+#   * The trade, stated honestly: work die-between-edit-and-flush widens from
+#     "since your last keystroke" to "since the worker last caught up" — a
+#     few seconds on a bad share, for a net whose job is surviving a closed
+#     tab. A KILLED PROCESS may drop the last pending write.
+#   * Readers call async_flush() first (there is one draft reader); deleters
+#     call async_cancel() before unlink, or a pending write would resurrect
+#     the draft the planner just discarded.
+_ASYNC_CV = threading.Condition()
+_ASYNC_PENDING: dict[str, str] = {}
+_ASYNC_BUSY: str | None = None
+_ASYNC_LAST: dict[str, tuple[float, str | None]] = {}   # path -> (secs, error)
+_ASYNC_THREAD: threading.Thread | None = None
+
+
+def _async_worker():
+    global _ASYNC_BUSY
+    while True:
+        with _ASYNC_CV:
+            while not _ASYNC_PENDING:
+                _ASYNC_CV.wait()
+            path, text = next(iter(_ASYNC_PENDING.items()))
+            del _ASYNC_PENDING[path]
+            _ASYNC_BUSY = path
+        t0 = time.perf_counter()
+        err = None
+        try:
+            _atomic_write(Path(path), text, _count=False)
+        except OSError as e:
+            err = str(e)
+        with _ASYNC_CV:
+            _ASYNC_LAST[path] = (time.perf_counter() - t0, err)
+            _ASYNC_BUSY = None
+            _ASYNC_CV.notify_all()
+
+
+def async_write(path: Path, text: str) -> None:
+    """Queue an atomic write and return immediately. Latest wins per path."""
+    global _ASYNC_THREAD
+    with _ASYNC_CV:
+        if _ASYNC_THREAD is None or not _ASYNC_THREAD.is_alive():
+            _ASYNC_THREAD = threading.Thread(
+                target=_async_worker, name="cp-draft-writer", daemon=True)
+            _ASYNC_THREAD.start()
+        _ASYNC_PENDING[str(path)] = text
+        _ASYNC_CV.notify_all()
+
+
+def async_cancel(path: Path) -> None:
+    """Drop any pending write for this path (call BEFORE deleting the file)."""
+    with _ASYNC_CV:
+        _ASYNC_PENDING.pop(str(path), None)
+
+
+def async_flush(timeout: float = 5.0) -> bool:
+    """Wait until nothing is pending or in flight. True if it drained."""
+    deadline = time.monotonic() + timeout
+    with _ASYNC_CV:
+        while _ASYNC_PENDING or _ASYNC_BUSY is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _ASYNC_CV.wait(left)
+    return True
+
+
+def async_last_write(path: Path) -> tuple[float, str | None] | None:
+    """(seconds, error) of the last completed background write, for the
+    timing line. None while nothing has completed yet."""
+    with _ASYNC_CV:
+        if str(path) in _ASYNC_PENDING or _ASYNC_BUSY == str(path):
+            return None                      # still in flight — say "writing…"
+        return _ASYNC_LAST.get(str(path))
 
 
 # ---------------------------------------------------------------- plan years

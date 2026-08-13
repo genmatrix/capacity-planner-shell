@@ -43,6 +43,9 @@ st.session_state["_run_seq"] = st.session_state.get("_run_seq", 0) + 1
 # is pure round-trip cost on a slow share. collab memoizes for the duration
 # of a run; this drops it as the next one starts, so liveness is unchanged.
 collab.new_run()
+# Start of this script run, for the sidebar timing line. Module-level is
+# correct here BECAUSE the script re-executes top-down every rerun.
+_T_RUN0 = time.perf_counter()
 
 
 
@@ -464,8 +467,10 @@ def _autosave_draft():
     if "lobs" not in st.session_state:
         return
     try:
+        t0 = time.perf_counter()
         payload = _serialize_lobs()
         blob = json.dumps(payload, sort_keys=True)
+        st.session_state["_perf_draft_ser"] = time.perf_counter() - t0
         if st.session_state.get("_draft_blob") == blob:
             return
         # mkdir once per session, not per change — exist_ok on SMB still costs
@@ -474,7 +479,10 @@ def _autosave_draft():
         if not st.session_state.get("_draft_dir_ready"):
             _draft_path().parent.mkdir(parents=True, exist_ok=True)
             st.session_state["_draft_dir_ready"] = True
-        collab._atomic_write(_draft_path(), json.dumps({
+        # Handed to the background writer — the rerun does NOT wait on the
+        # share (2026-08-13, "still took like 15 seconds"). Latest wins;
+        # _read_draft flushes first; the discard/cleanup paths cancel first.
+        collab.async_write(_draft_path(), json.dumps({
             "user": st.session_state.user,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "sandbox": bool(st.session_state.get("sandbox")),
@@ -488,7 +496,9 @@ def _autosave_draft():
 
 def _read_draft(src: Path) -> dict | None:
     """One reader for draft files. A missing or half-written draft must never
-    take the app down — the share can vanish mid-read."""
+    take the app down — the share can vanish mid-read. Drains the background
+    writer first, so a read can never race the write it is looking for."""
+    collab.async_flush()
     try:
         return json.loads(src.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -517,6 +527,7 @@ def _startup_draft_check():
         ref = {k: v for k, v in _serialize_lobs().items() if k in keys}
     mine = {k: payload.get(k) for k in keys if k in payload}
     if json.dumps(mine, sort_keys=True, default=str) == json.dumps(ref, sort_keys=True, default=str):
+        collab.async_cancel(src)      # a queued write must not resurrect it
         src.unlink(missing_ok=True)   # everything was published — clean up
         return
     # Park the offered work in its OWN file before anything else can touch it
@@ -3541,8 +3552,9 @@ with st.sidebar:
             # Delete the file the check actually READ — which may be the
             # pre-per-year name, in which case deleting _draft_path() would
             # leave the legacy draft to be offered again on every boot.
-            Path(st.session_state.get("_draft_file")
-                 or _draft_path()).unlink(missing_ok=True)
+            _dp = Path(st.session_state.get("_draft_file") or _draft_path())
+            collab.async_cancel(_dp)  # a queued write must not resurrect it
+            _dp.unlink(missing_ok=True)
             st.session_state["_draft_pending"] = None
             st.rerun()
         st.divider()
@@ -6569,3 +6581,31 @@ else:
                     "here — one Plan / Actual / Variance row per metric.")
 
 _autosave_draft()
+
+
+def _render_perf_line():
+    """One small sidebar caption: where THIS run's time went, measured on the
+    machine that runs it. Built after a slow-share deployment felt 15 seconds
+    per change while the dev estimate said 2-3 — each deployment reports its
+    own numbers, the user reads four figures off the screen, and the next fix
+    targets the real cost. 'script' is server-side execution only; if the
+    felt delay is far above it, the remainder is the browser rendering or the
+    network to it."""
+    total = time.perf_counter() - _T_RUN0
+    io_s, io_n = collab.IO_PERF["s"], collab.IO_PERF["n"]
+    ser = st.session_state.get("_perf_draft_ser")
+    bits = [f"script {total:.2f}s",
+            f"share I/O {io_s:.2f}s ({io_n} op{'s' if io_n != 1 else ''})"]
+    if ser is not None:
+        bits.append(f"draft serialize {ser:.2f}s")
+    last = collab.async_last_write(_draft_path())
+    if last is None and st.session_state.get("_draft_blob"):
+        bits.append("draft write: in background…")
+    elif last is not None:
+        secs, err = last
+        bits.append("⚠ draft write FAILED" if err
+                    else f"last draft write {secs:.2f}s (background)")
+    st.sidebar.caption("⏱ " + " · ".join(bits))
+
+
+_render_perf_line()
