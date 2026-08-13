@@ -3095,7 +3095,41 @@ def render_team_status() -> tuple[bool, str]:
 
     c1, c2 = st.columns(2)
     take_label = "Take over" if (lock and not collab.lock_is_stale(lock)) else "Take control"
-    if c1.button(take_label, width="stretch"):
+
+    # WARN BEFORE, not after (field report 2026-08-13: "I resume working on the
+    # plan, take control, and my changes are gone"). Taking control when the
+    # plan has ADVANCED loads the newer version — correct, or you would
+    # republish over a colleague's work — but it was a surprise: the notice
+    # only appeared once the edits had already been replaced, and recovery
+    # meant hand-copying out of a what-if.
+    #
+    # Only computed in the rare state that can actually lose something: we do
+    # NOT hold the lock, a newer version exists, and the session differs from
+    # it. That keeps `diff_payloads` off every rerun.
+    _clash = 0
+    _act_pre = collab.read_active(SCENARIO_DIR, year)
+    _newer = (_act_pre and lv is not None
+              and _act_pre.get("version") != lv and not st.session_state.sandbox)
+    if _newer:
+        try:
+            _snap_pre = _cached_snapshot(str(SCENARIO_DIR), _act_pre["file"])
+            if _snap_pre:
+                _clash = len(diff_payloads(_snap_pre, _serialize_lobs()))
+        except Exception:
+            _clash = 0
+    _ready = True
+    if _clash:
+        st.warning(
+            f"**Taking control will replace your unsaved work.** The plan "
+            f"advanced to **v{_act_pre['version']}** "
+            f"(by {_act_pre.get('author', '?')}) and your session differs from "
+            f"it in **{_clash} field(s)**. Their published version wins — "
+            "otherwise you would republish over it — so your edits are saved "
+            "as the what-if **“before taking control”** rather than merged. "
+            "To compare first, open **Sandbox** instead: nothing shared moves.")
+        _ready = st.checkbox(f"Yes — load v{_act_pre['version']} and set my "
+                             "edits aside", key=f"take_confirm_{year}")
+    if c1.button(take_label, width="stretch", disabled=not _ready):
         ok, info = collab.acquire_lock(SCENARIO_DIR, year, user, force=True)
         st.session_state[f"lock_token_{year}"] = (info or {}).get("token")
         # Re-seed from the shared truth ONLY when it actually moved under us
