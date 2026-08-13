@@ -142,15 +142,12 @@ def _read_json(path: Path):
 # so an existing share opens with its full history and needs no migration step.
 LEGACY_YEAR = 2026
 
-# Publishing LEGACY_YEAR also writes the bare `active.json`. Everyone launches
-# the one copy on the share, so the only window where two code versions coexist
-# is a session left OPEN across an update — that process keeps the old module
-# until relaunch, and would otherwise read a pointer nobody updates any more.
-# Dual-writing costs one small file per publish and closes it.
-# REMOVE THIS after the release following the one that introduces it (added
-# 2026-07-29). Left alone, a compatibility shim becomes permanent by forgetting,
-# and then nobody can tell whether `active.json` still means anything.
-DUAL_WRITE_LEGACY = True
+# A bare `active.json` is READ as 2026's pointer (above) but no longer WRITTEN:
+# the dual-write shim that kept it fresh for sessions left open across the
+# 2026-07-29 update was removed 2026-08-13, several releases later, per its own
+# removal note. A stale `active.json` left on a share is harmless — the
+# year-scoped pointer exists there and wins — and deliberately not deleted:
+# publish should never remove files it did not write.
 
 
 # ---------------------------------------------------------------- active pointer
@@ -172,10 +169,7 @@ def read_active(d, year):
 
 
 def write_active(d, year, meta: dict):
-    dd = _dir(d)
-    _atomic_write(active_path(dd, int(year)), json.dumps(meta))
-    if DUAL_WRITE_LEGACY and int(year) == LEGACY_YEAR:
-        _atomic_write(legacy_active_path(dd), json.dumps(meta))
+    _atomic_write(active_path(_dir(d), int(year)), json.dumps(meta))
 
 
 # --------------------------------------------------------------- budget pointer
@@ -242,10 +236,11 @@ def _live_lock_path(d, year) -> Path:
     open on the old code would appear to hold nothing, and new code would hand
     out edit control for a plan someone is actively editing.
 
-    Deliberately NOT dual-written, unlike the pointer: a lock is transient and
-    two files would need an atomic O_EXCL race across both. Once anyone acquires
-    through this code the year-scoped file exists and wins from then on; the
-    stranded legacy lock ages out at LOCK_STALE_MIN and stops mattering."""
+    The lock was never dual-written (unlike the pointer, briefly, until
+    2026-08-13): a lock is transient and two files would need an atomic O_EXCL
+    race across both. Once anyone acquires through this code the year-scoped
+    file exists and wins from then on; the stranded legacy lock ages out at
+    LOCK_STALE_MIN and stops mattering."""
     def _resolve():
         p = lock_path(d, year)
         if not p.exists() and int(year) == LEGACY_YEAR:
