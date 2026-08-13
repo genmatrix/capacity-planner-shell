@@ -175,34 +175,58 @@ def _read_json(path: Path):
 _STAT_CACHE: dict[str, tuple[int, int, object]] = {}
 _DIR_CACHE: dict[str, tuple[int, tuple]] = {}
 
+# Round five (2026-08-13, the timing line's first field report: share I/O
+# 1.35 s over 6 ops ≈ 225 ms per stat — paid on EVERY keystroke). Liveness
+# signals don't need per-keystroke freshness: within this window a validated
+# value is served without even the stat, so a burst of grid edits touches the
+# share ZERO times. The cost, stated: a colleague's publish/takeover shows up
+# to LIVENESS_MIN_SEC later (on top of SMB's own ~10 s attribute cache) —
+# nothing against LOCK_STALE_MIN=5 min, and one's OWN actions are always
+# immediate because every writer calls _invalidate.
+LIVENESS_MIN_SEC = 5.0
+_LAST_CHECK: dict[str, float] = {}
+_RESOLVE_CACHE: dict[tuple, object] = {}
+
 
 def _invalidate(path: Path):
     """Called wherever shared state changes: the file's own cached parse and
     its parent directory's cached listing are dropped, plus the whole run
-    memo. Invalidate where the change happens, never on the way in."""
+    memo and the liveness clocks. Invalidate where the change happens, never
+    on the way in."""
     _STAT_CACHE.pop(str(path), None)
     _DIR_CACHE.pop(str(Path(path).parent), None)
+    _LAST_CHECK.pop(str(path), None)
+    _LAST_CHECK.pop(str(Path(path).parent), None)
+    _RESOLVE_CACHE.clear()
     _RUN_MEMO.clear()
 
 
 def _read_json_pointer(path: Path):
-    """Pointer-file reader (active-, budget-, the lock): one os.stat when the
-    file is unchanged since the last rerun, a full read only when it moved."""
+    """Pointer-file reader (active-, budget-, the lock): NO share op inside
+    the liveness window, one os.stat to revalidate after it, a full read only
+    when the file actually moved. Missing files cache as None ((-1,-1)
+    signature) so an absent budget pointer is not re-statted per keystroke."""
+    key = str(path)
+    now = time.monotonic()
+    if key in _STAT_CACHE and now - _LAST_CHECK.get(key, -1e9) < LIVENESS_MIN_SEC:
+        return copy.deepcopy(_STAT_CACHE[key][2])
     t0 = time.perf_counter()
     try:
-        key = str(path)
         try:
             stt = os.stat(path)
         except OSError:
-            _STAT_CACHE.pop(key, None)
+            _STAT_CACHE[key] = (-1, -1, None)
+            _LAST_CHECK[key] = now
             return None
         hit = _STAT_CACHE.get(key)
         if hit and hit[0] == stt.st_mtime_ns and hit[1] == stt.st_size:
+            _LAST_CHECK[key] = now
             return copy.deepcopy(hit[2])
         val = _read_json(path)
         if val is None:
             return None             # unreadable ≠ missing: never cache a fluke
         _STAT_CACHE[key] = (stt.st_mtime_ns, stt.st_size, val)
+        _LAST_CHECK[key] = now
         return copy.deepcopy(val)
     finally:
         IO_PERF["s"] += time.perf_counter() - t0
@@ -214,9 +238,12 @@ def _dir_entries(d) -> tuple:
     shared by every listing consumer (version history, drafts, the corrupt-
     lock caption), revalidated across reruns by the directory's own mtime."""
     def _load():
+        key = str(d)
+        now = time.monotonic()
+        if key in _DIR_CACHE and now - _LAST_CHECK.get(key, -1e9) < LIVENESS_MIN_SEC:
+            return _DIR_CACHE[key][1]
         t0 = time.perf_counter()
         try:
-            key = str(d)
             try:
                 dstt = os.stat(d)
             except OSError:
@@ -224,6 +251,7 @@ def _dir_entries(d) -> tuple:
                 return ()
             hit = _DIR_CACHE.get(key)
             if hit and hit[0] == dstt.st_mtime_ns:
+                _LAST_CHECK[key] = now
                 return hit[1]
             try:
                 with os.scandir(d) as it:
@@ -239,6 +267,7 @@ def _dir_entries(d) -> tuple:
                 return ()
             ents = tuple(ents)
             _DIR_CACHE[key] = (dstt.st_mtime_ns, ents)
+            _LAST_CHECK[key] = now
             return ents
         finally:
             IO_PERF["s"] += time.perf_counter() - t0
@@ -447,7 +476,22 @@ def _live_lock_path(d, year) -> Path:
             if legacy.exists():
                 return legacy
         return p
-    return _memo(("lockpath", str(d), int(year)), _resolve)
+    # The exists() probes above are share round trips too — throttled on the
+    # same liveness window. _invalidate clears this cache wholesale, so one's
+    # own acquire/release re-resolves immediately.
+    def _cached():
+        key = (str(d), int(year))
+        now = time.monotonic()
+        hit = _RESOLVE_CACHE.get(key)
+        if hit and now - hit[0] < LIVENESS_MIN_SEC:
+            return hit[1]
+        t0 = time.perf_counter()
+        p = _resolve()
+        IO_PERF["s"] += time.perf_counter() - t0
+        IO_PERF["n"] += 1
+        _RESOLVE_CACHE[key] = (now, p)
+        return p
+    return _memo(("lockpath", str(d), int(year)), _cached)
 
 
 def read_lock(d, year):
