@@ -1366,7 +1366,17 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Required FTE": pd.Series(required_fte).round(1).to_numpy(),
             "Workload Req FTE": workload_req.round(1),
             "Erlang Req FTE": np.round(erlang_req, 1),
+            # END-of-week headcount: that week's departures are already out.
             "Production HC": hc.round(1),
+            # START-of-week headcount — the SAME walk, reported one step
+            # earlier. Many spreadsheets (ours included) carry headcount at the
+            # start of the week, which made every week look ~1 week of
+            # attrition apart from this one for no reason either side was
+            # wrong (field report 2026-08-13). Both are now on the page, so a
+            # comparison lines up without anyone re-deriving the convention.
+            # Informational: nothing downstream reads it.
+            "Production HC (start)": np.round(
+                np.concatenate(([float(a["starting_hc"] or 0)], hc[:-1])), 1),
             "Prod HC — FT": (hc * ft).round(1),
             "Prod HC — PT": (hc * (1 - ft)).round(1),
             "Supervisors": sups,
@@ -4047,7 +4057,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "CPM (plan)", "CPM (actual)",
              "Workload (hrs)", "Available Hrs/FTE", "Required FTE",
              "Workload Req FTE", "Erlang Req FTE",
-             "Production HC", "Prod HC — FT", "Prod HC — PT",
+             "Production HC (start)", "Production HC", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "NH Grads", "Ramp Discount",
              "PT Discount", "NH Lab HC", "Lab FTE",
