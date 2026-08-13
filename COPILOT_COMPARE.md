@@ -69,6 +69,13 @@ Services against a whole-workbook total is the fastest way to a wrong answer.
 >   out of Staffed FTE but stay in Production headcount. If the workbook has no
 >   such row, the tool will show lower Staffed FTE for those weeks and that is
 >   correct, not a defect.
+> - **Part-time agents never attrite in the tool.** Full-time and part-time are
+>   separate typed counts; the attrition walk (modelled rate AND recorded
+>   departures) runs on the full-time count only, and each part-timer counts as
+>   part-time hours ÷ paid hours of an FTE in Staffed. If the workbook attrites
+>   everyone or splits by a percentage, its headcount will drift slightly below
+>   the tool's over the year on any line with part-timers — expected, not a
+>   defect. Compare the full-time walks against each other first.
 > - **Attrition** may be a modelled rate in one and recorded actuals in the
 >   other. The tool treats a blank in a fully elapsed week as zero departures,
 >   so past weeks are a ledger rather than a forecast. Compare the rates
