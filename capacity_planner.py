@@ -131,6 +131,8 @@ def _payload_lobs(p: dict) -> dict:
             ros["Attrition (actual)"] = np.nan
         if "Mentors" not in ros.columns:              # pre-mentors plans
             ros["Mentors"] = 0.0
+        if "NH Lab HC" not in ros.columns:            # pre-coaching-lab plans
+            ros["NH Lab HC"] = 0.0
         _nh = pd.read_json(StringIO(d["nh"]), orient="split")
         if "Actual Grads" not in _nh.columns:         # pre-actualized-grads plans
             _nh["Actual Grads"] = np.nan
@@ -179,6 +181,7 @@ ASSUMPTION_LABELS = {
     "occupancy_pct": "Target occupancy %",
     "paid_hours_per_week": "Paid hours/week",
     "pt_hours_per_week": "Part-time hours/week",
+    "lab_productivity_pct": "Coaching-lab productivity %",
     "workload_margin_pct": "Workload margin %",
     "ft_pct": "Full-time %",
     "req_basis": "Requirement basis",
@@ -661,6 +664,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
     roster = pd.DataFrame(
         {"Week": weeks, "LOA": [round(hc * 0.04, 1)] * n_weeks,
          "Mentors": [0.0] * n_weeks,
+         "NH Lab HC": [0.0] * n_weeks,
          "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [float(max(1, round(hc / 15)))] * n_weeks,
@@ -684,6 +688,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
         "occupancy_pct": 85.0,
         "paid_hours_per_week": 40.0,
         "pt_hours_per_week": 40.0,
+        "lab_productivity_pct": 50.0,
         "workload_margin_pct": 5.0,
         "ft_pct": 82.0,
         "req_basis": "workload", "sl_target_pct": 80.0,
@@ -712,7 +717,7 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
     })
     roster = pd.DataFrame(
         {"Week": weeks, "LOA": [0.0] * n_weeks, "Mentors": [0.0] * n_weeks,
-         "Transfers +/-": [0.0] * n_weeks,
+         "NH Lab HC": [0.0] * n_weeks, "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [0.0] * n_weeks, "Leads/Project": [0.0] * n_weeks})
     nh = pd.DataFrame({
@@ -725,7 +730,8 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
     assumptions = {
         "starting_hc": 0.0, "annual_attrition_pct": 28.0, "shrinkage_pct": 32.0,
         "occupancy_pct": 85.0, "paid_hours_per_week": 40.0,
-        "pt_hours_per_week": 40.0, "workload_margin_pct": 5.0,
+        "pt_hours_per_week": 40.0, "lab_productivity_pct": 50.0,
+        "workload_margin_pct": 5.0,
         "ft_pct": 82.0, "req_basis": "workload", "sl_target_pct": 80.0,
         "sl_threshold_sec": 40.0, "open_hrs_week": 60.0,
         "ramp_weeks": 0, "ramp_start_pct": 60.0,
@@ -798,6 +804,38 @@ def init_state(n_weeks: int):
 # ----------------------------------------------------------------------
 # The calculation engine (this is what the scheduled job would run)
 # ----------------------------------------------------------------------
+def _lab_overlap_weeks(roster: pd.DataFrame, nh: pd.DataFrame,
+                       weeks: list[str]) -> list[str]:
+    """Weeks where NH Lab HC is filled on or after a class's graduation week.
+
+    The lab column is a SEPARATE headcount that adds to Staffed FTE; the class
+    adds the same people to Production HC when it graduates. Overlap is the one
+    way to count a cohort twice, so it is named rather than left to be noticed."""
+    if roster is None or nh is None or roster.empty or nh.empty:
+        return []
+    if "NH Lab HC" not in roster.columns:
+        return []
+    idx = {w: i for i, w in enumerate(weeks)}
+    grads = []
+    for _, r in nh.dropna(subset=["Class Start Week"]).iterrows():
+        if r["Class Start Week"] not in idx:
+            continue
+        tr = pd.to_numeric(r.get("Training Wks"), errors="coerce")
+        co = pd.to_numeric(r.get("Coaching Wks"), errors="coerce")
+        if pd.isna(tr) and pd.isna(co):
+            continue                       # incomplete row — flagged elsewhere
+        g = idx[r["Class Start Week"]] + int(0 if pd.isna(tr) else tr) \
+            + int(0 if pd.isna(co) else co)
+        if 0 <= g < len(weeks):
+            grads.append(g)
+    if not grads:
+        return []
+    first_grad = min(grads)
+    lab = pd.to_numeric(roster["NH Lab HC"], errors="coerce").fillna(0).to_numpy()
+    return [weeks[i] for i in range(first_grad, min(len(weeks), len(lab)))
+            if lab[i] > 0]
+
+
 def _incomplete_classes(nh: pd.DataFrame) -> list[str]:
     """Human-readable reasons the engine is skipping a new-hire row.
 
@@ -1270,7 +1308,29 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     _pt_ratio = min(1.0, _pt_hrs / _paid) if _paid > 0 else 1.0
     _available = hc - loa_arr - ment_arr
     pt_discount = _available * (1 - ft) * (1 - _pt_ratio)
-    staffed = _available - pt_discount - ramp_discount
+
+    # Coaching-lab new hires TAKE CALLS at partial productivity (user
+    # 2026-08-13). Until now trainees were invisible until graduation, so the
+    # coaching weeks understated capacity — the opposite direction from every
+    # other correction here, and worth saying so.
+    #
+    # A TYPED weekly headcount rather than something derived from the class
+    # grid, and that is the point: it also represents cohorts that started
+    # LAST year and are still in the lab in January. Those classes are not in
+    # this year's grid at all, so nothing derived could see them, and the user
+    # reports exactly that bleed-in wrecking early-year reconciliation.
+    #
+    # Deliberately NOT in Production HC: the class adds those people on its
+    # graduation week, and counting them here as well would double them. It IS
+    # in Overall HC, because the org is paying them — and the supervisor and
+    # lead ratios divide by the walking agent count, not Overall HC, so those
+    # rows are untouched.
+    lab_arr = (pd.to_numeric(roster["NH Lab HC"], errors="coerce").fillna(0)
+                 .to_numpy(dtype=float)
+               if "NH Lab HC" in roster.columns else np.zeros(n))
+    lab_pct = float(a.get("lab_productivity_pct", 50.0) or 0.0) / 100
+    lab_fte = lab_arr * lab_pct
+    staffed = _available - pt_discount - ramp_discount + lab_fte
     net = staffed - required_fte
     # A cleared AHT (0) is a legitimate state — it is what a fresh rollover
     # leaves behind — so guard the division rather than emitting NaN and a
@@ -1314,12 +1374,14 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Leads/Project": leads,
             "Leads/Project Ratios": np.round(lead_ratio, 1),
             "Support Staff": support,
-            "Overall HC": (hc + support).round(1),
+            "Overall HC": (hc + support + lab_arr).round(1),
             "Attrition": attrition.round(2),
             "Attrition (actual)": np.round(attr_actual, 2),   # blank where modelled
             "NH Grads": adds.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "PT Discount": np.round(pt_discount, 1),
+            "NH Lab HC": lab_arr,
+            "Lab FTE": np.round(lab_fte, 1),
             "LOA": loa_arr,
             "Mentors": ment_arr,
             "Staffed FTE": staffed.round(1),
@@ -3713,6 +3775,16 @@ with st.sidebar:
                 help="Share of the HEADCOUNT that is full-time. Headcount is "
                      "counted in PEOPLE, so the rest are discounted to the "
                      "part-time hours below.")
+            a["lab_productivity_pct"] = st.number_input(
+                "Coaching-lab productivity %", 0.0, 100.0,
+                float(a.get("lab_productivity_pct", 50.0)), 5.0, disabled=RO,
+                key=f"as_lab_{view}",
+                help="What a new hire in the coaching lab delivers against a "
+                     "full agent while they are still nesting. Applied to the "
+                     "weekly **NH Lab HC** column on the roster grid. They add "
+                     "to Staffed FTE and Overall HC, but NOT to Production HC "
+                     "— their class adds them there on its graduation week, "
+                     "and counting them twice is the trap this avoids.")
             a["pt_hours_per_week"] = st.number_input(
                 "Part-time hours/week", 0.0, 80.0,
                 float(a.get("pt_hours_per_week",
@@ -3978,7 +4050,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Production HC", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "NH Grads", "Ramp Discount",
-             "PT Discount",
+             "PT Discount", "NH Lab HC", "Lab FTE",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
              "Volume Capacity"]
     return df[[c for c in order if c in df.columns]]
@@ -6369,6 +6441,16 @@ else:
             # a row with no size or no pipeline length is not yet a class — but
             # they were SILENT, and a silently ignored class reads exactly like
             # a class that is being counted (audit 2026-08-12).
+            _dbl = _lab_overlap_weeks(lob["roster"], lob["nh"],
+                                      lob["demand"]["Week"].tolist())
+            if _dbl:
+                st.warning(
+                    f"**NH Lab HC is still filled after a class graduated** — "
+                    + ", ".join(_dbl[:4]) + ("; …" if len(_dbl) > 4 else "")
+                    + ". Those people are already in Production HC from the "
+                      "graduation week, so counting them in the lab as well "
+                      "doubles them. Clear the lab column from the week the "
+                      "class graduates.")
             _ig = _incomplete_classes(lob["nh"])
             if _ig:
                 st.warning(
