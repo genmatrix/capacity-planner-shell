@@ -23,6 +23,7 @@ Design choices:
 All functions take the scenarios directory as their first argument so the app
 can point them at the share path.
 """
+import copy
 import getpass
 import json
 import os
@@ -87,10 +88,10 @@ def _atomic_write(path: Path, text: str):
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)  # atomic rename on the same volume
-    # Any write to shared state invalidates the per-run memo — otherwise a read
-    # later in the SAME run would serve the pre-write value (take-control read
-    # back a stale lock and stayed read-only: 11 checks red, 2026-08-10).
-    _RUN_MEMO.clear()
+    # Any write to shared state invalidates every cache layer — otherwise a
+    # read later in the SAME run would serve the pre-write value (take-control
+    # read back a stale lock and stayed read-only: 11 checks red, 2026-08-10).
+    _invalidate(path)
 
 
 # ---------------------------------------------------------------- per-run memo
@@ -131,6 +132,90 @@ def _read_json(path: Path):
         return None
 
 
+# ------------------------------------------------- cross-run stat validation
+# Round three of the share work (2026-08-13, "it took nine seconds"). The
+# run-memo stopped repeat reads WITHIN a run; every rerun still paid a full
+# OPEN for each pointer file and a scandir per listed directory, and on SMB an
+# open+read+close is 2-3 round trips where a stat is one. The overwhelmingly
+# common case is "nothing changed since the last rerun", so:
+#
+#   * a pointer file is revalidated with ONE os.stat — (mtime_ns, size)
+#     unchanged serves the cached parse; moving triggers a real read;
+#   * a listed DIRECTORY is revalidated by its own mtime — creating, deleting
+#     or atomically replacing any entry bumps it, so one stat answers "did
+#     anything change?" and the scandir is only paid when it did.
+#
+# Liveness is preserved because every shared-state change here is a file
+# create, unlink or atomic replace — all of which move the stats being
+# checked. Windows' SMB attribute cache can serve a stale stat for a few
+# seconds (FileInfoCacheLifetime, default 10s); acceptable for signals acted
+# on at human timescale, and the lock ACQUIRE path never trusts a stat — the
+# O_EXCL create stays the arbiter. Values are deep-copied on the way out:
+# they now cross rerun boundaries, and heartbeat() MUTATES the dict it read.
+_STAT_CACHE: dict[str, tuple[int, int, object]] = {}
+_DIR_CACHE: dict[str, tuple[int, tuple]] = {}
+
+
+def _invalidate(path: Path):
+    """Called wherever shared state changes: the file's own cached parse and
+    its parent directory's cached listing are dropped, plus the whole run
+    memo. Invalidate where the change happens, never on the way in."""
+    _STAT_CACHE.pop(str(path), None)
+    _DIR_CACHE.pop(str(Path(path).parent), None)
+    _RUN_MEMO.clear()
+
+
+def _read_json_pointer(path: Path):
+    """Pointer-file reader (active-, budget-, the lock): one os.stat when the
+    file is unchanged since the last rerun, a full read only when it moved."""
+    key = str(path)
+    try:
+        stt = os.stat(path)
+    except OSError:
+        _STAT_CACHE.pop(key, None)
+        return None
+    hit = _STAT_CACHE.get(key)
+    if hit and hit[0] == stt.st_mtime_ns and hit[1] == stt.st_size:
+        return copy.deepcopy(hit[2])
+    val = _read_json(path)
+    if val is None:
+        return None                 # unreadable ≠ missing: never cache a fluke
+    _STAT_CACHE[key] = (stt.st_mtime_ns, stt.st_size, val)
+    return copy.deepcopy(val)
+
+
+def _dir_entries(d) -> tuple:
+    """(name, mtime_ns, size, is_file) for every entry in `d` — ONE scandir
+    shared by every listing consumer (version history, drafts, the corrupt-
+    lock caption), revalidated across reruns by the directory's own mtime."""
+    def _load():
+        key = str(d)
+        try:
+            dstt = os.stat(d)
+        except OSError:
+            _DIR_CACHE.pop(key, None)
+            return ()
+        hit = _DIR_CACHE.get(key)
+        if hit and hit[0] == dstt.st_mtime_ns:
+            return hit[1]
+        try:
+            with os.scandir(d) as it:
+                ents = []
+                for e in it:
+                    try:
+                        stt = e.stat()   # free on Windows: rides the listing
+                        ents.append((e.name, stt.st_mtime_ns, stt.st_size,
+                                     e.is_file()))
+                    except OSError:
+                        continue
+        except OSError:
+            return ()
+        ents = tuple(ents)
+        _DIR_CACHE[key] = (dstt.st_mtime_ns, ents)
+        return ents
+    return _memo(("dirents", str(d)), _load)
+
+
 # ---------------------------------------------------------------- plan years
 # Each plan year is its own independently-published, independently-locked plan,
 # so 2026 can stay the operating plan while the team works on 2027. Before this
@@ -161,9 +246,9 @@ def legacy_active_path(d) -> Path:
 
 def read_active(d, year):
     def _load():
-        j = _read_json(active_path(d, year))
+        j = _read_json_pointer(active_path(d, year))
         if j is None and int(year) == LEGACY_YEAR:
-            j = _read_json(legacy_active_path(d))      # pre-per-year share
+            j = _read_json_pointer(legacy_active_path(d))   # pre-per-year share
         return j
     return _memo(("active", str(d), int(year)), _load)
 
@@ -194,7 +279,7 @@ def budget_path(d, year) -> Path:
 
 def read_budget(d, year):
     return _memo(("budget", str(d), int(year)),
-                 lambda: _read_json(budget_path(d, year)))
+                 lambda: _read_json_pointer(budget_path(d, year)))
 
 
 def write_budget(d, year, meta: dict):
@@ -214,7 +299,7 @@ def clear_budget(d, year) -> bool:
     p = budget_path(_dir(d), int(year))
     if p.exists():
         p.unlink()
-        _RUN_MEMO.clear()
+        _invalidate(p)
         return True
     return False
 
@@ -253,7 +338,7 @@ def _live_lock_path(d, year) -> Path:
 
 def read_lock(d, year):
     return _memo(("lock", str(d), int(year)),
-                 lambda: _read_json(_live_lock_path(d, year)))
+                 lambda: _read_json_pointer(_live_lock_path(d, year)))
 
 
 def lock_is_stale(info: dict | None) -> bool:
@@ -308,7 +393,7 @@ def acquire_lock(d, year, user: str, force: bool = False):
                 f"{p.name}.corrupt-{_now().strftime('%Y%m%d-%H%M%S')}"))
         except OSError:
             pass
-        _RUN_MEMO.clear()          # the rename changed what _live_lock_path resolves to
+        _invalidate(p)             # the rename changed what _live_lock_path resolves to
         cur = read_lock(d, year)   # a valid lock may have appeared meanwhile
     if cur is None:
         try:  # atomic create — wins the race against another new acquirer
@@ -319,7 +404,7 @@ def acquire_lock(d, year, user: str, force: bool = False):
             # race safe), so it bypasses _atomic_write's invalidation — clear
             # by hand or the read below serves the memoized "no lock" and the
             # caller gets no token, i.e. stays read-only after taking control.
-            _RUN_MEMO.clear()
+            _invalidate(p)
             return True, read_lock(d, year)
         except FileExistsError:
             cur = read_lock(d, year)  # lost the race; fall through
@@ -366,11 +451,12 @@ def release_lock(d, year, user: str, token: str | None = None,
                  force: bool = False) -> bool:
     cur = read_lock(d, year)
     if cur and (force or owns_lock(cur, user, token)):
+        p = _live_lock_path(d, year)
         try:
-            _live_lock_path(d, year).unlink()
+            p.unlink()
         except FileNotFoundError:
             pass
-        _RUN_MEMO.clear()
+        _invalidate(p)
         return True
     return False
 
@@ -413,19 +499,20 @@ _SNAP_META_KEYS = ("version", "name", "author", "published_at", "saved_at",
 _SNAP_CACHE: dict[tuple, dict | None] = {}
 
 
-def _snapshot_meta(p: Path, stt=None) -> dict | None:
+def _snapshot_meta(p: Path, sig=None) -> dict | None:
     """One snapshot's listing header, WITHOUT its plan payload. None when the
     file is not a snapshot (a pointer, a stray json) or cannot be read.
 
-    `stt` is the caller's already-obtained stat result — `_all_snapshots` gets
-    it free from `os.scandir`, and re-statting here would put back exactly the
-    per-file round trip that scandir exists to avoid."""
-    if stt is None:
+    `sig` is the caller's already-obtained (mtime_ns, size) — `_all_snapshots`
+    gets it free from the shared directory scan, and re-statting here would
+    put back exactly the per-file round trip that scan exists to avoid."""
+    if sig is None:
         try:
             stt = p.stat()
+            sig = (stt.st_mtime_ns, stt.st_size)
         except OSError:
             return None
-    key = (str(p), stt.st_mtime_ns, stt.st_size)
+    key = (str(p), sig[0], sig[1])
     if key in _SNAP_CACHE:
         return _SNAP_CACHE[key]
     j = _read_json(p)
@@ -440,7 +527,8 @@ def _snapshot_meta(p: Path, stt=None) -> dict | None:
 
 
 def list_names(d) -> list[str]:
-    """Entry names in a shared directory, via ONE scandir, memoized per run.
+    """Entry names in a shared directory, off the ONE shared `_dir_entries`
+    scan (dir-mtime validated, memoized per run).
 
     `Path.glob` is the trap here: CPython 3.13 rewrote pathlib to walk with
     scandir, while 3.11 — the oldest version this app supports — stats every
@@ -449,12 +537,7 @@ def list_names(d) -> list[str]:
     interpreter, not the newest. Callers filter the returned names in Python,
     which costs nothing.
     """
-    def _load():
-        try:
-            return [e.name for e in os.scandir(d)]
-        except OSError:
-            return []
-    return _memo(("names", str(d)), _load)
+    return [name for name, _m, _s, _f in _dir_entries(d)]
 
 
 def _all_snapshots(d) -> list[dict]:
@@ -477,21 +560,11 @@ def _all_snapshots_uncached(d) -> list[dict]:
     that is the 15-20 seconds — the reads were already cached; it was the
     METADATA calls that had not been.
     """
-    try:
-        entries = list(os.scandir(d))
-    except OSError:
-        return []
     out = []
-    for e in sorted(entries, key=lambda x: x.name):
-        if e.name == "active.json" or not e.name.endswith(".json"):
+    for name, mtime_ns, size, is_file in sorted(_dir_entries(d)):
+        if name == "active.json" or not name.endswith(".json") or not is_file:
             continue
-        try:
-            if not e.is_file():
-                continue
-            stt = e.stat()          # from the directory listing — no round trip
-        except OSError:
-            continue
-        meta = _snapshot_meta(Path(e.path), stt)
+        meta = _snapshot_meta(Path(d) / name, (mtime_ns, size))
         if meta is not None:
             out.append(meta)
     return out

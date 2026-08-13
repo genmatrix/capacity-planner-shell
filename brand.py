@@ -40,17 +40,36 @@ DEFAULT_WORD = "WFM"
 DEFAULT_SUB = "Workforce Management"
 
 
+# identity() is called several times per rerun (masthead, footer, page title)
+# and the file lives on the share, where every open is 2-3 network round
+# trips. Cache the parse per process, revalidated by ONE os.stat — the file
+# is written atomically (temp + replace), so a change always moves
+# (mtime_ns, size). A missing file caches as "defaults" against sig None.
+_IDENT_CACHE: dict = {"sig": (), "data": {}}
+
+
 def identity() -> dict:
     """{mark, word, sub} — the local override if there is one, else the
     shipped defaults. Never raises: a missing, unreadable or half-written file
     just means defaults, because a branding file is not worth a broken app."""
-    data = {}
     try:
-        data = json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        pass
+        stt = os.stat(IDENTITY_FILE)
+        sig = (stt.st_mtime_ns, stt.st_size)
+    except OSError:
+        sig = None
+    if _IDENT_CACHE["sig"] == sig:
+        data = _IDENT_CACHE["data"]
+    else:
+        data = {}
+        if sig is not None:
+            try:
+                data = json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, ValueError):
+                pass
+        _IDENT_CACHE["sig"] = sig
+        _IDENT_CACHE["data"] = data
 
     def pick(key, default, limit):
         v = data.get(key)

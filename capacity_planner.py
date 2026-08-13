@@ -468,7 +468,12 @@ def _autosave_draft():
         blob = json.dumps(payload, sort_keys=True)
         if st.session_state.get("_draft_blob") == blob:
             return
-        _draft_path().parent.mkdir(parents=True, exist_ok=True)
+        # mkdir once per session, not per change — exist_ok on SMB still costs
+        # a round trip every autosave. The except below clears the flag, so a
+        # drafts folder deleted mid-session is recreated on the next change.
+        if not st.session_state.get("_draft_dir_ready"):
+            _draft_path().parent.mkdir(parents=True, exist_ok=True)
+            st.session_state["_draft_dir_ready"] = True
         collab._atomic_write(_draft_path(), json.dumps({
             "user": st.session_state.user,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -478,7 +483,7 @@ def _autosave_draft():
         }))
         st.session_state["_draft_blob"] = blob
     except OSError:
-        pass
+        st.session_state["_draft_dir_ready"] = False
 
 
 def _read_draft(src: Path) -> dict | None:
