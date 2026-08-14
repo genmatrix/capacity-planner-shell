@@ -1428,6 +1428,11 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "Overall HC": (hc + support + lab_arr).round(1),
             "Attrition": attrition.round(2),
             "Attrition (actual)": np.round(attr_actual, 2),   # blank where modelled
+            # The remaining walk term, surfaced so the whole identity
+            # (start − attrition + transfers + grads = end) is auditable from
+            # ONE table — the user chased a 4-FTE week-over-week drop with
+            # this row invisible (2026-08-13). Echo of the roster input.
+            "Transfers +/-": xfer_arr.round(1),
             "NH Grads": adds.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "PT Discount": np.round(pt_discount, 1),
@@ -4121,7 +4126,8 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Workload Req FTE", "Erlang Req FTE",
              "Production HC (start)", "Production HC", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
-             "Attrition", "Attrition (actual)", "NH Grads", "Ramp Discount",
+             "Attrition", "Attrition (actual)", "Transfers +/-", "NH Grads",
+             "Ramp Discount",
              "PT Discount", "NH Lab HC", "Lab FTE",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
              "Volume Capacity"]
