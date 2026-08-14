@@ -634,6 +634,10 @@ table.cc-table td {{
 }}
 table.cc-table tr:last-child td {{ border-bottom: none; }}
 table.cc-table tr:hover td {{ background: {BG}; }}
+table.cc-table td.hashelp {{
+  text-decoration: underline dotted; text-underline-offset: 3px;
+  text-decoration-color: {MUTED}; cursor: help;
+}}
 table.cc-table td.neg {{ color: {SHORT}; background: {SHORT_BG}; font-weight: 700; }}
 table.cc-table td.pos {{ color: {COVERED}; background: {COVERED_BG}; }}
 table.cc-table td.tone-neg {{ color: {SHORT}; font-weight: 600; }}
@@ -699,7 +703,7 @@ def _blank(v) -> bool:
 
 
 def data_table(grid, *, int_rows=(), precision=None, shade_rows=(), tone_rows=(),
-               rule_before=(), na_rep: str = "—"):
+               rule_before=(), na_rep: str = "—", row_help=None):
     """Render a metrics-down / periods-across frame as the compact house table.
 
     `grid` is a DataFrame whose INDEX is the row labels and whose columns are
@@ -715,6 +719,10 @@ def data_table(grid, *, int_rows=(), precision=None, shade_rows=(), tone_rows=()
       tone_rows   ink only, no tint, by sign (variance rows, where a tint on
                   every second row would fight the table)
       rule_before a hairline above the row, for grouping
+      row_help    {row: formula/definition} — the label gets a dotted
+                  underline and shows the text on hover, so what makes up a
+                  count is readable off the table itself (user ask
+                  2026-08-13, after auditing the headcount walk row by row)
 
     Deliberately not st.dataframe: this is the reading surface, and the grid
     affordances (sort, resize, copy) are kept alongside it rather than
@@ -744,7 +752,10 @@ def data_table(grid, *, int_rows=(), precision=None, shade_rows=(), tone_rows=()
             elif name in tone_rows:
                 cls = ' class="tone-neg"' if num < 0 else ' class="tone-pos"'
             cells.append(f"<td{cls}>{txt}</td>")
-        rows.append(f"<tr{tr}><td>{_esc(name)}</td>{''.join(cells)}</tr>")
+        tip = (row_help or {}).get(name)
+        label = (f'<td class="hashelp" title="{_esc(tip)}">{_esc(name)}</td>'
+                 if tip else f"<td>{_esc(name)}</td>")
+        rows.append(f"<tr{tr}>{label}{''.join(cells)}</tr>")
     st.markdown(
         f'<div class="cc-tablewrap"><table class="cc-table">'
         f"<thead><tr><th></th>{head}</tr></thead>"

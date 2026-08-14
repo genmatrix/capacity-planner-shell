@@ -3975,6 +3975,68 @@ _PLAN_RULES = frozenset({"Workload (hrs)", "Production HC", "Staffed FTE"})
 # "1.4" or "1.5", which is not a readout.
 _PLAN_PRECISION = {"CPM (plan)": 2, "CPM (actual)": 2}
 
+# Hover text per row: what makes up the count, in the row names on the same
+# table (user ask 2026-08-13, straight after auditing the headcount walk cell
+# by cell). These MIRROR the engine — a formula here that drifts from
+# compute_plan is worse than no formula, so keep them in the engine's terms.
+_PLAN_ROW_FORMULAS = {
+    "Model Forecast": "Members × CPM ÷ 52 × Seasonality (curve normalized so "
+                      "a uniform index keeps the annual total)",
+    "Forecast (final)": "Fcst Override where filled, else Model Forecast",
+    "Workload (hrs)": "Forecast (final) × AHT ÷ 3600 × (1 + Workload margin %)",
+    "Available Hrs/FTE": "Paid hrs/week × (1 − Shrinkage %) × Occupancy %",
+    "Workload Req FTE": "Workload (hrs) ÷ Available Hrs/FTE",
+    "Erlang Req FTE": "Fewest agents hitting the SL target (Erlang C, "
+                      "occupancy as a cap) over open hours; on-roll = agents "
+                      "× open hrs ÷ (paid hrs × (1 − shrinkage))",
+    "Required FTE": "Workload Req FTE or Erlang Req FTE, per this LOB's "
+                    "Requirement basis",
+    "Production HC (start)": "Previous week's Production HC "
+                             "(week 1: entered FT + PT counts)",
+    "Production HC": "Prod HC — FT + Prod HC — PT (end of week — this week's "
+                     "departures are already out)",
+    "Prod HC — FT (start)": "Previous week's Prod HC — FT "
+                            "(week 1: the entered full-time count)",
+    "Prod HC — FT": "FT (start) − Attrition + Transfers +/- + NH Grads. "
+                    "The walk is full-time only",
+    "Prod HC — PT": "The entered part-time count — flat; part-time never "
+                    "attrites",
+    "Supervisors": "Roster entry (forward-fills)",
+    "Supervisor Ratios": "Production HC ÷ Supervisors",
+    "Leads/Project": "Roster entry (forward-fills)",
+    "Leads/Project Ratios": "Production HC ÷ Leads/Project",
+    "Support Staff": "Supervisors + Leads/Project",
+    "Overall HC": "Production HC + Support Staff + NH Lab HC",
+    "Attrition": "Attrition (actual) where entered; blank FUTURE week = "
+                 "Attrition %/yr ÷ 52 × FT start-of-week; blank ELAPSED "
+                 "week = 0 (nobody left)",
+    "Attrition (actual)": "Roster entry: recorded departures. 0 means "
+                          "'nobody left'; blank means 'use the model'",
+    "Transfers +/-": "Roster entry: agents moved between LOBs that week "
+                     "(one-week event, never fills forward)",
+    "NH Grads": "Class Size × stage survival — or Actual Grads where entered "
+                "— landing training + coaching weeks after the class start",
+    "Ramp Discount": "Ramping grads × (1 − productivity) across the ramp "
+                     "weeks, decaying at the weekly attrition rate",
+    "PT Discount": "Prod HC — PT × (1 − PT hours ÷ paid hours)",
+    "NH Lab HC": "Roster entry: new hires in the coaching lab taking calls — "
+                 "not in Production HC until their class graduates",
+    "Lab FTE": "NH Lab HC × Coaching-lab productivity %",
+    "LOA": "Roster entry: on leave — stays in Production HC, comes out of "
+           "Staffed FTE (full-time pull)",
+    "Mentors": "Roster entry: coaching a class — stays in Production HC, "
+               "comes out of Staffed FTE (full-time pull)",
+    "Staffed FTE": "(Prod HC — FT − LOA − Mentors) − PT Discount − "
+                   "Ramp Discount + Lab FTE",
+    "Net FTE": "Staffed FTE − Required FTE",
+    "Volume Capacity": "Staffed FTE × Available Hrs/FTE × 3600 ÷ AHT",
+    "Actual Offered": "ACD actual contacts for the week",
+    "Actual Variance": "Actual Offered − Forecast (final)",
+    "CPM (actual)": "Actual Offered × 52 ÷ the membership the model used "
+                    "that week",
+    "CPM (plan)": "The CPM the demand grid planned for that week",
+}
+
 
 def _safe_name(x) -> str:
     """Filename-safe LOB name for an export."""
@@ -3986,7 +4048,8 @@ def render_plan_grid(plan: pd.DataFrame, note: str):
     grid.columns = [c[5:] for c in grid.columns]
 
     brand.data_table(grid, int_rows=_PLAN_COUNT_ROWS, precision=_PLAN_PRECISION,
-                     shade_rows={"Net FTE"}, rule_before=_PLAN_RULES)
+                     shade_rows={"Net FTE"}, rule_before=_PLAN_RULES,
+                     row_help=_PLAN_ROW_FORMULAS)
     st.caption(note)
 
     def shade_net(row):
