@@ -1417,7 +1417,15 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                 np.concatenate(([float(a["starting_hc"] or 0) + pt_hc],
                                 hc[:-1])), 1),
             # Real walks now, not a percentage split of the total: FT is the
-            # attrition walk, PT is the flat typed count.
+            # attrition walk, PT is the flat typed count. FT gets BOTH
+            # conventions like the total does — the team's workbook carries
+            # start-of-week FULL-TIME headcount, and without this row the
+            # comparison forced mental arithmetic that double-deducted a
+            # leaver (2026-08-13: "shouldn't Jan 5 be 234?" — no: 235,
+            # because Dec-29's end-of-week 235 already excludes them).
+            "Prod HC — FT (start)": np.round(
+                np.concatenate(([float(a["starting_hc"] or 0)],
+                                hc_ft[:-1])), 1),
             "Prod HC — FT": hc_ft.round(1),
             "Prod HC — PT": np.full(n, round(pt_hc, 1)),
             "Supervisors": sups,
@@ -4124,7 +4132,8 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "CPM (plan)", "CPM (actual)",
              "Workload (hrs)", "Available Hrs/FTE", "Required FTE",
              "Workload Req FTE", "Erlang Req FTE",
-             "Production HC (start)", "Production HC", "Prod HC — FT", "Prod HC — PT",
+             "Production HC (start)", "Production HC",
+             "Prod HC — FT (start)", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "Transfers +/-", "NH Grads",
              "Ramp Discount",
