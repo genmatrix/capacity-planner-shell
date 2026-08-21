@@ -4808,7 +4808,15 @@ def render_executive_view():
     # something. Same for AHT: the plan's own assumption is what a variance
     # should be read against, since that is the number the plan was built on.
     sw = st.session_state.get("acd_weekly")
-    if sw is not None and not sw.empty and "Actual SL %" in sw.columns:
+    # ONLY actual weeks inside THIS plan's horizon. This table groups the feed
+    # rollup rather than `plans`, so without the filter it averaged every
+    # loaded week — which put 2026 actuals under a 2027 plan's targets and
+    # called it "actuals vs. plan" (field report 2026-08-21). Every other
+    # surface joins on plan weeks and goes correctly blank across years; this
+    # one now does too, and SAYS so rather than showing nothing.
+    if sw is not None and not sw.empty and "Actual SL %" in sw.columns \
+            and not sw[sw["Week"].isin(weeks)].empty:
+        sw = sw[sw["Week"].isin(weeks)]
         with brand.section("svc", "Service level & AHT — actuals vs. plan"):
             svc_rows = []
             # Grouped off the FEED rollup, not `plans`, so the page scope has
@@ -4863,13 +4871,23 @@ def render_executive_view():
                 partial = int((sw["Days Covered"] < _n).sum())
             else:
                 partial = 0
-            cap = (f"Contact-weighted across {sw['Week'].nunique()} loaded ACD week(s). "
+            cap = (f"Contact-weighted across {sw['Week'].nunique()} ACD week(s) "
+                   "inside this plan's horizon. "
                    "SL% = contacts answered within threshold ÷ offered; "
                    "AHT includes hold time. AHT Plan is the LOB's own assumption.")
             if partial:
                 cap += (f" ⚠️ {partial} LOB-week(s) cover fewer days than their "
                         "queue's normal week — treat these figures as directional.")
             st.caption(cap)
+    elif (sw is not None and not sw.empty and "Actual SL %" in sw.columns):
+        # Actuals ARE loaded — they just belong to another year's weeks.
+        # An honest sentence beats a table quietly comparing across years,
+        # and beats silence, which reads as "no data exists".
+        st.caption(
+            f"ℹ️ {sw['Week'].nunique()} ACD week(s) are loaded, but none fall "
+            f"inside this plan's {plan_year()} horizon — service actuals are "
+            "judged only against the year they belong to. Switch the plan "
+            "year to see them.")
 
     # ---- data health band ---------------------------------------------
     sw = st.session_state.get("acd_weekly")
