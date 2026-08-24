@@ -121,6 +121,14 @@ def _payload_lobs(p: dict) -> dict:
             # counted part-timers as whole FTE, so that is what it must keep
             # computing until someone enters the real number.
             _as["pt_hours_per_week"] = float(_as.get("paid_hours_per_week", 40.0) or 40.0)
+        if "members_own" not in _as:
+            # Per-LOB membership base (2026-08-24). Every plan before it
+            # shared the org series, so the flag seeds OFF — numerically
+            # inert, and both sides of every changelog/budget diff migrate
+            # through this same path.
+            _as["members_own"] = False
+            _as["members_start_own"] = 0.0
+            _as["members_end_own"] = 0.0
         if "starting_hc_pt" not in _as:
             # FT/PT became typed COUNTS 2026-08-13 (`starting_hc` = full-time,
             # `starting_hc_pt` = part-time; the `ft_pct` percentage retired).
@@ -190,6 +198,9 @@ def _payload_lobs(p: dict) -> dict:
 ASSUMPTION_LABELS = {
     "starting_hc": "Starting HC — full-time",
     "starting_hc_pt": "Starting HC — part-time",
+    "members_own": "Own membership base (on/off)",
+    "members_start_own": "Members start (own base)",
+    "members_end_own": "Members year-end (own base)",
     "annual_attrition_pct": "Attrition %/yr",
     # Vestigial for a migrated plan — the weekly column drives the engine —
     # but it still seeds a new plan and still drives a pre-column snapshot,
@@ -716,6 +727,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
     assumptions = {
         "starting_hc": hc,          # full-time; PT is its own count below
         "starting_hc_pt": 0.0,
+        "members_own": False, "members_start_own": 0.0, "members_end_own": 0.0,
         "annual_attrition_pct": 28.0,
         "shrinkage_pct": 32.0,
         "occupancy_pct": 85.0,
@@ -761,6 +773,7 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
     })
     assumptions = {
         "starting_hc": 0.0, "starting_hc_pt": 0.0,
+        "members_own": False, "members_start_own": 0.0, "members_end_own": 0.0,
         "annual_attrition_pct": 28.0, "shrinkage_pct": 32.0,
         "occupancy_pct": 85.0, "paid_hours_per_week": 40.0,
         "pt_hours_per_week": 40.0, "lab_productivity_pct": 50.0,
@@ -944,14 +957,26 @@ def nh_production_adds(weeks: list[str], nh: pd.DataFrame) -> np.ndarray:
     return adds
 
 
-def apply_global_members() -> None:
-    """Membership is org-wide: one start (actual) → year-end (forecast) spread,
-    shared by every LOB. Write it into each LOB's Members column so per-LOB CPM
-    is the only demand differentiator between lines of business.
+def _lob_owns_members(a: dict | None) -> bool:
+    """True when this LOB runs on ITS OWN membership base (user 2026-08-24:
+    "SMB has its own specific membership number") — the org-wide series and
+    the org-wide actuals then never touch its frame."""
+    return bool((a or {}).get("members_own"))
 
-    "Members (actual)" — the weekly measured membership — is org-wide too: it is
-    entered in one LOB's grid and mirrored into every LOB here, so the model
-    always sees ONE membership history."""
+
+def apply_global_members() -> None:
+    """Membership is org-wide BY DEFAULT: one start (actual) → year-end
+    (forecast) spread, shared by every LOB, so per-LOB CPM is the only demand
+    differentiator between lines of business.
+
+    A LOB can OPT OUT (`members_own`, 2026-08-24 — SMB runs on its own
+    business-membership count): its Members column spreads from its OWN
+    start/end, and its "Members (actual)" column is its own history — never
+    mirrored in, never mirrored out.
+
+    For sharing LOBs, "Members (actual)" — the weekly measured membership —
+    is org-wide too: entered in one LOB's grid and mirrored into every
+    sharing LOB here, so the model always sees ONE membership history."""
     n = st.session_state.n_weeks
     ms = float(st.session_state.get("members_start", 0.0) or 0.0)
     me = float(st.session_state.get("members_end", 0.0) or 0.0)
@@ -961,9 +986,16 @@ def apply_global_members() -> None:
         actual = np.full(n, np.nan)
     for d in st.session_state.lobs.values():
         dem = d["demand"]
-        if len(dem) == n:
-            dem["Members"] = members
-            dem["Members (actual)"] = actual
+        if len(dem) != n:
+            continue
+        a = d.get("assumptions") or {}
+        if _lob_owns_members(a):
+            dem["Members"] = np.round(np.linspace(
+                float(a.get("members_start_own", 0.0) or 0.0),
+                float(a.get("members_end_own", 0.0) or 0.0), n), 0)
+            continue                       # its actuals column stays ITS OWN
+        dem["Members"] = members
+        dem["Members (actual)"] = actual
     st.session_state["members_actual"] = actual
 
 
@@ -1735,7 +1767,10 @@ def measured_cpm(lob: str) -> tuple[float, int] | None:
         return None
     dem = lobs[lob]["demand"]
     weeks = dem["Week"].tolist()
-    _sess = st.session_state.get("members_actual")
+    # An own-base LOB measures against ITS OWN actual membership — the org
+    # series is the wrong denominator for it by definition.
+    _sess = (None if _lob_owns_members(lobs[lob].get("assumptions"))
+             else st.session_state.get("members_actual"))
     if _sess is not None and len(_sess) == len(weeks):
         m_act = pd.Series(np.asarray(_sess, dtype=float), index=dem.index)
     elif "Members (actual)" in dem.columns:
@@ -1782,8 +1817,11 @@ def cpm_weekly_actuals(lob: str) -> pd.DataFrame | None:
         return None
     # Org-wide series is the source of truth: the sidebar (which fits the trend
     # for the rollover panel) renders BEFORE apply_global_members() mirrors it
-    # into the demand frames, so reading session state avoids a stale-frame miss.
-    _sess = st.session_state.get("members_actual")
+    # into the demand frames, so reading session state avoids a stale-frame
+    # miss. An own-base LOB reads its OWN column instead — the org series is
+    # the wrong denominator for it by definition.
+    _sess = (None if _lob_owns_members(lobs[lob].get("assumptions"))
+             else st.session_state.get("members_actual"))
     if _sess is not None and len(_sess) == len(weeks):
         m = np.asarray(_sess, dtype=float)
     elif "Members (actual)" in dem.columns:
@@ -1993,6 +2031,10 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         # Ending FULL-TIME walk seeds the new year's FT count; the flat PT
         # count rides along unchanged in the assumptions copy.
         a["starting_hc"] = float(plan["Prod HC — FT"].iloc[-1])
+        if _lob_owns_members(a):
+            # Same carry rule as the org-wide pair: year-end becomes the new
+            # start, and the planner enters the new year-end target.
+            a["members_start_own"] = float(a.get("members_end_own", 0.0) or 0.0)
         new_lobs[name] = {
             "demand": new_dem, "roster": new_ros,
             "nh": pd.DataFrame(nh_rows, columns=list(nh.columns)),
@@ -3882,6 +3924,26 @@ with st.sidebar:
                      "as the plan's 'PT Discount' row). Set it EQUAL to paid "
                      "hours/week and part-timers count as whole FTE. "
                      "Production HC stays in PEOPLE either way.")
+            a["members_own"] = st.checkbox(
+                "Own membership base", value=bool(a.get("members_own")),
+                disabled=RO, key=f"as_mown_{view}",
+                help="ON: this line's demand runs on ITS OWN membership count "
+                     "(e.g. business members), entered below — the org-wide "
+                     "Members series no longer applies to it, and its weekly "
+                     "**Members (actual)** entries stay its own instead of "
+                     "being mirrored org-wide. Measured CPM divides by this "
+                     "base too. OFF: the org-wide membership drives this "
+                     "line, like every other.")
+            if a.get("members_own"):
+                a["members_start_own"] = st.number_input(
+                    "Members — start (own base)", 0.0, 50_000_000.0,
+                    float(a.get("members_start_own", 0.0) or 0.0), 100.0,
+                    disabled=RO, key=f"as_mos_{view}")
+                a["members_end_own"] = st.number_input(
+                    "Members — year-end forecast (own base)", 0.0,
+                    50_000_000.0,
+                    float(a.get("members_end_own", 0.0) or 0.0), 100.0,
+                    disabled=RO, key=f"as_moe_{view}")
             a["ramp_weeks"] = st.number_input(
                 "NH ramp — weeks to full productivity", 0, 26,
                 int(a.get("ramp_weeks", 0) or 0), 1, disabled=RO, key=f"as_rampw_{view}",
@@ -4125,9 +4187,15 @@ def _model_members(lob: str | None, weeks) -> np.ndarray | None:
     the aggregate measured_cpm() does) is what makes a per-week CPM readable
     today: no team has entered actual membership yet, and a column that is
     blank in every row teaches nobody anything. Membership is org-wide, so any
-    LOB's frame answers for all of them — that is what apply_global_members
-    guarantees — which is also why the consolidated view can use the first."""
+    SHARING LOB's frame answers for all of them — that is what
+    apply_global_members guarantees — which is why the consolidated view can
+    use the first. Once any LOB owns its own base that stops being true, so
+    the consolidated readout is OMITTED rather than divided by the wrong
+    denominator (honest omission over a silent guess)."""
     lobs = st.session_state.get("lobs") or {}
+    if lob is None and any(_lob_owns_members(v.get("assumptions"))
+                           for v in lobs.values()):
+        return None
     d = lobs.get(lob) if lob else next(iter(lobs.values()), None)
     if d is None:
         return None
@@ -5576,7 +5644,9 @@ def _member_variant_payload(me_new: float) -> dict:
     members = np.round(np.linspace(ms, float(me_new), n), 0)
     lobs = _payload_lobs(p)
     for d in lobs.values():
-        if len(d["demand"]) == n:
+        # An own-base LOB is untouched by an ORG-membership what-if — its
+        # demand runs on its own count, which this scenario does not vary.
+        if len(d["demand"]) == n and not _lob_owns_members(d.get("assumptions")):
             d["demand"]["Members"] = members
     p["members_end"] = float(me_new)
     p["lobs"] = {lob: {"demand": d["demand"].to_json(orient="split"),
@@ -6449,7 +6519,11 @@ else:
             # direction: step changes fill, bounded events do not.
             cpm_filled = any([forward_fill_step(prev_demand, edited_demand, c)
                               for c in ("CPM", "AHT (sec)", "Shrinkage %")])
-            members_changed = capture_members_actual(edited_demand)
+            # An own-base LOB's actual-membership entries are ITS OWN history
+            # — capturing them here would overwrite the org-wide series with
+            # (e.g.) business-member counts for every sharing line.
+            members_changed = (False if _lob_owns_members(lob.get("assumptions"))
+                               else capture_members_actual(edited_demand))
             lob["demand"] = edited_demand
             if cpm_filled or members_changed:
                 st.rerun()  # redraw: carried-forward CPM, and actuals mirrored org-wide
