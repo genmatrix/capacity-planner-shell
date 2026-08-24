@@ -541,6 +541,24 @@ def _startup_draft_check():
         collab.async_cancel(src)      # a queued write must not resurrect it
         src.unlink(missing_ok=True)   # everything was published — clean up
         return
+    # The string compare assumes draft and snapshot were written by the SAME
+    # code. Right after an app update that is exactly false: loading MIGRATES
+    # the plan (new assumption keys, normalized dtypes), the autosave writes
+    # the migrated form, and the draft can never byte-match an active file
+    # published by the older code — so every boot and year switch offered
+    # "unsaved changes" nobody typed, and Discard could not stick because the
+    # next autosave recreated the mismatch (field report 2026-08-24: "that
+    # prompt keeps popping back up"). diff_payloads runs BOTH sides through
+    # the one migration path with float/blank-tolerant cells: zero rows means
+    # nothing a planner typed differs, however different the bytes are.
+    try:
+        _base = snap if snap is not None else _serialize_lobs()
+        if not diff_payloads(_base, payload):
+            collab.async_cancel(src)
+            src.unlink(missing_ok=True)
+            return
+    except Exception:
+        pass       # a malformed draft still gets OFFERED — never crash a boot
     # Park the offered work in its OWN file before anything else can touch it
     # (fixed 2026-08-03). Previously this left the payload in memory only: the
     # session goes on to load the ACTIVE plan, and the first autosave wrote
