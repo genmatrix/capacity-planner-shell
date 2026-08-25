@@ -4809,9 +4809,15 @@ def render_executive_view():
         heat = alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
             y=alt.Y("LOB:N", sort=lobs, title=None),
+            # THREE-point domain to match the three-colour range — one pivot
+            # per colour, so the neutral sits at exactly 0 in both the cells
+            # AND the legend gradient. A two-point domain with a three-colour
+            # range (the first cut) leaves Vega to guess the midpoint, and
+            # the legend and the cells guessed differently ("doesn't match
+            # the legend", 2026-08-25).
             color=alt.Color("Short %:Q",
-                            scale=alt.Scale(domainMid=0,
-                                            domain=[-HEAT_CAP_PCT, HEAT_CAP_PCT],
+                            scale=alt.Scale(domain=[-HEAT_CAP_PCT, 0,
+                                                    HEAT_CAP_PCT],
                                             clamp=True,
                                             range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
                             legend=alt.Legend(title="Net ÷ Required %")),
