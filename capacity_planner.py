@@ -505,15 +505,70 @@ def _autosave_draft():
         st.session_state["_draft_dir_ready"] = False
 
 
+def _payload_year_mismatch(p: dict) -> int | None:
+    """The year a payload's frames are actually anchored to, when that
+    disagrees with the year the payload CLAIMS — None when coherent, or when
+    there is nothing to judge (unjudgeable is not evidence of mislabeling).
+
+    Why the label cannot be trusted (found 2026-08-25, via the Hiring Advisor
+    "recommending 2026 classes" inside the 2027 plan): before the 2026-08-10
+    year-switch fix, switching to an unpublished year kept the OLD year's
+    frames on screen, and the autosave wrote them into the NEW year's draft
+    file — a payload that says plan_year 2027 carrying 2026's weeks. The fix
+    stopped the creation; the files written during that window survive on
+    shares, and every loader trusted their label. The frames' own first week
+    is the ground truth: every plan this app writes starts at week 1 of its
+    year (the Monday of the week containing Jan 1)."""
+    try:
+        claimed = int(p.get("plan_year", DEFAULT_PLAN_YEAR) or DEFAULT_PLAN_YEAR)
+        first = next(iter((p.get("lobs") or {}).values()), None)
+        if not first:
+            return None
+        dem = pd.read_json(StringIO(first["demand"]), orient="split")
+        wk0 = date.fromisoformat(str(dem["Week"].iloc[0]))
+    except Exception:
+        return None
+    if wk0 == week_starts(1, claimed)[0]:
+        return None
+    # A week-1 Monday always has Jan 1 within its 7 days, so the year the
+    # frames belong to is the year six days in. A first week that is not any
+    # year's week 1 (hand-edited file) is not this bug class — leave it alone.
+    anchor = (wk0 + timedelta(days=6)).year
+    return anchor if (anchor != claimed
+                      and wk0 == week_starts(1, anchor)[0]) else None
+
+
 def _read_draft(src: Path) -> dict | None:
     """One reader for draft files. A missing or half-written draft must never
     take the app down — the share can vanish mid-read. Drains the background
-    writer first, so a read can never race the write it is looking for."""
+    writer first, so a read can never race the write it is looking for.
+
+    A draft whose plan_year label disagrees with its frames' own weeks is
+    QUARANTINED — set aside as `<name>.mislabeled-<stamp>` (evidence
+    preserved, same pattern as the corrupt edit.lock) and never loaded or
+    offered: loading it re-creates the fixed 2026-08-10 switch bug on every
+    visit, and the year's real plan is never in it (see
+    _payload_year_mismatch). A draft too malformed to JUDGE still comes back
+    as-is — _startup_draft_check deliberately offers those."""
     collab.async_flush()
     try:
-        return json.loads(src.read_text(encoding="utf-8"))
+        d = json.loads(src.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    wrong = _payload_year_mismatch(d.get("payload") or {})
+    if wrong is not None:
+        claimed = (d.get("payload") or {}).get("plan_year")
+        try:
+            collab.async_cancel(src)   # a queued write must not resurrect it
+            dest = src.with_name(
+                src.name + f".mislabeled-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+            os.replace(src, dest)
+            fname = dest.name
+        except OSError:
+            fname = src.name           # couldn't set it aside; still refuse it
+        st.session_state["_mislabeled_draft"] = (fname, claimed, wrong)
+        return None
+    return d
 
 
 def _startup_draft_check():
@@ -668,12 +723,21 @@ def _switch_year(year: int) -> None:
 
 
 def _load_active_into_session():
-    """Point the working plan at the current shared active version (if any)."""
+    """Point the working plan at the current shared active version (if any).
+
+    A published version whose frames disagree with its plan_year label still
+    LOADS — it is the team's shared truth and refusing the pointer would
+    strand the year — but the rail warns loudly (see _payload_year_mismatch;
+    publish now refuses to mint one, so the repair is re-roll + republish)."""
+    st.session_state["_mislabeled_active"] = None
     act = collab.read_active(SCENARIO_DIR, _plan_year())
     snap = _cached_snapshot(str(SCENARIO_DIR), act["file"]) if act else None
     if snap:
         _apply_payload(snap)
         st.session_state.loaded_version = act["version"]
+        _wrong = _payload_year_mismatch(snap)
+        if _wrong is not None:
+            st.session_state["_mislabeled_active"] = (act["version"], _wrong)
         return True
     return False
 
@@ -3378,15 +3442,26 @@ def render_publish_panel(mode: str):
         c1, c2 = st.columns(2)
         for label, col, release in [("Publish", c1, False), ("Publish & release", c2, True)]:
             if col.button(label, width="stretch", key=f"pub_{label}"):
+                _pl = _serialize_lobs()
+                _wrong_yr = _payload_year_mismatch(_pl)
                 if not (note or "").strip():
                     st.error("Add a one-line note on what changed — it is the "
                              "'why' column of the Change log, and nothing else "
                              "can supply it.")
+                elif _wrong_yr is not None:
+                    # Closes the creation end of the mislabel bug class for
+                    # good: a payload like this is how "2026 recommendations
+                    # inside the 2027 plan" happened (2026-08-25).
+                    st.error(f"Refusing to publish: this plan says "
+                             f"{_plan_year()} but its weeks are dated for "
+                             f"{_wrong_yr}. That happens when a session was "
+                             f"moved to a year without its frames — re-roll "
+                             f"the year (or reload it) and try again.")
                 elif not collab.holds_lock(SCENARIO_DIR, _plan_year(), user,
                                            st.session_state.get(f"lock_token_{_plan_year()}")):
                     st.error("You no longer hold edit control — can't publish.")
                 else:
-                    meta, _ = collab.publish(SCENARIO_DIR, _serialize_lobs(),
+                    meta, _ = collab.publish(SCENARIO_DIR, _pl,
                                              name, user, parent, note)
                     st.session_state.loaded_version = meta["version"]
                     if release:
@@ -3455,12 +3530,21 @@ def render_publish_panel(mode: str):
                 j = collab.load_snapshot(SCENARIO_DIR, j["_file"]) or j
                 payload = {k: j[k] for k in ("n_weeks", "members_start", "members_end", "lobs")}
                 payload["plan_year"] = j.get("plan_year", DEFAULT_PLAN_YEAR)
-                meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
-                                         user, st.session_state.get("loaded_version"),
-                                         note=f"restored from v{j['version']}")
-                _apply_payload(meta)
-                st.session_state.loaded_version = meta["version"]
-                st.rerun()
+                _wrong_yr = _payload_year_mismatch(payload)
+                if _wrong_yr is not None:
+                    # Same gate as Publish: restoring would republish another
+                    # year's numbers under this year's name (2026-08-25).
+                    st.error(f"v{j['version']} says {payload['plan_year']} but "
+                             f"its weeks are dated for {_wrong_yr} — restoring "
+                             f"it would republish the wrong year's numbers. "
+                             f"Open it in Sandbox to inspect instead.")
+                else:
+                    meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
+                                             user, st.session_state.get("loaded_version"),
+                                             note=f"restored from v{j['version']}")
+                    _apply_payload(meta)
+                    st.session_state.loaded_version = meta["version"]
+                    st.rerun()
 
     with st.expander("How the team plan works"):
         st.markdown(
@@ -3609,6 +3693,25 @@ with st.container(key="ccnav"):
 with st.sidebar:
     st.title("Capacity Planner")
     st.divider()
+
+    # Mislabeled-payload surfaces (2026-08-25): quarantines are a caption
+    # (informational — nothing current was touched), a mislabeled PUBLISHED
+    # version is a warning (the numbers on screen belong to another year).
+    if st.session_state.get("_mislabeled_draft"):
+        _mf, _mcl, _man = st.session_state["_mislabeled_draft"]
+        st.caption(
+            f"⚠️ A saved draft said **{_mcl}** but carried **{_man}**'s weeks — "
+            f"left over from a year-switch bug fixed 2026-08-10. It was set "
+            f"aside as `{_mf}` and not loaded; {_man}'s own plan is unaffected.")
+    if st.session_state.get("_mislabeled_active"):
+        _mv, _man2 = st.session_state["_mislabeled_active"]
+        st.warning(
+            f"The published **v{_mv}** for {_plan_year()} carries weeks dated "
+            f"for **{_man2}** — it was published by a session hit by the "
+            f"year-switch bug fixed 2026-08-10, so its numbers are {_man2}'s. "
+            f"Re-roll the year (or rebuild its inputs) and publish a corrected "
+            f"version; publishing now refuses mislabeled plans, so this cannot "
+            f"recur.")
 
     if st.session_state.get("_draft_pending"):
         _d = st.session_state["_draft_pending"]
