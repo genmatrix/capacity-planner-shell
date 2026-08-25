@@ -4778,33 +4778,56 @@ def render_executive_view():
     # ---- heatmap: who is short, and when ------------------------------
     with brand.section("heat", "Net FTE heat — who & when"):
         hm_long = pd.concat([
-            pd.DataFrame({"Week": weeks, "LOB": l, "Net FTE": p["Net FTE"]})
+            pd.DataFrame({"Week": weeks, "LOB": l, "Net FTE": p["Net FTE"],
+                          "Required": p["Required FTE"]})
             for l, p in plans.items()])
+        # Colour is RELATIVE depth — Net ÷ Required — not absolute FTE
+        # (user 2026-08-25: with the largest line at -80, "all the other
+        # smaller groups with -6 don't look so bad even though that's pretty
+        # deep for them"). One absolute scale let the largest line flatten
+        # everyone else's shading; -6 on a 20-FTE requirement is a deeper
+        # hole than -80 on 208. The NUMBERS in the cells stay absolute Net
+        # FTE — colour answers "how deep for THEM", the label "how many
+        # people". ±HEAT_CAP_PCT saturates the ramp (clamped), so a sliver
+        # line's noise cannot blow the scale out either; Required 0 (a blank
+        # line) shades neutral rather than inventing a coverage ratio.
+        _hr = hm_long["Required"].to_numpy(dtype=float)
+        _hn = hm_long["Net FTE"].to_numpy(dtype=float)
+        HEAT_CAP_PCT = 40.0
+        hm_long["Short %"] = np.where(_hr > 0, _hn / np.where(_hr > 0, _hr, 1.0)
+                                      * 100, 0.0)
         # Numbers IN the cells, so the grid reads without hovering every one
         # (user ask 2026-08-03). A toggle rather than always-on: at a 52-week
         # horizon the cells are ~15px wide and 3-character labels crowd, which
         # is a fair trade for some planners and not for others.
         show_n = st.checkbox("Show numbers", value=True, key="heat_labels",
                              help="Print each week's Net FTE in the cell. Turn "
-                                  "off if a full-year horizon looks crowded.")
+                                  "off if a full-year horizon looks crowded. "
+                                  "Cell colour shades by Net ÷ Required, so a "
+                                  "small team's shortfall reads as deep as it "
+                                  "is for them.")
         heat = alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
             y=alt.Y("LOB:N", sort=lobs, title=None),
-            color=alt.Color("Net FTE:Q",
+            color=alt.Color("Short %:Q",
                             scale=alt.Scale(domainMid=0,
+                                            domain=[-HEAT_CAP_PCT, HEAT_CAP_PCT],
+                                            clamp=True,
                                             range=[brand.SHORT, brand.NEUTRAL, brand.COVERED]),
-                            legend=alt.Legend(title="Net FTE")),
-            tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f")])
+                            legend=alt.Legend(title="Net ÷ Required %")),
+            tooltip=["LOB", "Week", alt.Tooltip("Net FTE:Q", format="+.1f"),
+                     alt.Tooltip("Short %:Q", format="+.0f")])
         if show_n:
             # Ink on the pale middle, white on the saturated ends — no single
             # colour clears both (white on NEUTRAL is 1.2:1, ink on SHORT is
             # 2.0:1). The switch points are COMPUTED, not eyeballed: walking
             # the diverging ramp, white overtakes ink at 62% toward SHORT and
             # 83% toward COVERED. Different per side because the two endpoints
-            # differ in lightness, so one threshold would misjudge one of them.
-            _mx = float(np.nanmax(np.abs(hm_long["Net FTE"].to_numpy())) or 0.0) or 1.0
-            _dark = (f"datum['Net FTE'] <= {-0.62 * _mx} || "
-                     f"datum['Net FTE'] >= {0.83 * _mx}")
+            # differ in lightness, so one threshold would misjudge one of
+            # them. Thresholds sit on the COLOUR field's scale — Short %,
+            # capped — not on the FTE the label prints.
+            _dark = (f"datum['Short %'] <= {-0.62 * HEAT_CAP_PCT} || "
+                     f"datum['Short %'] >= {0.83 * HEAT_CAP_PCT}")
             heat = heat + alt.Chart(hm_long).mark_text(
                 fontSize=9, fontWeight=500).encode(
                 x=alt.X("Week:O", sort=None, axis=_month_axis()),
