@@ -3562,8 +3562,13 @@ ALL_PAGES = ["Executive View", "Capacity Plan", "Hiring Advisor",
 # CP_SHOW_ALL_PAGES=1 unhides everything. `hiring_cadence_check.py` drives the
 # real page through the nav radio, and a hidden feature whose proof was deleted
 # is a feature that rots quietly until the day you try to bring it back.
+#
+# Hiring Advisor REVIVED 2026-08-25 (user decision — the phased rollout
+# reached its phase). The set stays as the mechanism for any future hide;
+# the check that kept the page proven while hidden ran green the whole time,
+# which is exactly why revival is one line.
 HIDDEN_PAGES = (frozenset() if os.environ.get("CP_SHOW_ALL_PAGES")
-                else frozenset({"Hiring Advisor"}))
+                else frozenset())
 
 PAGES = [p for p in ALL_PAGES if p not in HIDDEN_PAGES]
 
@@ -6174,6 +6179,16 @@ def render_advisor_page(ro: bool):
         "every week green — accounting for training + coaching lead time, stage "
         "attrition, and the ramp (a class is sized so even week-one grads cover "
         "the hole). Apply buttons only touch the working plan.")
+    # The engine grew two supply inputs while this page was hidden — the
+    # solver sizes against the Net FTE they produce, but two judgment calls
+    # stay with the planner, so say them here rather than let them surprise.
+    st.caption(
+        "ℹ️ Two things the solver deliberately leaves to you: a shortfall "
+        "caused by **Mentors** weeks is a bounded coaching window — cover it "
+        "with an interim, not a permanent class. And if a recommended class "
+        "will also be typed into **NH Lab HC** while nesting, remember the "
+        "lab column already adds partial capacity for those weeks — sizing "
+        "was computed without it, so keep the two in view together.")
     lobs = st.session_state.lobs
     names = list(lobs)
     donor = st.selectbox(
