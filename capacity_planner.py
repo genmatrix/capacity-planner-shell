@@ -2024,14 +2024,29 @@ def project_cpm(trend: dict, n_weeks: int) -> np.ndarray:
 ATTR_MIN_WEEKS = 8   # below this, annualizing a few weeks is noise, not signal
 
 
-def _weeks_passed(weeks: list[str]) -> np.ndarray:
+def _today() -> date:
+    """The ONE clock read. `CP_TODAY=YYYY-MM-DD` overrides it — a test hook
+    (2026-09-04), because the Hiring Advisor now plans from today and its
+    hand-predicted fixtures would otherwise change answer every week."""
+    env = os.environ.get("CP_TODAY")
+    return date.fromisoformat(env) if env else date.today()
+
+
+def _weeks_passed(weeks: list[str], today: date | None = None) -> np.ndarray:
     """True for plan weeks that have fully elapsed (their Sunday is behind
     today) — the boundary where forecast becomes history. Deliberately makes
     compute_plan clock-dependent: hindcasting past weeks on facts is the
     point (Members (actual) does the same via entered data)."""
-    today = date.today()
+    today = today or _today()
     return np.array([date.fromisoformat(w) + timedelta(days=7) <= today
                      for w in weeks], dtype=bool)
+
+
+def _first_future(weeks: list[str], today: date | None = None) -> int:
+    """Index of the first week that has NOT elapsed — the earliest week any
+    plan can still act on. len(weeks) when the whole horizon is history."""
+    passed = _weeks_passed(weeks, today)
+    return int(np.argmax(~passed)) if (~passed).any() else len(weeks)
 
 
 def measured_attrition_pct(lob_data: dict, line: str = "ft") -> tuple[float, int] | None:
@@ -2195,7 +2210,7 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
 # ----------------------------------------------------------------------
 # Hiring Advisor — greedy solvers over compute_plan
 # ----------------------------------------------------------------------
-def recommend_classes(lob_data: dict, template: dict
+def recommend_classes(lob_data: dict, template: dict, today: date | None = None
                       ) -> tuple[list[dict], list[dict]]:
     """Greedy class plan: find the first red week, back a class start up by the
     pipeline lead time (training + coaching), size it net of stage attrition
@@ -2226,10 +2241,18 @@ def recommend_classes(lob_data: dict, template: dict
     calendar. Class size limits come from `class_max_size` (per-LOB, default
     12) with `class_min_size` clamped under it.
 
+    Plans from TODAY (2026-09-04, user: "the hiring advisor suggests classes
+    for dates that have already passed"): no start is ever placed in an
+    elapsed week, so a red week whose class would have had to start already
+    is reported why="lead" — the lead time now runs from today, not from
+    week 1 — and a red week that has itself elapsed is why="past": history
+    the page names, never something to cover.
+
     Returns (recommended class rows, uncoverable shortfalls). Uncoverable
     entries carry why="lead" (inside the pipeline lead time), why="cadence"
-    (no calendar-legal start lands grads in time), or why="min" (need too
-    small for a cohort); all need interims or OT."""
+    (no calendar-legal start lands grads in time), why="min" (need too
+    small for a cohort), or why="past" (already happened); the first three
+    need interims or OT."""
     work = {"demand": lob_data["demand"], "roster": lob_data["roster"],
             "nh": lob_data["nh"].copy(), "assumptions": dict(lob_data["assumptions"])}
     a = work["assumptions"]
@@ -2271,7 +2294,13 @@ def recommend_classes(lob_data: dict, template: dict
         return True
 
     recs, uncoverable = [], []
-    scan_from = 0
+    earliest = _first_future(weeks, today)   # no class starts in the past
+    net0 = compute_plan(work)["Net FTE"].to_numpy()
+    for i in range(min(earliest, len(net0))):
+        if net0[i] < -0.05:
+            uncoverable.append({"week": weeks[i], "short": round(float(-net0[i]), 1),
+                                "why": "past"})
+    scan_from = earliest
     for _ in range(60):                 # backstop, not a real bound
         net = compute_plan(work)["Net FTE"].to_numpy()
         red = [i for i in range(scan_from, len(net)) if net[i] < -0.05]
@@ -2279,7 +2308,7 @@ def recommend_classes(lob_data: dict, template: dict
             break
         i = red[0]
         s = i - lead                    # latest start whose grads land by week i
-        if s < 0:
+        if s < earliest:
             uncoverable.append({"week": weeks[i], "short": round(float(-net[i]), 1),
                                 "why": "lead"})
             scan_from = i + 1
@@ -2336,20 +2365,26 @@ def recommend_classes(lob_data: dict, template: dict
     return recs, uncoverable
 
 
-def shortfall_windows(lob_data: dict) -> list[dict]:
+def shortfall_windows(lob_data: dict, today: date | None = None) -> list[dict]:
     """Contiguous red-week windows for one LOB: start/end, deepest shortfall,
     whole-agent cover size, and whether the window overlaps LOA weeks (the
-    'someone went out — do we need an interim?' case)."""
+    'someone went out — do we need an interim?' case).
+
+    Future weeks only (2026-09-04): an interim cannot be booked for a week
+    that has passed, so a window is clipped to start at the first future
+    week and one entirely in the past is not a window at all. The page
+    counts elapsed short weeks separately, as history."""
     plan = compute_plan(lob_data)
     net = plan["Net FTE"].to_numpy()
     weeks = plan["Week"].tolist()
+    earliest = _first_future(weeks, today)
     loa = pd.to_numeric(lob_data["roster"]["LOA"], errors="coerce").fillna(0).to_numpy()
     a = lob_data["assumptions"]
     # An arriving interim ramps on this line — size the pull so even week-one
     # (starting-productivity) coverage fills the hole.
     t_prod0 = (float(a.get("transfer_ramp_start_pct", 75.0)) / 100
                if int(a.get("transfer_ramp_weeks", 2) or 0) > 0 else 1.0)
-    out, i = [], 0
+    out, i = [], earliest
     while i < len(net):
         if net[i] < -0.05:
             j = i
@@ -6440,9 +6475,17 @@ def render_advisor_page(ro: bool):
     # ---- interims for the specialty queues -----------------------------
     st.subheader("Interim coverage — specialty queues")
     any_short = False
+    _past_short = []
     for name in names:
         if name == donor:
             continue
+        # Elapsed short weeks are history — named, never proposed for an
+        # interim (user 2026-09-04: "interims for dates that already passed").
+        _pl = compute_plan(lobs[name])
+        _n_past = int(((_pl["Net FTE"].to_numpy() < -0.05)
+                       & _weeks_passed(_pl["Week"].tolist())).sum())
+        if _n_past:
+            _past_short.append(f"{name} ({_n_past})")
         for w, win in enumerate(shortfall_windows(lobs[name])):
             any_short = True
             tag = " · overlaps LOA" if win["loa_linked"] else ""
@@ -6462,7 +6505,10 @@ def render_advisor_page(ro: bool):
                 apply_interim(name, donor, win["start_i"], win["end_i"], win["agents"])
                 st.rerun()
     if not any_short:
-        st.caption("No specialty shortfalls — nothing to cover.")
+        st.caption("No upcoming specialty shortfalls — nothing to cover.")
+    if _past_short:
+        st.caption("Short weeks already elapsed — history, not planned here: "
+                   + ", ".join(_past_short) + ".")
 
     # ---- class plan for the donor LOB -----------------------------------
     st.subheader(f"New-hire class plan — {donor}")
@@ -6508,9 +6554,13 @@ def render_advisor_page(ro: bool):
     lead_u = [u for u in uncoverable if u.get("why") == "lead"]
     cad_u = [u for u in uncoverable if u.get("why") == "cadence"]
     min_u = [u for u in uncoverable if u.get("why") == "min"]
+    past_u = [u for u in uncoverable if u.get("why") == "past"]
+    if past_u:
+        st.caption(f"{len(past_u)} short week(s) already elapsed — history, not "
+                   "planned here (classes are only recommended from this week on).")
     if lead_u:
-        st.warning("Shortfalls **inside the pipeline lead time** — no class can "
-                   "reach them; cover with interims/OT: "
+        st.warning("Shortfalls **inside the pipeline lead time from today** — a "
+                   "class would have had to start already; cover with interims/OT: "
                    + ", ".join(f"{u['week'][5:]} ({u['short']} FTE)"
                                for u in lead_u))
     if cad_u:
@@ -6548,7 +6598,7 @@ def render_advisor_page(ro: bool):
                        "Capacity Plan page, then publish.")
             st.rerun()
     else:
-        st.caption(f"{donor} stays green all horizon — no classes needed.")
+        st.caption(f"{donor} stays green for the rest of the horizon — no classes needed.")
 
 
 CHANGELOG_MAX_VERSIONS = 25   # newest N; anything dropped is NAMED, never silent
