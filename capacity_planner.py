@@ -157,6 +157,17 @@ def _payload_lobs(p: dict) -> dict:
             ros["Mentors"] = 0.0
         if "NH Lab HC" not in ros.columns:            # pre-coaching-lab plans
             ros["NH Lab HC"] = 0.0
+        # Part-time became a WALK 2026-09-04 (user: "I need part time
+        # attrition so that it affects them differently for actuals ... when
+        # we hire new part time people, how can I add that mid-year?").
+        # Seeded inert: no hires, no recorded departures, rate 0 → the line
+        # is exactly the flat count it was.
+        if "PT Hires +/-" not in ros.columns:
+            ros["PT Hires +/-"] = 0.0
+        if "PT Attrition (actual)" not in ros.columns:
+            ros["PT Attrition (actual)"] = np.nan
+        if "annual_attrition_pct_pt" not in _as:
+            _as["annual_attrition_pct_pt"] = 0.0
         _nh = pd.read_json(StringIO(d["nh"]), orient="split")
         if "Actual Grads" not in _nh.columns:         # pre-actualized-grads plans
             _nh["Actual Grads"] = np.nan
@@ -202,6 +213,7 @@ ASSUMPTION_LABELS = {
     "members_start_own": "Members start (own base)",
     "members_end_own": "Members year-end (own base)",
     "annual_attrition_pct": "Attrition %/yr",
+    "annual_attrition_pct_pt": "Attrition %/yr — part-time",
     # Vestigial for a migrated plan — the weekly column drives the engine —
     # but it still seeds a new plan and still drives a pre-column snapshot,
     # so a change to it is real and belongs in the audit trail.
@@ -792,6 +804,8 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
          "NH Lab HC": [0.0] * n_weeks,
          "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
+         "PT Hires +/-": [0.0] * n_weeks,
+         "PT Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [float(max(1, round(hc / 15)))] * n_weeks,
          "Leads/Project": [float(max(1, round(hc / 20)))] * n_weeks}
     )
@@ -809,6 +823,7 @@ def make_lob(n_weeks: int, seed: int, members0: float, cpm: float,
     assumptions = {
         "starting_hc": hc,          # full-time; PT is its own count below
         "starting_hc_pt": 0.0,
+        "annual_attrition_pct_pt": 0.0,
         "members_own": False, "members_start_own": 0.0, "members_end_own": 0.0,
         "annual_attrition_pct": 28.0,
         "shrinkage_pct": 32.0,
@@ -845,6 +860,8 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
         {"Week": weeks, "LOA": [0.0] * n_weeks, "Mentors": [0.0] * n_weeks,
          "NH Lab HC": [0.0] * n_weeks, "Transfers +/-": [0.0] * n_weeks,
          "Attrition (actual)": [np.nan] * n_weeks,
+         "PT Hires +/-": [0.0] * n_weeks,
+         "PT Attrition (actual)": [np.nan] * n_weeks,
          "Supervisors": [0.0] * n_weeks, "Leads/Project": [0.0] * n_weeks})
     nh = pd.DataFrame({
         "Class Start Week": pd.Series(dtype="object"),
@@ -854,7 +871,7 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
         "Actual Grads": pd.Series(dtype="float"),   # blank = use stage attrition
     })
     assumptions = {
-        "starting_hc": 0.0, "starting_hc_pt": 0.0,
+        "starting_hc": 0.0, "starting_hc_pt": 0.0, "annual_attrition_pct_pt": 0.0,
         "members_own": False, "members_start_own": 0.0, "members_end_own": 0.0,
         "annual_attrition_pct": 28.0, "shrinkage_pct": 32.0,
         "occupancy_pct": 85.0, "paid_hours_per_week": 40.0,
@@ -1402,7 +1419,33 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                         else prev * wk_attr_rate)
         prev = prev - attrition[i] + xfer_arr[i] + adds[i]
         hc_ft[i] = prev
-    pt_hc = float(a.get("starting_hc_pt", 0.0) or 0.0)
+    # Part-time is its OWN walk since 2026-09-04 (user: "I need part time
+    # attrition so that it affects them differently for actuals" and "when we
+    # hire new part time people ... I can't adjust the starting headcount if
+    # it's in the middle of the year"). Same shape as the FT walk, separately
+    # parameterised: its own rate (`annual_attrition_pct_pt`, default 0 — the
+    # 08-13 finding that part-time barely attrites still holds as the
+    # DEFAULT, it is just no longer hard-wired), its own recorded departures
+    # (`PT Attrition (actual)`, replaces the modelled figure that week; blank
+    # elapsed week = 0, like the FT rule), and `PT Hires +/-` for mid-year
+    # adds or reductions (a bounded event that lands in its week — no fill).
+    # Classes and transfers still land in FT: they are full-time hires.
+    wk_attr_rate_pt = float(a.get("annual_attrition_pct_pt", 0.0) or 0.0) / 100 / 52
+    pt_actual = (pd.to_numeric(roster["PT Attrition (actual)"], errors="coerce")
+                 .to_numpy(dtype=float)
+                 if "PT Attrition (actual)" in roster.columns else np.full(n, np.nan))
+    pt_actual = np.where(_weeks_passed(weeks) & np.isnan(pt_actual), 0.0, pt_actual)
+    pt_hires = (pd.to_numeric(roster["PT Hires +/-"], errors="coerce").fillna(0)
+                .to_numpy(dtype=float)
+                if "PT Hires +/-" in roster.columns else np.zeros(n))
+    pt_hc = np.zeros(n)
+    attrition_pt = np.zeros(n)
+    prev_pt = float(a.get("starting_hc_pt", 0.0) or 0.0)
+    for i in range(n):
+        attrition_pt[i] = (float(pt_actual[i]) if not np.isnan(pt_actual[i])
+                           else prev_pt * wk_attr_rate_pt)
+        prev_pt = prev_pt - attrition_pt[i] + pt_hires[i]
+        pt_hc[i] = prev_pt
     hc = hc_ft + pt_hc
 
     # NH ramp: grads count as bodies (hc, attrition) but deliver partial FTE
@@ -1459,7 +1502,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     _pt_hrs = float(a.get("pt_hours_per_week", _paid) or 0.0)
     _pt_ratio = min(1.0, _pt_hrs / _paid) if _paid > 0 else 1.0
     _available = hc - loa_arr - ment_arr
-    pt_discount = np.full(n, pt_hc * (1 - _pt_ratio))
+    pt_discount = pt_hc * (1 - _pt_ratio)
 
     # Coaching-lab new hires TAKE CALLS at partial productivity (user
     # 2026-08-13). Until now trainees were invisible until graduation, so the
@@ -1528,7 +1571,8 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             # comparison lines up without anyone re-deriving the convention.
             # Informational: nothing downstream reads it.
             "Production HC (start)": np.round(
-                np.concatenate(([float(a["starting_hc"] or 0) + pt_hc],
+                np.concatenate(([float(a["starting_hc"] or 0)
+                                 + float(a.get("starting_hc_pt", 0.0) or 0.0)],
                                 hc[:-1])), 1),
             # Real walks now, not a percentage split of the total: FT is the
             # attrition walk, PT is the flat typed count. FT gets BOTH
@@ -1541,7 +1585,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                 np.concatenate(([float(a["starting_hc"] or 0)],
                                 hc_ft[:-1])), 1),
             "Prod HC — FT": hc_ft.round(1),
-            "Prod HC — PT": np.full(n, round(pt_hc, 1)),
+            "Prod HC — PT": pt_hc.round(1),
             "Supervisors": sups,
             "Supervisor Ratios": np.round(sup_ratio, 1),
             "Leads/Project": leads,
@@ -1556,6 +1600,11 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             # this row invisible (2026-08-13). Echo of the roster input.
             "Transfers +/-": xfer_arr.round(1),
             "NH Grads": adds.round(1),
+            # The part-time walk's own terms, so PT (start − attrition +
+            # hires = end) is auditable from the same table as FT.
+            "Attrition — PT": attrition_pt.round(2),
+            "PT Attrition (actual)": np.round(pt_actual, 2),   # blank where modelled
+            "PT Hires +/-": pt_hires.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "PT Discount": np.round(pt_discount, 1),
             "NH Lab HC": lab_arr,
@@ -1985,26 +2034,32 @@ def _weeks_passed(weeks: list[str]) -> np.ndarray:
                      for w in weeks], dtype=bool)
 
 
-def measured_attrition_pct(lob_data: dict) -> tuple[float, int] | None:
+def measured_attrition_pct(lob_data: dict, line: str = "ft") -> tuple[float, int] | None:
     """(annualized %, weeks used) implied by the weeks where the planner entered
     an actual: Σ departures ÷ Σ headcount-at-risk × 52 × 100, against the same
     walking headcount the engine uses. None when nothing is entered.
+
+    `line` picks the walk: "ft" reads `Attrition (actual)` against the FT
+    walk, "pt" reads `PT Attrition (actual)` against the PT walk (2026-09-04).
+    Each line learns from its OWN departures over its OWN base — counting
+    the other line in the denominator would dilute the rate.
 
     Caller must respect ATTR_MIN_WEEKS: annualizing 1-2 weeks produces absurd
     figures (4 leavers out of 99 in one week annualizes to 210%). Same
     discipline as derive-seasonality, which refuses below 8 full weeks."""
     ros = lob_data["roster"]
-    if "Attrition (actual)" not in ros.columns:
+    col, row, start_key = (("PT Attrition (actual)", "Prod HC — PT", "starting_hc_pt")
+                           if line == "pt"
+                           else ("Attrition (actual)", "Prod HC — FT", "starting_hc"))
+    if col not in ros.columns:
         return None
-    act = pd.to_numeric(ros["Attrition (actual)"], errors="coerce").to_numpy(dtype=float)
+    act = pd.to_numeric(ros[col], errors="coerce").to_numpy(dtype=float)
     weeks_with = ~np.isnan(act)
     if not weeks_with.any():
         return None
-    # At-risk base is the FULL-TIME walk: part-timers sit outside attrition
-    # (2026-08-13), so counting them in the denominator would learn a rate
-    # diluted by people who never leave.
-    hc = compute_plan(lob_data)["Prod HC — FT"].to_numpy(dtype=float)
-    start_hc = np.concatenate(([float(lob_data["assumptions"]["starting_hc"])], hc[:-1]))
+    hc = compute_plan(lob_data)[row].to_numpy(dtype=float)
+    start_hc = np.concatenate(([float(lob_data["assumptions"].get(start_key, 0.0) or 0.0)],
+                               hc[:-1]))
     at_risk = start_hc[weeks_with].sum()
     if at_risk <= 0:
         return None
@@ -2076,6 +2131,8 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
             "Mentors": [0.0] * n,
             "Transfers +/-": [0.0] * n,
             "Attrition (actual)": [np.nan] * n,   # last year's departures are history
+            "PT Hires +/-": [0.0] * n,            # bounded events reset with Transfers
+            "PT Attrition (actual)": [np.nan] * n,
 
             "Supervisors": [last("Supervisors", ros)
                             if "Supervisors" in ros.columns else 0.0] * n,
@@ -2113,6 +2170,9 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         # Ending FULL-TIME walk seeds the new year's FT count; the flat PT
         # count rides along unchanged in the assumptions copy.
         a["starting_hc"] = float(plan["Prod HC — FT"].iloc[-1])
+        # PT walks too (2026-09-04): its ending count seeds the new year, the
+        # way the FT walk's does — identical to the old carry when inert.
+        a["starting_hc_pt"] = float(plan["Prod HC — PT"].iloc[-1])
         if _lob_owns_members(a):
             # Same carry rule as the org-wide pair: year-end becomes the new
             # start, and the planner enters the new year-end target.
@@ -3908,12 +3968,13 @@ with st.sidebar:
                 "Starting HC — part-time", 0.0, 2000.0,
                 float(a.get("starting_hc_pt", 0.0) or 0.0), 1.0, disabled=RO,
                 key=f"as_hcpt_{view}",
-                help="Part-time production agents, in PEOPLE — a typed count, "
-                     "not a percentage. Deliberately OUTSIDE the attrition "
-                     "walk (part-time attrition here is near zero); each "
-                     "contributes part-time hours ÷ paid hours of an FTE to "
-                     "Staffed. LOA and Mentors come out of the full-time "
-                     "line, not this one.")
+                help="Part-time production agents at week 1, in PEOPLE — a "
+                     "typed count, not a percentage. Walks on its own line: the "
+                     "part-time attrition rate below, **PT Attrition (actual)** "
+                     "and **PT Hires +/-** on the roster grid move it week by "
+                     "week. Each head contributes part-time hours ÷ paid hours "
+                     "of an FTE to Staffed. LOA and Mentors come out of the "
+                     "full-time line, not this one.")
             if float(a.get("starting_hc_pt", 0.0) or 0.0) > 0:
                 st.caption(f"Total starting HC: "
                            f"{float(a['starting_hc'] or 0) + float(a['starting_hc_pt'] or 0):,.0f} people")
@@ -3946,6 +4007,33 @@ with st.sidebar:
                                   f"actuals."):
                     a["annual_attrition_pct"] = round(float(_pct), 1)
                     st.session_state.pop(f"as_attr_{view}", None)   # let the widget re-seed
+                    st.rerun()
+            # Part-time has its own walk (2026-09-04). Default 0 keeps the
+            # 08-13 finding ("part-time barely ever has any attrition") as the
+            # starting assumption without hard-wiring it; recorded PT
+            # departures go in the roster's PT Attrition (actual) column.
+            a["annual_attrition_pct_pt"] = st.number_input(
+                "Annual attrition % — part-time", 0.0, 100.0,
+                float(a.get("annual_attrition_pct_pt", 0.0) or 0.0), 0.5,
+                disabled=RO, key=f"as_attrpt_{view}",
+                help="Applied to the part-time count only (rate ÷ 52 per week). "
+                     "0 = the part-time line only moves when you record a "
+                     "departure in **PT Attrition (actual)** or an add in "
+                     "**PT Hires +/-** on the roster grid.")
+            _meas_pt = measured_attrition_pct(st.session_state.lobs[view], line="pt")
+            if _meas_pt is not None:
+                _ppct, _pwks = _meas_pt
+                _penough = _pwks >= ATTR_MIN_WEEKS
+                st.caption(f"Part-time actual, annualized from **{_pwks}** week(s): "
+                           f"**{_ppct:.1f}%** · "
+                           f"{_ppct - float(a.get('annual_attrition_pct_pt', 0.0) or 0.0):+.1f} "
+                           f"pts vs assumption"
+                           + ("" if _penough else
+                              f" — ⚠️ too few weeks to trust (≥{ATTR_MIN_WEEKS})"))
+                if st.button("Adopt measured part-time attrition",
+                             disabled=RO or not _penough, key=f"adopt_attrpt_{view}"):
+                    a["annual_attrition_pct_pt"] = round(float(_ppct), 1)
+                    st.session_state.pop(f"as_attrpt_{view}", None)
                     st.rerun()
             # Shrinkage moved to a WEEKLY column (2026-08-11) because the team
             # trends it: "we keep the previous weeks with the old numbers and
@@ -4187,17 +4275,26 @@ _PLAN_ROW_FORMULAS = {
                             "(week 1: the entered full-time count)",
     "Prod HC — FT": "FT (start) − Attrition + Transfers +/- + NH Grads. "
                     "The walk is full-time only",
-    "Prod HC — PT": "The entered part-time count — flat; part-time never "
-                    "attrites",
+    "Prod HC — PT": "Previous week's Prod HC — PT − Attrition — PT + "
+                    "PT Hires +/- (week 1 starts from the entered part-time "
+                    "count). Its own walk since 2026-09-04",
+    "Attrition — PT": "PT Attrition (actual) where entered; blank FUTURE "
+                      "week = part-time Attrition %/yr ÷ 52 × PT "
+                      "start-of-week; blank ELAPSED week = 0",
+    "PT Attrition (actual)": "Roster entry: recorded part-time departures. "
+                             "0 means 'nobody left'; blank means 'use the "
+                             "part-time rate'",
+    "PT Hires +/-": "Roster entry: part-timers added (or cut) that week — "
+                    "lands in Prod HC — PT immediately, never fills forward",
     "Supervisors": "Roster entry (forward-fills)",
     "Supervisor Ratios": "Production HC ÷ Supervisors",
     "Leads/Project": "Roster entry (forward-fills)",
     "Leads/Project Ratios": "Production HC ÷ Leads/Project",
     "Support Staff": "Supervisors + Leads/Project",
     "Overall HC": "Production HC + Support Staff + NH Lab HC",
-    "Attrition": "Attrition (actual) where entered; blank FUTURE week = "
-                 "Attrition %/yr ÷ 52 × FT start-of-week; blank ELAPSED "
-                 "week = 0 (nobody left)",
+    "Attrition": "Full-time departures: Attrition (actual) where entered; "
+                 "blank FUTURE week = Attrition %/yr ÷ 52 × FT start-of-week; "
+                 "blank ELAPSED week = 0 (nobody left)",
     "Attrition (actual)": "Roster entry: recorded departures. 0 means "
                           "'nobody left'; blank means 'use the model'",
     "Transfers +/-": "Roster entry: agents moved between LOBs that week "
@@ -4393,6 +4490,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Prod HC — FT (start)", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
              "Attrition", "Attrition (actual)", "Transfers +/-", "NH Grads",
+             "Attrition — PT", "PT Attrition (actual)", "PT Hires +/-",
              "Ramp Discount",
              "PT Discount", "NH Lab HC", "Lab FTE",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
@@ -4982,7 +5080,7 @@ def render_executive_view():
         min_net = float(net.min())
         wi = int(net.to_numpy().argmin())
         cov = float((net >= 0).mean() * 100)
-        attr = float(p["Attrition"].sum())
+        attr = float(p["Attrition"].sum()) + float(p["Attrition — PT"].sum())
         grads = float(p["NH Grads"].sum())
         if avg_req <= 0:
             pill, tone = "No demand entered", ""
@@ -5011,7 +5109,9 @@ def render_executive_view():
         sup = pd.DataFrame({
             "Week": weeks,
             "NH Grads": sum(p["NH Grads"].to_numpy() for p in plans.values()),
-            "Attrition": -sum(p["Attrition"].to_numpy() for p in plans.values()),
+            # Departures are departures: FT walk + PT walk (2026-09-04).
+            "Attrition": -sum(p["Attrition"].to_numpy() + p["Attrition — PT"].to_numpy()
+                              for p in plans.values()),
         }).melt("Week", var_name="Flow", value_name="FTE")
         sup_chart = alt.Chart(sup).mark_bar(opacity=.9, cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
@@ -5516,7 +5616,14 @@ def weekly_checklist():
             continue
         blank = pd.to_numeric(ros["Attrition (actual)"],
                               errors="coerce").isna().to_numpy()
-        n_ass = int((_weeks_passed(ros["Week"].tolist()) & blank).sum())
+        _passed = _weeks_passed(ros["Week"].tolist())
+        n_ass = int((_passed & blank).sum())
+        # The PT walk only GUESSES when it has a rate to guess with: at the
+        # default 0, blank-elapsed = 0 is the model too, so nothing is hidden.
+        if (float(d["assumptions"].get("annual_attrition_pct_pt", 0.0) or 0.0) > 0
+                and "PT Attrition (actual)" in ros.columns):
+            n_ass += int((_passed & pd.to_numeric(ros["PT Attrition (actual)"],
+                                                  errors="coerce").isna().to_numpy()).sum())
         if n_ass:
             assumed.append(f"{l} ({n_ass})")
     if assumed:
@@ -5698,6 +5805,7 @@ BUDGET_DRIVER_COLS = [("demand", "CPM"), ("demand", "AHT (sec)"),
                       ("demand", "Shrinkage %"),
                       ("demand", "Seasonality"), ("demand", "Members"),
                       ("roster", "LOA"), ("roster", "Mentors"),
+                      ("roster", "PT Hires +/-"),
                       ("roster", "Supervisors"), ("roster", "Leads/Project")]
 
 
@@ -6780,11 +6888,14 @@ else:
                 "but deliver no capacity, the same way LOA does) — net transfers in/out, "
                 "**Attrition (actual)** — people who actually left that week (blank = "
                 "use the modelled rate; a filled cell **replaces** it, so past weeks "
-                "become truth and the walk self-corrects) — and support staff. "
+                "become truth and the walk self-corrects) — **PT Hires +/-** and "
+                "**PT Attrition (actual)** for the part-time line (it walks on its "
+                "own: hires land the week you enter them, recorded departures "
+                "replace the part-time rate for that week) — and support staff. "
                 "**LOA, Supervisors and Leads/Project carry forward** "
                 "from the week you edit until you edit a later week (a sup added in Q3 "
-                "is entered once). **Mentors and Transfers do not carry forward** — "
-                "both are bounded events, so you enter the weeks they actually cover "
+                "is entered once). **Mentors, Transfers and PT Hires do not carry "
+                "forward** — they are bounded events, so you enter the weeks they actually cover "
                 "and nothing runs on past them. Support staff are informational — the "
                 "plan computes their ratio rows against walking agent headcount; they "
                 "never affect Net FTE.")
