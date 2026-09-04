@@ -1,9 +1,8 @@
 # Tested versions, pinned deliberately — not the newest available.
 #
-# Requires Python 3.11.4 or newer, and numpy is what sets that floor: 2.5.x
-# publishes no cp311 wheel, so pinning it makes `pip install -r` fail on Python
-# 3.11 before the app is ever reached. 2.4.6 is the newest numpy with a cp311
-# build. Verified on 3.11 and on 3.14.
+# Work runs Python 3.14 (approved 2026-09-04); verified on 3.14.5. The numpy
+# pin dates from when 3.11 was the floor (2.4.6 was the last cp311 build) —
+# it may be raised, but only after the full check suite is green on the new pin.
 #
 # If you bump anything here, run the full check suite against it first — the
 # launcher re-syncs every environment from this file automatically.
@@ -19,6 +18,6 @@ altair==6.1.0
 pyarrow==24.0.0
 # NOT here on purpose: openpyxl. It is reachable only through data_io.py, which
 # is deliberately never imported (manual entry is the model, user decision
-# 2026-07-10). Verified 2026-08-04 by running the whole suite against a 3.11.4
-# venv without it: all 24 green. Wiring data_io later means adding it back —
+# 2026-07-10). Verified 2026-08-04 by running the whole suite against a venv
+# built from this file without it: all green. Wiring data_io later means adding it back —
 # pandas raises a clear "Missing optional dependency 'openpyxl'" if you forget.

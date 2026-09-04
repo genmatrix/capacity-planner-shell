@@ -689,7 +689,7 @@ def list_names(d) -> list[str]:
     scan (dir-mtime validated, memoized per run).
 
     `Path.glob` is the trap here: CPython 3.13 rewrote pathlib to walk with
-    scandir, while 3.11 — the oldest version this app supports — stats every
+    scandir, while 3.11 — the deployment's interpreter until 2026-09-04 — stats every
     entry. Identical code measured 9 network round trips per edit on 3.14 and
     15 on 3.11, entirely from globs. Benchmark on the OLDEST supported
     interpreter, not the newest. Callers filter the returned names in Python,

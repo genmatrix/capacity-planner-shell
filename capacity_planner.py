@@ -6490,11 +6490,10 @@ def render_advisor_page(ro: bool):
     one_att = bool(da.get("one_class_at_a_time", False))
     lead = int(template["training_wks"]) + int(template["coaching_wks"])
     eff_sp = max(gap, lead) if one_att else gap
-    # Hoisted out of the f-string deliberately: a replacement field whose
-    # expression spans lines is PEP 701, i.e. Python 3.12+. Work approves 3.11.4
-    # only, and this is a PARSE error — the whole app failed to boot on 3.11 over
-    # one line on a page that is currently hidden. Keep replacement fields to a
-    # single line; `python3.11 -m py_compile` is the only reliable check.
+    # Hoisted out of the f-string when work ran Python 3.11 (a multi-line
+    # replacement field is PEP 701, 3.12+, and this line failed the whole app's
+    # parse). Work moved to 3.14 on 2026-09-04, so the constraint is gone;
+    # the hoist is harmless and stays.
     cadence = f"≥ {gap} weeks between class starts" if gap else "unconstrained"
     st.caption(f"Hiring cadence: **{cadence}**"
                + (f" · **one class at a time** (pipeline {lead} wks, so starts "

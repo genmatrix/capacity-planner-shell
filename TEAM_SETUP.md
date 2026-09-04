@@ -12,10 +12,9 @@ Pick the year with **Plan year** at the top of the sidebar.
 
 ## One-time, per person
 
-1. **Install Python — 3.11.4 or newer** (3.11, 3.12, 3.13 and 3.14 all work) —
-   Software Center if IT offers it, else python.org. Whatever your IT has
-   approved is fine; **3.11.4 is verified**, so there is no need to chase a
-   newer version through an approval process.
+1. **Install Python 3.14** — the version IT has approved, and the one every
+   check is verified against — from Software Center if it offers it, else
+   python.org.
    On the installer's first screen, **tick "Add python.exe to PATH"**, then use
    the default install (per-user — needs **no admin rights**, and it includes
    the `py` launcher our start script relies on). The PATH tick isn't required

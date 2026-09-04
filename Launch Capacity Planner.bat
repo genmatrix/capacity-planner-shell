@@ -18,7 +18,7 @@ set "PYEXE=%VENV%\Scripts\python.exe"
 where py >nul 2>nul
 if errorlevel 1 (
   echo Python is not installed on this machine.
-  echo Install Python 3.11+ from Software Center or python.org
+  echo Install Python 3.14 from Software Center or python.org
   echo ^(the default per-user install needs no admin rights^), then
   echo double-click this launcher again.
   pause & exit /b 1

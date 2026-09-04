@@ -30,7 +30,7 @@ data — the planning model is driven entirely by what you enter.
 
 ## Run it
 
-1. Install Python 3.11.4 or newer (per-user install is fine).
+1. Install Python 3.14 (per-user install is fine).
 2. Double-click `Launch Capacity Planner.bat` (Windows — builds its own
    environment), or: `pip install -r requirements.txt` then
    `streamlit run capacity_planner.py`.
