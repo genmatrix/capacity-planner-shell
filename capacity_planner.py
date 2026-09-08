@@ -3467,8 +3467,14 @@ def render_real_data_page():
 # ----------------------------------------------------------------------
 # Collaboration — team plan status, edit control, publish, history
 # ----------------------------------------------------------------------
-def _hm(iso: str) -> str:
-    return iso[11:16] if iso and len(iso) >= 16 else iso
+def _when(iso: str) -> str:
+    """A stored stamp (`YYYY-MM-DD HH:MM:SS`) as `YYYY-MM-DD HH:MM`. It printed
+    the clock time alone until 2026-09-08 (user: "change log only has a time and
+    not a date") — fine for a lock taken this morning, useless for a version
+    published three weeks ago, and the change log is exactly the surface where
+    someone asks WHEN. Every published/locked/acquired stamp routes through
+    here, so the date shows everywhere at once."""
+    return iso[:16] if iso and len(iso) >= 16 else iso
 
 
 def _default_lob(names: list[str]) -> str:
@@ -3567,7 +3573,7 @@ def render_team_status() -> tuple[bool, str]:
     st.markdown(f"**{year} plan:** "
                 + (f"v{act['version']} · {act['name']}" if act else "_none published yet_"))
     if act:
-        st.caption(f"by {act['author']} · {_hm(act['published_at'])}"
+        st.caption(f"by {act['author']} · {_when(act['published_at'])}"
                    + (f" · {act['note']}" if act.get("note") else ""))
 
     # Drift: a newer version was published than the one we're viewing.
@@ -3607,7 +3613,7 @@ def render_team_status() -> tuple[bool, str]:
             st.rerun()
         st.session_state[_we_key] = True
         st.success(f"You have **edit control of {year}** "
-                   f"(since {_hm(lock.get('acquired_at',''))}).")
+                   f"(since {_when(lock.get('acquired_at',''))}).")
         if st.button("Release edit control", width="stretch"):
             collab.release_lock(SCENARIO_DIR, year, user, tok)
             st.session_state.pop(f"lock_token_{year}", None)
@@ -3623,7 +3629,7 @@ def render_team_status() -> tuple[bool, str]:
                        "HERE — the other session becomes read-only.")
         else:
             st.warning(f"**{lock.get('user')}** is editing **{year}** "
-                       f"(since {_hm(lock.get('acquired_at',''))}, "
+                       f"(since {_when(lock.get('acquired_at',''))}, "
                        f"active {int(collab.age_min(lock.get('heartbeat','')))}m ago). "
                        "You're read-only.")
     elif lock:
@@ -3778,7 +3784,7 @@ def render_publish_panel(mode: str):
             # per line, so the button rendered as a vertical column of letters.
             # The year is already in the expander title; drop it from every row.
             st.caption(f"**v{j['version']}** · {j.get('name','')}"
-                       f" · {j.get('author','')} · {_hm(j.get('published_at',''))}"
+                       f" · {j.get('author','')} · {_when(j.get('published_at',''))}"
                        + (f" — {j['note']}" if j.get("note") else ""))
             cols = st.columns(2)
             # Keys come from the FILENAME, not the version number. `next_version`
@@ -3877,7 +3883,7 @@ def render_publish_panel(mode: str):
     mine = collab.personal_snapshots(SCENARIO_DIR, user)
     if mine:
         with st.expander("My what-ifs"):
-            labels = {f"{j.get('name')} · {_hm(j.get('published_at',''))}": j for j in mine}
+            labels = {f"{j.get('name')} · {_when(j.get('published_at',''))}": j for j in mine}
             pick = st.selectbox("Load one (opens in sandbox)", list(labels), key="load_whatif")
             if st.button("Load what-if"):
                 _full = collab.load_snapshot(SCENARIO_DIR, labels[pick]["_file"])
@@ -6166,7 +6172,7 @@ def _scenario_candidates() -> dict:
         cands[label] = j
 
     for j in collab.personal_snapshots(SCENARIO_DIR, st.session_state.user):
-        add(f"{j.get('name', 'what-if')} · {_hm(j.get('published_at', ''))}", j)
+        add(f"{j.get('name', 'what-if')} · {_when(j.get('published_at', ''))}", j)
     # The locked budget is just a published version, but it is the one people
     # come here to compare against — mark it so it is findable in a long list.
     _b = collab.read_budget(SCENARIO_DIR, plan_year()) or {}
@@ -6476,7 +6482,7 @@ def render_budget_baseline(grain: str, yr: int):
             st.markdown(
                 f"**Locked: v{ptr.get('version')} · {ptr.get('name', '')}** — "
                 f"locked by {ptr.get('locked_by', '?')} "
-                f"{_hm(ptr.get('locked_at', ''))}"
+                f"{_when(ptr.get('locked_at', ''))}"
                 + (f" · _{ptr['note']}_" if ptr.get("note") else ""))
             if ptr.get("history"):
                 with st.expander(f"Re-baselined {len(ptr['history'])} time(s)"):
@@ -6486,7 +6492,7 @@ def render_budget_baseline(grain: str, yr: int):
                     for h in ptr["history"]:
                         st.caption(f"was v{h.get('version')} · {h.get('name', '')} "
                                    f"— {h.get('locked_by', '?')} "
-                                   f"{_hm(h.get('locked_at', ''))}"
+                                   f"{_when(h.get('locked_at', ''))}"
                                    + (f" · {h['note']}" if h.get("note") else ""))
         else:
             st.info(f"No {yr} budget locked yet. Pick the published version that "
@@ -6504,7 +6510,7 @@ def render_budget_baseline(grain: str, yr: int):
             st.caption("Take control (sidebar) to lock or change the baseline.")
         else:
             opts = {f"v{j['version']} · {j.get('name', '')} · "
-                    f"{_hm(j.get('published_at', ''))}": j for j in vers}
+                    f"{_when(j.get('published_at', ''))}": j for j in vers}
             c1, c2 = st.columns([2, 1])
             pick = c1.selectbox("Version to lock as the budget", list(opts),
                                 key="bl_pick")
@@ -6840,7 +6846,7 @@ def _changelog_rows(log: list[dict], limit: int) -> tuple[pd.DataFrame, int]:
                       "Field": "could not compare", "Week": "",
                       "Was": f"v{older['version']}", "Now": str(e)[:80]}]
         head = {"Version": f"v{newer['version']}",
-                "When": _hm(newer.get("published_at", "")),
+                "When": _when(newer.get("published_at", "")),
                 "Who": newer.get("author", ""),
                 "Why": newer.get("note", "") or "(no note)"}
         if not diffs:
