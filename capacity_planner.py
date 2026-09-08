@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
 import sources as sx
 import collab
@@ -1288,11 +1289,14 @@ def _weekly_assumption(d: pd.DataFrame, col: str, scalar, n: int) -> np.ndarray:
     return np.where(np.isnan(v), float(scalar), v)
 
 
-def compute_plan(lob_data: dict) -> pd.DataFrame:
+def compute_plan(lob_data: dict, closures=None) -> pd.DataFrame:
+    """`closures` = (closure dict, hours pattern) — see `closure_hours_lost`.
+    None → the session's configured closures (none in bare mode)."""
     d = lob_data["demand"].copy()
     roster, nh, a = lob_data["roster"], lob_data["nh"], lob_data["assumptions"]
     weeks = d["Week"].tolist()
     n = len(weeks)
+    _cl, _pat = closures if closures is not None else _closure_context()
 
     # CPM = Calls Per Member per year. Annual contacts = Members × CPM, so the
     # flat weekly base is Members × CPM ÷ 52. (Blank LOB has CPM=0 → base 0.)
@@ -1350,6 +1354,12 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
     # Erlang's s already includes the idle time the SL demands; the occupancy
     # assumption only caps a/s. Margin is applied to volume, as in workload.
     open_hrs = float(a.get("open_hrs_week", 60.0))
+    # Holiday closures (2026-09-08): a closed day takes its normal open hours
+    # out of the week — Erlang spreads the volume over what is left, and the
+    # same hours come out of Staffed FTE below. Required on the workload basis
+    # is untouched: the demand side already dips in a holiday week.
+    closed_hrs = closure_hours_lost(weeks, open_hrs, _cl, _pat)
+    open_wk = np.maximum(open_hrs - closed_hrs, 0.0)
     sl_t = float(a.get("sl_target_pct", 80.0))
     sl_sec = float(a.get("sl_threshold_sec", 40.0))
     seat_hrs_arr = a["paid_hours_per_week"] * (1 - shr_arr / 100)
@@ -1361,10 +1371,13 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             if seat_hrs_arr[i] <= 0:
                 erlang_req[i] = np.nan
                 continue
-            cph = fcst_arr[i] * (1 + a["workload_margin_pct"] / 100) / open_hrs
+            if open_wk[i] <= 0:          # closed every day it would have run
+                erlang_req[i] = 0.0
+                continue
+            cph = fcst_arr[i] * (1 + a["workload_margin_pct"] / 100) / open_wk[i]
             agents = erlang_c_agents(cph, aht_arr[i], sl_t, sl_sec,
                                      max_occ_pct=a["occupancy_pct"])
-            erlang_req[i] = agents * open_hrs / seat_hrs_arr[i]
+            erlang_req[i] = agents * open_wk[i] / seat_hrs_arr[i]
 
     required_fte = (pd.Series(erlang_req, index=d.index)
                     if a.get("req_basis", "workload") == "erlang" else workload_req)
@@ -1525,7 +1538,15 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
                if "NH Lab HC" in roster.columns else np.zeros(n))
     lab_pct = float(a.get("lab_productivity_pct", 50.0) or 0.0) / 100
     lab_fte = lab_arr * lab_pct
-    staffed = _available - pt_discount - ramp_discount + lab_fte
+    staffed_open = _available - pt_discount - ramp_discount + lab_fte
+    # Closure Discount (user 2026-09-08): everything productive that week
+    # loses the same share of its hours as the center did — Thanksgiving week
+    # on a 64-hour queue is 52/64 of a normal week. A SUPPLY fact, not a
+    # shrinkage assumption: shrinkage sits in the Required denominator and
+    # forward-fills, both wrong for a one-week closure.
+    closure_share = (closed_hrs / open_hrs) if open_hrs > 0 else np.zeros(n)
+    closure_discount = staffed_open * np.clip(closure_share, 0.0, 1.0)
+    staffed = staffed_open - closure_discount
     net = staffed - required_fte
     # A cleared AHT (0) is a legitimate state — it is what a fresh rollover
     # leaves behind — so guard the division rather than emitting NaN and a
@@ -1607,6 +1628,7 @@ def compute_plan(lob_data: dict) -> pd.DataFrame:
             "PT Hires +/-": pt_hires.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "PT Discount": np.round(pt_discount, 1),
+            "Closure Discount": np.round(closure_discount, 1),
             "NH Lab HC": lab_arr,
             "Lab FTE": np.round(lab_fte, 1),
             "LOA": loa_arr,
@@ -1660,18 +1682,166 @@ def _holidays_path() -> Path:
     return APP_DIR / HOLIDAYS_FILE_NAME
 
 
-def load_holidays() -> list[str]:
-    """Org-wide closure dates (ISO), team-shared next to the app — a closed
-    holiday makes a week legitimately one day short of the queue's norm, and
-    the partial-week logic must not treat it as a truncated export (field
-    finding 2026-07-16: 'for holidays it freaks out because we are closed')."""
-    if "holidays" not in st.session_state:
+# The org's normal day: Mon-Fri 07:00-19:00 and Saturday 09:00-13:00 for every
+# queue but Wires (user 2026-07-13). A closure is worth the hours that day would
+# normally have been open, so these two numbers are what a closure costs.
+DEFAULT_WEEKDAY_HOURS = 12.0
+DEFAULT_SATURDAY_HOURS = 4.0
+
+
+def _parse_holidays_file(raw) -> tuple[dict[str, float], tuple[float, float]]:
+    """`holidays.json` → ({ISO date: hours OPEN that day}, (weekday hrs, Saturday
+    hrs)). Two shapes on disk: the ORIGINAL list of dates (every entry a full
+    closure, default pattern) and the dict form written since 2026-09-08 —
+    {"closures": ["2026-11-26", {"date": "2026-12-24", "open_hours": 7}],
+    "weekday_hours": 12, "saturday_hours": 4}. 0 hours open = closed all day;
+    Christmas Eve at 7 is a partial day. Unreadable entries are skipped, never
+    guessed."""
+    closures: dict[str, float] = {}
+    pattern = (DEFAULT_WEEKDAY_HOURS, DEFAULT_SATURDAY_HOURS)
+    if isinstance(raw, dict):
+        items = raw.get("closures", [])
         try:
-            st.session_state["holidays"] = sorted(set(
-                json.loads(_holidays_path().read_text(encoding="utf-8"))))
-        except (OSError, ValueError):
-            st.session_state["holidays"] = []
-    return st.session_state["holidays"]
+            pattern = (float(raw.get("weekday_hours", DEFAULT_WEEKDAY_HOURS)),
+                       float(raw.get("saturday_hours", DEFAULT_SATURDAY_HOURS)))
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+    for it in items:
+        try:
+            if isinstance(it, dict):
+                dt = date.fromisoformat(str(it.get("date"))).isoformat()
+                hrs = float(it.get("open_hours", 0.0) or 0.0)
+            else:
+                dt = date.fromisoformat(str(it)).isoformat()
+                hrs = 0.0
+        except (TypeError, ValueError):
+            continue
+        closures[dt] = max(0.0, hrs)
+    return closures, pattern
+
+
+def _parse_closure_lines(text: str) -> tuple[dict[str, float], list[str]]:
+    """The expander's typed lines: `YYYY-MM-DD` (closed all day) or
+    `YYYY-MM-DD 7` / `YYYY-MM-DD, 7` (open that many hours). Returns
+    (closures, bad lines) — a bad line is NAMED, never silently dropped."""
+    good: dict[str, float] = {}
+    bad: list[str] = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        parts = [x for x in re.split(r"[\s,;]+", t) if x]
+        try:
+            dt = date.fromisoformat(parts[0]).isoformat()
+            hrs = float(parts[1]) if len(parts) > 1 else 0.0
+            if len(parts) > 2 or hrs < 0 or hrs > 24:
+                raise ValueError
+        except (ValueError, IndexError):
+            bad.append(t)
+            continue
+        good[dt] = hrs
+    return good, bad
+
+
+def _format_closure_lines(closures: dict[str, float]) -> str:
+    """Inverse of `_parse_closure_lines`: one line per closure, a full closure as
+    the bare date (what the file always held), a partial day as `date hours`."""
+    return "\n".join(f"{d} {h:g}" if h > 0 else d for d, h in sorted(closures.items()))
+
+
+def _ensure_closures_loaded() -> None:
+    if "closures" in st.session_state and "hours_pattern" in st.session_state:
+        return
+    try:
+        raw = json.loads(_holidays_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    closures, pattern = _parse_holidays_file(raw)
+    st.session_state["closures"] = closures
+    st.session_state["hours_pattern"] = pattern
+
+
+def load_closures() -> dict[str, float]:
+    """Org-wide closures, team-shared next to the app: {ISO date: hours the
+    center was OPEN that day} (0 = closed). Since 2026-09-08 a closure is also
+    a SUPPLY fact — its lost open hours come out of Staffed FTE for that week
+    (`closure_hours_lost`), so a holiday week no longer reads as surplus."""
+    _ensure_closures_loaded()
+    return st.session_state["closures"]
+
+
+def load_hours_pattern() -> tuple[float, float]:
+    """(weekday open hours, Saturday open hours) for the org — what a closure on
+    that weekday costs. Sunday is never open."""
+    _ensure_closures_loaded()
+    wd, sat = st.session_state["hours_pattern"]
+    return float(wd), float(sat)
+
+
+def load_holidays() -> list[str]:
+    """FULL closure dates (ISO) — the Days Covered view of the closures. A
+    closed holiday makes a week legitimately one day short of the queue's norm,
+    and the partial-week logic must not treat it as a truncated export (field
+    finding 2026-07-16: 'for holidays it freaks out because we are closed').
+    A PARTIAL day (Christmas Eve open 7 hours) is deliberately NOT here: the
+    queue was open, the ACD export covers the day, so the week's day count is
+    not short — only its hours are, and that is the engine's business."""
+    return sorted(d for d, h in load_closures().items() if h <= 0)
+
+
+def closure_hours_lost(weeks, open_hrs_week: float, closures: dict[str, float],
+                       pattern: tuple[float, float]) -> np.ndarray:
+    """Per plan week: open hours the LOB LOSES to configured closures.
+
+    Each closure costs (that weekday's normal hours − hours open), clamped at
+    0: a weekday is worth the org's weekday hours, Saturday its Saturday
+    hours, Sunday nothing. The LOB's own `open_hrs_week` says which of those
+    days it runs — 64 = five weekdays plus the 4-hour Saturday, 60 = Mon-Fri
+    only (Wires) — so a Saturday closure costs a 60-hour queue nothing, and a
+    LOB entered below 5 × weekday hours is treated as shorter weekdays with no
+    Saturday rather than as impossible. Pure: no session, no clock."""
+    n = len(weeks)
+    out = np.zeros(n)
+    if not closures or open_hrs_week <= 0:
+        return out
+    wd_org, sat_org = float(pattern[0]), float(pattern[1])
+    if open_hrs_week >= 5 * wd_org:
+        wd_lob, sat_lob = wd_org, min(sat_org, max(0.0, open_hrs_week - 5 * wd_org))
+    else:
+        wd_lob, sat_lob = open_hrs_week / 5, 0.0
+    day_hours = [wd_lob] * 5 + [sat_lob, 0.0]          # Mon..Sun
+    parsed = []
+    for dt, open_hrs in closures.items():
+        try:
+            parsed.append((date.fromisoformat(str(dt)), float(open_hrs or 0.0)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return out
+    for i, w in enumerate(weeks):
+        try:
+            monday = date.fromisoformat(str(w))
+        except (TypeError, ValueError):
+            continue
+        sunday = monday + timedelta(days=6)
+        for dt, open_hrs in parsed:
+            if monday <= dt <= sunday:
+                out[i] += max(0.0, day_hours[dt.weekday()] - open_hrs)
+    return out
+
+
+def _closure_context() -> tuple[dict[str, float], tuple[float, float]]:
+    """What `compute_plan` uses when the caller passes nothing: the session's
+    closures inside a Streamlit run, and NO closures in bare mode (a check
+    script or a plain import — session state does not exist there, and the
+    engine must not spam the console asking for it)."""
+    if get_script_run_ctx(suppress_warning=True) is None:
+        return {}, (DEFAULT_WEEKDAY_HOURS, DEFAULT_SATURDAY_HOURS)
+    return load_closures(), load_hours_pattern()
 
 
 def _holidays_in_week(week_iso) -> int:
@@ -2990,38 +3160,54 @@ def render_real_data_page():
     # legitimate weeks look like truncated exports) ------------------------
     with st.expander("Holiday closures"):
         st.caption(
-            "Days the center is CLOSED, org-wide. A week containing a closure "
-            "legitimately covers one day fewer than the queue's norm — listing "
-            "it here keeps that week counted as FULL in benchmarks, variance, "
-            "and seasonality (the holiday dip is a real recurring shape) "
-            "instead of excluded as a truncated export. One date per line "
-            "(YYYY-MM-DD); paste a column straight from Excel. Team-shared "
-            "(`holidays.json` next to the app).")
-        _txt = st.text_area("Closure dates", value="\n".join(load_holidays()),
+            "Days the center is CLOSED or open SHORT hours, org-wide. Two "
+            "things follow from an entry: the week's supply drops by the hours "
+            "lost (the plan's 'Closure Discount' row — a closed Thursday on a "
+            "64-hour queue is 12/64 of that week's Staffed FTE), and a full "
+            "closure keeps the week counted as COMPLETE in benchmarks, "
+            "variance and seasonality instead of excluded as a truncated "
+            "export. One entry per line: `YYYY-MM-DD` = closed all day; "
+            "`YYYY-MM-DD 7` = open 7 hours that day (Christmas Eve). Paste a "
+            "column straight from Excel. Team-shared (`holidays.json` next to "
+            "the app).")
+        _wd0, _sat0 = load_hours_pattern()
+        _hc1, _hc2 = st.columns(2)
+        _wd = _hc1.number_input("Weekday open hours", 0.0, 24.0, float(_wd0), 0.5,
+                                key="holidays_wd",
+                                help="A normal Mon-Fri day (07:00-19:00 = 12). "
+                                     "What a weekday closure costs.")
+        _sat = _hc2.number_input("Saturday open hours", 0.0, 24.0, float(_sat0), 0.5,
+                                 key="holidays_sat",
+                                 help="A normal Saturday (09:00-13:00 = 4). A queue "
+                                      "whose Open hours/week has no Saturday in it "
+                                      "loses nothing to a Saturday closure.")
+        _txt = st.text_area("Closure dates",
+                            value=_format_closure_lines(load_closures()),
                             key="holidays_txt", height=140,
                             label_visibility="collapsed",
-                            placeholder="2026-11-26\n2026-12-25")
+                            placeholder="2026-11-26\n2026-12-24 7\n2026-12-25")
         if st.button("Save holiday closures", key="holidays_save"):
-            good, bad = [], []
-            for ln in _txt.splitlines():
-                t = ln.strip()
-                if not t:
-                    continue
-                try:
-                    good.append(date.fromisoformat(t).isoformat())
-                except ValueError:
-                    bad.append(t)
+            good, bad = _parse_closure_lines(_txt)
             if bad:
-                st.error("Not YYYY-MM-DD date(s): " + ", ".join(bad[:5])
-                         + ("…" if len(bad) > 5 else "") + " — nothing saved.")
+                st.error("Not `YYYY-MM-DD` or `YYYY-MM-DD hours-open` (0-24): "
+                         + ", ".join(bad[:5]) + ("…" if len(bad) > 5 else "")
+                         + " — nothing saved.")
             else:
-                st.session_state["holidays"] = sorted(set(good))
+                st.session_state["closures"] = good
+                st.session_state["hours_pattern"] = (float(_wd), float(_sat))
                 try:
                     collab._atomic_write(
                         _holidays_path(),
-                        json.dumps(st.session_state["holidays"], indent=2))
-                    st.success(f"Saved {len(good)} closure date(s) — applied "
-                               "everywhere immediately.")
+                        json.dumps({
+                            "closures": [d if h <= 0 else {"date": d, "open_hours": h}
+                                         for d, h in sorted(good.items())],
+                            "weekday_hours": float(_wd),
+                            "saturday_hours": float(_sat),
+                        }, indent=2))
+                    _npart = sum(1 for h in good.values() if h > 0)
+                    st.success(f"Saved {len(good)} closure(s)"
+                               + (f" ({_npart} partial day(s))" if _npart else "")
+                               + " — applied everywhere immediately.")
                 except OSError as exc:
                     st.warning("Applied this session, but couldn't save to "
                                f"the share ({exc.__class__.__name__}) — will "
@@ -4106,11 +4292,17 @@ with st.sidebar:
                 a["sl_threshold_sec"] = st.number_input(
                     "SL threshold (sec)", 5.0, 600.0, float(a.get("sl_threshold_sec", 40.0)),
                     5.0, disabled=RO, key=f"as_sls_{view}")
-                a["open_hrs_week"] = st.number_input(
-                    "Open hours / week", 1.0, 168.0, float(a.get("open_hrs_week", 60.0)),
-                    1.0, disabled=RO, key=f"as_open_{view}",
-                    help="Hours the queue is open — spreads weekly volume into an hourly "
-                         "arrival rate and converts concurrent agents back to weekly FTE.")
+            # Every basis, not just Erlang (2026-09-08): holiday closures cost
+            # this LOB the share of ITS open week that the closed day was, so
+            # the closure math needs the number on every line.
+            a["open_hrs_week"] = st.number_input(
+                "Open hours / week", 1.0, 168.0, float(a.get("open_hrs_week", 60.0)),
+                1.0, disabled=RO, key=f"as_open_{view}",
+                help="Hours this queue is open in a normal week — 64 for a Mon-Fri "
+                     "12h + Saturday 4h line, 60 for Mon-Fri only. Holiday closures "
+                     "take a closed day's hours out of this (the plan's 'Closure "
+                     "Discount' row); on the Erlang basis it also spreads weekly "
+                     "volume into an hourly arrival rate.")
             a["occupancy_pct"] = st.number_input(
                 "Target occupancy %", 50.0, 100.0, float(a["occupancy_pct"]), 0.5,
                 disabled=RO, key=f"as_occ_{view}",
@@ -4339,6 +4531,8 @@ _PLAN_ROW_FORMULAS = {
     "Ramp Discount": "Ramping grads × (1 − productivity) across the ramp "
                      "weeks, decaying at the weekly attrition rate",
     "PT Discount": "Prod HC — PT × (1 − PT hours ÷ paid hours)",
+    "Closure Discount": "Staffed (before this row) × open hours lost to "
+                        "holiday closures that week ÷ Open hours/week",
     "NH Lab HC": "Roster entry: new hires in the coaching lab taking calls — "
                  "not in Production HC until their class graduates",
     "Lab FTE": "NH Lab HC × Coaching-lab productivity %",
@@ -4347,7 +4541,7 @@ _PLAN_ROW_FORMULAS = {
     "Mentors": "Roster entry: coaching a class — stays in Production HC, "
                "comes out of Staffed FTE (full-time pull)",
     "Staffed FTE": "(Prod HC — FT − LOA − Mentors) − PT Discount − "
-                   "Ramp Discount + Lab FTE",
+                   "Ramp Discount + Lab FTE − Closure Discount",
     "Net FTE": "Staffed FTE − Required FTE",
     "Volume Capacity": "Staffed FTE × Available Hrs/FTE × 3600 ÷ AHT",
     "Actual Offered": "ACD actual contacts for the week",
@@ -4527,7 +4721,7 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Attrition", "Attrition (actual)", "Transfers +/-", "NH Grads",
              "Attrition — PT", "PT Attrition (actual)", "PT Hires +/-",
              "Ramp Discount",
-             "PT Discount", "NH Lab HC", "Lab FTE",
+             "PT Discount", "Closure Discount", "NH Lab HC", "Lab FTE",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
              "Volume Capacity"]
     return df[[c for c in order if c in df.columns]]
@@ -5418,6 +5612,10 @@ the number moved from 6 to 33.
   colored against each line's SL target.
 - **Ramp Discount** (plan grid): headcount that exists on paper but isn't at
   full productivity yet (new grads, arriving transfers).
+- **Closure Discount** (plan grid): the FTE a holiday week loses because the
+  center is closed (or open short hours) — Thanksgiving week on a 64-hour
+  queue is 52/64 of a normal week. Set the dates and hours under Real Data →
+  Holiday closures.
 """),
     ("Data health warnings", """
 - **Partial weeks** (Days Covered < 7): totals reflect only the days present.
