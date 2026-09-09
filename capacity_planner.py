@@ -3514,7 +3514,18 @@ def render_team_status() -> tuple[bool, str]:
         # rolling into 2027 was yanked straight back to 2026 on the next run.
         # Remembering the plan_year we last rendered with separates the cases:
         # if it moved underneath us, follow it; otherwise the widget is truth.
-        if st.session_state.get("_year_seen") != _plan_year():
+        #
+        # ...unless the widget has NO state to be truth with (2026-09-09,
+        # "membership numbers are not holding to the respective year"). The
+        # draft banner's Resume/Discard sit ABOVE this selector and st.rerun()
+        # before it renders; Streamlit drops the state of a keyed widget that
+        # did not render in a run, so the selector came back at its FIRST
+        # option — 2026 — and the app faithfully switched the whole plan back
+        # (year, frames, membership) under the planner's feet. plan_year had
+        # not moved, so the guard above never fired. A missing key means the
+        # widget was wiped, never that the planner chose the first year.
+        if (st.session_state.get("_year_seen") != _plan_year()
+                or "year_pick" not in st.session_state):
             st.session_state["year_pick"] = _plan_year()
             st.session_state["_year_seen"] = _plan_year()
         _picked = st.selectbox("Plan year", _years, key="year_pick",
