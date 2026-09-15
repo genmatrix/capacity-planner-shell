@@ -241,6 +241,8 @@ ASSUMPTION_LABELS = {
     "one_class_at_a_time": "One class at a time",
     "members_start": "Members — start",
     "members_end": "Members — year-end",
+    "start_sync_year": "Start synced from (year)",
+    "start_sync_version": "Start synced from (version)",
     "supervisors": "Supervisors (legacy flat)",
     "leads": "Leads/Project (legacy flat)",
 }
@@ -2355,6 +2357,14 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         # Ending FULL-TIME walk seeds the new year's FT count; the flat PT
         # count rides along unchanged in the assumptions copy.
         a["starting_hc"] = float(plan["Prod HC — FT"].iloc[-1])
+        # Remember WHERE the start came from, so the new year can say when the
+        # old one has moved on (sync-start panel, 2026-09-15). The version the
+        # session had loaded — None if this plan was never published, in which
+        # case there is nothing to compare against later.
+        a["start_sync_year"] = yr
+        a["start_sync_version"] = (int(st.session_state.loaded_version)
+                                   if st.session_state.get("loaded_version") is not None
+                                   else None)
         # PT walks too (2026-09-04): its ending count seeds the new year, the
         # way the FT walk's does — identical to the old carry when inert.
         a["starting_hc_pt"] = float(plan["Prod HC — PT"].iloc[-1])
@@ -2375,6 +2385,144 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
     st.session_state.loaded_version = None   # unpublished until the team publishes it
     st.session_state["members_actual"] = None   # new year: no actuals yet
     _purge_assumption_widgets()
+
+
+# ----------------------------------------------------------------------
+# Sync start from the prior year (user 2026-09-15: "get the 2027 plan to use
+# the end staffing from 2026's last week so I don't have to keep going in and
+# changing it when actuals occur in 2026 … and all years after do the same").
+#
+# A BUTTON, not a live link (user's pick over the linked-start design): the
+# start counts stay numbers a person chose to put in the plan, with no hidden
+# dependency between years. What makes a button good rather than merely cheap:
+# every LOB records WHICH prior-year version its start came from, so the app
+# can say "2026 moved to v15 since this was synced from v12" — the reminder
+# comes from the app, not memory — and the panel previews every delta before
+# anything changes. Source is always the prior year's PUBLISHED version: the
+# team's truth, never someone's draft.
+#
+# What it copies, in one click: FT and PT starting counts from the prior
+# plan's last week (its ending walks), org-wide membership start (the last
+# recorded actual if the final week has one, else the year-end forecast),
+# and own-base LOBs' membership start. NOT classes straddling December or the
+# LOA level — those are typed rows the planner may have edited since rollover,
+# and merging derived rows with typed ones is where this would get messy.
+# ----------------------------------------------------------------------
+@st.cache_data(show_spinner=False, max_entries=16)
+def _prior_year_end_cached(scen_dir: str, fname: str) -> dict:
+    """What a published plan ENDS with, per LOB. Keyed on the version file,
+    which is immutable, so this costs one computation per version ever."""
+    snap = _cached_snapshot(scen_dir, fname)
+    lobs = _payload_lobs(snap)
+    out = {}
+    for name, d in lobs.items():
+        # Closures do not touch the headcount walk, so an explicit empty
+        # context keeps this pure and cacheable.
+        plan = compute_plan(d, closures=({}, (DEFAULT_WEEKDAY_HOURS,
+                                              DEFAULT_SATURDAY_HOURS)))
+        a = d.get("assumptions") or {}
+        out[name] = {"ft": float(plan["Prod HC — FT"].iloc[-1]),
+                     "pt": float(plan["Prod HC — PT"].iloc[-1]),
+                     "own": _lob_owns_members(a),
+                     "members_end_own": float(a.get("members_end_own", 0.0) or 0.0)}
+    m_end = float(snap.get("members_end", 0.0) or 0.0)
+    ma = snap.get("members_actual") or []
+    last_actual = ma[-1] if ma else None
+    return {"lobs": out,
+            "members_start_next": (float(last_actual) if last_actual is not None
+                                   else m_end),
+            "members_from_actual": last_actual is not None}
+
+
+def prior_year_end_state(year: int) -> dict | None:
+    """The prior year's published end state for `year` to sync from, or None
+    when the prior year has nothing published (nothing to sync from is not an
+    error — the panel simply does not render)."""
+    py = int(year) - 1
+    act = collab.read_active(SCENARIO_DIR, py)
+    if not act:
+        return None
+    st_ = dict(_prior_year_end_cached(str(SCENARIO_DIR), act["file"]))
+    st_["year"] = py
+    st_["version"] = int(act["version"])
+    st_["name"] = act.get("name", "")
+    return st_
+
+
+def start_sync_status(year: int, lobs: dict) -> tuple[str, dict]:
+    """('none' | 'never' | 'stale' | 'current', detail). 'none' = the prior
+    year has nothing published; 'never' = no LOB carries a sync record;
+    'stale' = the prior year has been republished since the (oldest) record."""
+    st_ = prior_year_end_state(year)
+    if st_ is None:
+        return "none", {"prior_year": int(year) - 1}
+    recs = [int(d["assumptions"]["start_sync_version"]) for d in lobs.values()
+            if (d.get("assumptions") or {}).get("start_sync_version") is not None
+            and int((d.get("assumptions") or {}).get("start_sync_year") or 0) == st_["year"]]
+    detail = {"prior_year": st_["year"], "current_version": st_["version"],
+              "recorded_version": min(recs) if recs else None}
+    if not recs or len(recs) < len(lobs):
+        return ("never" if not recs else "stale"), detail
+    return ("stale" if min(recs) < st_["version"] else "current"), detail
+
+
+def start_sync_preview(year: int, lobs: dict, members_start_now: float) -> list[dict]:
+    """Every number the sync would change, before it changes: one row per
+    LOB per line (FT, PT, own membership) plus the org-wide membership row.
+    Columns: LOB · Line · Now · From <prior year> · Δ."""
+    st_ = prior_year_end_state(year)
+    if st_ is None:
+        return []
+    py = st_["year"]
+    col_from = f"From {py}"
+    rows = []
+    for name, d in lobs.items():
+        src = st_["lobs"].get(name)
+        if src is None:
+            rows.append({"LOB": name, "Line": "FT", "Now": None, col_from: None, "Δ": None})
+            continue
+        a = d.get("assumptions") or {}
+        for line, key, val in (("FT", "starting_hc", src["ft"]),
+                               ("PT", "starting_hc_pt", src["pt"])):
+            now = float(a.get(key, 0.0) or 0.0)
+            rows.append({"LOB": name, "Line": line, "Now": round(now, 1),
+                         col_from: round(val, 1), "Δ": round(val - now, 1)})
+        if _lob_owns_members(a):
+            now = float(a.get("members_start_own", 0.0) or 0.0)
+            rows.append({"LOB": name, "Line": "Members (own)", "Now": now,
+                         col_from: src["members_end_own"],
+                         "Δ": src["members_end_own"] - now})
+    rows.append({"LOB": "Members (org-wide)",
+                 "Line": "actual" if st_["members_from_actual"] else "forecast",
+                 "Now": float(members_start_now),
+                 col_from: st_["members_start_next"],
+                 "Δ": st_["members_start_next"] - float(members_start_now)})
+    return rows
+
+
+def sync_start_from_prior_year() -> list[str]:
+    """Apply the sync to the working plan. Returns the LOBs changed. Touches
+    counts only — never frames — and re-seeds the sidebar widgets."""
+    year = plan_year()
+    st_ = prior_year_end_state(year)
+    if st_ is None:
+        return []
+    changed = []
+    for name, d in st.session_state.lobs.items():
+        src = st_["lobs"].get(name)
+        if src is None:
+            continue                       # a LOB the prior year never had
+        a = d["assumptions"]
+        a["starting_hc"] = src["ft"]
+        a["starting_hc_pt"] = src["pt"]
+        if _lob_owns_members(a):
+            a["members_start_own"] = src["members_end_own"]
+        a["start_sync_year"] = st_["year"]
+        a["start_sync_version"] = st_["version"]
+        changed.append(name)
+    st.session_state.members_start = st_["members_start_next"]
+    _purge_assumption_widgets()
+    return changed
 
 
 # ----------------------------------------------------------------------
@@ -4176,6 +4324,41 @@ with st.sidebar:
                 + " Set the new year-end member forecast, review, then publish.")
             st.rerun()
 
+    # --- Sync start from the prior year (2026-09-15) ----------------------
+    _py = _yr - 1
+    _pstate = prior_year_end_state(_yr)
+    if _pstate is not None:
+        _ss, _sd = start_sync_status(_yr, st.session_state.lobs)
+        with st.expander(f"Sync start from {_py}"):
+            if _ss == "current":
+                st.caption(f"Start counts are **in sync** with {_py} v{_sd['current_version']} "
+                           f"({_pstate['name']}).")
+            elif _ss == "stale":
+                st.warning(f"**{_py} moved to v{_sd['current_version']}** since this plan's "
+                           f"start was synced from v{_sd['recorded_version']}. Sync to "
+                           f"pick up what changed — recorded departures, hires, the "
+                           f"final membership.")
+            else:
+                st.info(f"Start counts were **never synced** from {_py}'s published plan "
+                        f"(now v{_sd['current_version']}).")
+            st.caption(
+                f"Copies {_py}'s ending walk (last week of its *published* plan) into "
+                "this year's starting FT and PT counts, and its final membership "
+                "(last recorded actual, else the year-end forecast) into Members — "
+                "start. Classes straddling December and the LOA level are NOT touched "
+                "— those are rows you may have edited here. Preview first:")
+            _rows = start_sync_preview(_yr, st.session_state.lobs,
+                                       float(st.session_state.get("members_start", 0.0) or 0.0))
+            if _rows:
+                st.dataframe(pd.DataFrame(_rows), hide_index=True, width="stretch")
+            _sure = st.checkbox(f"Replace this plan's starting counts with {_py}'s ending walk",
+                                key="sync_confirm", disabled=RO)
+            if st.button(f"Sync start from {_py}", disabled=RO or not _sure, key="sync_btn"):
+                _done = sync_start_from_prior_year()
+                st.success(f"Synced {len(_done)} LOB(s) from {_py} v{_sd['current_version']}. "
+                           "Publish when you're happy with it.")
+                st.rerun()
+
     st.subheader("Membership (all LOBs)")
     st.caption("One org-wide member base — spreads linearly from start (actual) to "
                "year-end (forecast). Each LOB applies its own CPM to it.")
@@ -5657,7 +5840,13 @@ the number moved from 6 to 33.
 4. Rebuild seasonality in one click with **Derive from ACD actuals** (Capacity
    Plan) — it now has a full extra year of history to learn from.
 3. Enter the new year-end member forecast, review, then publish.
-4. **This year keeps running.** Each year is its own plan with its own versions
+4. **As this year's actuals keep landing**, the new year's start drifts from
+   the truth. Sidebar → **Sync start from <this year>** copies the ending walk
+   (FT and PT) and the final membership from this year's *published* plan
+   into the new year's starting counts, with a preview of every delta. The
+   panel and the weekly checklist say when this year has moved to a newer
+   version than the start was synced from, so nothing has to be remembered.
+5. **This year keeps running.** Each year is its own plan with its own versions
    and its own edit lock, so publishing next year does not disturb this one —
    and someone else can carry on editing this year while you build next.
    Switch between them with **Plan year** at the top of the sidebar.
@@ -5876,6 +6065,16 @@ def weekly_checklist():
                                                   errors="coerce").isna().to_numpy()).sum())
         if n_ass:
             assumed.append(f"{l} ({n_ass})")
+    # Start-sync staleness (2026-09-15): the prior year was republished since
+    # this plan's start was taken from it — the nudge the button needs.
+    _ss, _sd = start_sync_status(_plan_year(), st.session_state.get("lobs") or {})
+    if _ss == "stale":
+        items.append(("⚠️", f"**{_sd['prior_year']} moved to v{_sd['current_version']}** since "
+                            f"this plan's start was synced from v{_sd['recorded_version']} — "
+                            f"sidebar → *Sync start from {_sd['prior_year']}*"))
+    elif _ss == "never":
+        items.append(("ℹ️", f"Start counts never synced from {_sd['prior_year']}'s published "
+                            f"plan — sidebar → *Sync start from {_sd['prior_year']}*"))
     if assumed:
         items.append(("ℹ️", "**Past weeks with no recorded attrition — treated as "
                             "0 leavers**: " + ", ".join(assumed)
