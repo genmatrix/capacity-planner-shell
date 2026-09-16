@@ -1429,10 +1429,17 @@ def compute_plan(lob_data: dict, closures=None) -> pd.DataFrame:
     # the FT walk too; part-time rides flat until the planner changes it.
     hc_ft = np.zeros(n)
     attrition = np.zeros(n)
+    # The MODELLED figure for every week — rate × start-of-week FT — kept even
+    # where a recorded actual replaced it in the walk (2026-09-16, user: "where
+    # can I see actual attrition trend vs projected"). It runs on the REAL
+    # walk's base, so cumulative actual − cumulative modelled is rate error
+    # alone, not headcount drift compounding on top of it.
+    attrition_model = np.zeros(n)
     prev = float(a["starting_hc"] or 0)
     for i in range(n):
+        attrition_model[i] = prev * wk_attr_rate
         attrition[i] = (float(attr_actual[i]) if not np.isnan(attr_actual[i])
-                        else prev * wk_attr_rate)
+                        else attrition_model[i])
         prev = prev - attrition[i] + xfer_arr[i] + adds[i]
         hc_ft[i] = prev
     # Part-time is its OWN walk since 2026-09-04 (user: "I need part time
@@ -1456,10 +1463,12 @@ def compute_plan(lob_data: dict, closures=None) -> pd.DataFrame:
                 if "PT Hires +/-" in roster.columns else np.zeros(n))
     pt_hc = np.zeros(n)
     attrition_pt = np.zeros(n)
+    attrition_pt_model = np.zeros(n)
     prev_pt = float(a.get("starting_hc_pt", 0.0) or 0.0)
     for i in range(n):
+        attrition_pt_model[i] = prev_pt * wk_attr_rate_pt
         attrition_pt[i] = (float(pt_actual[i]) if not np.isnan(pt_actual[i])
-                           else prev_pt * wk_attr_rate_pt)
+                           else attrition_pt_model[i])
         prev_pt = prev_pt - attrition_pt[i] + pt_hires[i]
         pt_hc[i] = prev_pt
     hc = hc_ft + pt_hc
@@ -1618,6 +1627,7 @@ def compute_plan(lob_data: dict, closures=None) -> pd.DataFrame:
             "Overall HC": (hc + support + lab_arr).round(1),
             "Attrition": attrition.round(2),
             "Attrition (actual)": np.round(attr_actual, 2),   # blank where modelled
+            "Attrition (modelled)": np.round(attrition_model, 2),   # rate × start, every week
             # The remaining walk term, surfaced so the whole identity
             # (start − attrition + transfers + grads = end) is auditable from
             # ONE table — the user chased a 4-FTE week-over-week drop with
@@ -1628,6 +1638,7 @@ def compute_plan(lob_data: dict, closures=None) -> pd.DataFrame:
             # hires = end) is auditable from the same table as FT.
             "Attrition — PT": attrition_pt.round(2),
             "PT Attrition (actual)": np.round(pt_actual, 2),   # blank where modelled
+            "Attrition — PT (modelled)": np.round(attrition_pt_model, 2),
             "PT Hires +/-": pt_hires.round(1),
             "Ramp Discount": np.round(ramp_discount, 1),
             "PT Discount": np.round(pt_discount, 1),
@@ -4806,6 +4817,11 @@ _PLAN_ROW_FORMULAS = {
     "Prod HC — PT": "Previous week's Prod HC — PT − Attrition — PT + "
                     "PT Hires +/- (week 1 starts from the entered part-time "
                     "count). Its own walk since 2026-09-04",
+    "Attrition (modelled)": "Attrition %/yr ÷ 52 × start-of-week Prod HC — FT, "
+                            "for EVERY week — what the rate would have taken, "
+                            "even where a recorded actual replaced it",
+    "Attrition — PT (modelled)": "Attrition %/yr — part-time ÷ 52 × start-of-week "
+                                 "Prod HC — PT, for every week",
     "Attrition — PT": "PT Attrition (actual) where entered; blank FUTURE "
                       "week = part-time Attrition %/yr ÷ 52 × PT "
                       "start-of-week; blank ELAPSED week = 0",
@@ -4851,6 +4867,86 @@ _PLAN_ROW_FORMULAS = {
                     "that week",
     "CPM (plan)": "The CPM the demand grid planned for that week",
 }
+
+
+def attrition_trend_frame(plan: pd.DataFrame, roster: pd.DataFrame,
+                          line: str = "ft") -> pd.DataFrame | None:
+    """Cumulative recorded vs modelled departures for one line, through the
+    LAST week with a recorded figure. None when nothing was ever recorded.
+    Cumulative on purpose: weekly counts of 0, 1 and 2 are too lumpy to read
+    as a trend, while a running total pulling away from the modelled line is
+    exactly "the rate is wrong", and the gap at the last recorded week is how
+    many people you are ahead of or behind plan. The modelled series runs to
+    the horizon (dashed beyond the last actual on the chart); the actual stops
+    where the record does — elapsed blank weeks count as 0 in the walk, but
+    plotting them as recorded zeros would dress a lapse up as evidence.
+    Recorded figures come from the ROSTER, not the plan row: the engine
+    writes 0 into the plan's actual row for elapsed blank weeks (its
+    blank-elapsed-is-0 rule), which would make every elapsed week look
+    recorded."""
+    act_col, mod_col = (("Attrition (actual)", "Attrition (modelled)") if line == "ft"
+                        else ("PT Attrition (actual)", "Attrition — PT (modelled)"))
+    if act_col not in roster.columns or mod_col not in plan.columns or len(roster) != len(plan):
+        return None
+    act = pd.to_numeric(roster[act_col], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(act).any():
+        return None
+    last = int(np.flatnonzero(np.isfinite(act)).max())
+    mod = pd.to_numeric(plan[mod_col], errors="coerce").fillna(0).to_numpy(dtype=float)
+    cum_act = np.cumsum(np.nan_to_num(act, nan=0.0))
+    cum_mod = np.cumsum(mod)
+    out = pd.DataFrame({"Week": plan["Week"].tolist(),
+                        "Modelled": cum_mod.round(2),
+                        "Recorded": np.where(np.arange(len(act)) <= last, cum_act, np.nan).round(2),
+                        "recorded_through": last})
+    return out
+
+
+def render_attrition_trend(plan: pd.DataFrame, roster: pd.DataFrame, view: str):
+    """Capacity Plan → 'Attrition — recorded vs modelled': FT and PT side by
+    side, cumulative from week 1, with the headline gap in words."""
+    import altair as alt
+    ft = attrition_trend_frame(plan, roster, "ft")
+    pt = attrition_trend_frame(plan, roster, "pt")
+    with brand.section("attr_trend", "Attrition — recorded vs. modelled",
+                       "Cumulative departures from week 1. The dashed line is what the "
+                       "assumed rate takes each week on the real headcount; the solid "
+                       "line is what you recorded. Where they part is where the rate "
+                       "assumption is wrong."):
+        if ft is None and pt is None:
+            st.caption("No departures recorded yet — enter them week by week in the "
+                       "roster grid (*Attrition (actual)* / *PT Attrition (actual)*) "
+                       "and the trend appears here.")
+            return
+        cols = st.columns(2)
+        for col, name, df in ((cols[0], "Full-time", ft), (cols[1], "Part-time", pt)):
+            with col:
+                st.markdown(f"**{name}**")
+                if df is None:
+                    st.caption("Nothing recorded on this line yet.")
+                    continue
+                last = int(df["recorded_through"].iloc[0])
+                wk = df["Week"].iloc[last]
+                rec, mod = float(df["Recorded"].iloc[last]), float(df["Modelled"].iloc[last])
+                gap = rec - mod
+                st.caption(f"Recorded through **{wk}**: **{rec:.1f}** left vs "
+                           f"**{mod:.1f}** modelled — "
+                           + (f"**{gap:+.1f}** " + ("more than" if gap > 0 else "fewer than")
+                              + " the rate predicted." if abs(gap) >= 0.05 else "on the rate."))
+                long = df.melt("Week", value_vars=["Modelled", "Recorded"],
+                               var_name="Series", value_name="Departures").dropna()
+                ch = alt.Chart(long).mark_line(strokeWidth=2.2).encode(
+                    x=alt.X("Week:O", sort=None, axis=_month_axis()),
+                    y=alt.Y("Departures:Q", title="Cumulative departures"),
+                    color=alt.Color("Series:N",
+                                    scale=alt.Scale(domain=["Modelled", "Recorded"],
+                                                    range=[brand.MUTED, brand.DEMAND]),
+                                    legend=alt.Legend(title=None, orient="top")),
+                    strokeDash=alt.condition(alt.datum.Series == "Modelled",
+                                             alt.value([5, 3]), alt.value([1, 0])),
+                    tooltip=["Week", "Series", alt.Tooltip("Departures:Q", format=".1f")])
+                _tr = _today_rule(df["Week"].tolist())
+                brand.chart(ch + _tr if _tr is not None else ch, height=200)
 
 
 def _safe_name(x) -> str:
@@ -5019,8 +5115,10 @@ def plan_with_demand_benchmarks(plan: pd.DataFrame, lob: str | None) -> pd.DataF
              "Production HC (start)", "Production HC",
              "Prod HC — FT (start)", "Prod HC — FT", "Prod HC — PT",
              "Supervisors", "Supervisor Ratios", "Leads/Project", "Leads/Project Ratios", "Support Staff", "Overall HC",
-             "Attrition", "Attrition (actual)", "Transfers +/-", "NH Grads",
-             "Attrition — PT", "PT Attrition (actual)", "PT Hires +/-",
+             "Attrition", "Attrition (actual)", "Attrition (modelled)",
+             "Transfers +/-", "NH Grads",
+             "Attrition — PT", "PT Attrition (actual)", "Attrition — PT (modelled)",
+             "PT Hires +/-",
              "Ramp Discount",
              "PT Discount", "Closure Discount", "NH Lab HC", "Lab FTE",
              "LOA", "Mentors", "Staffed FTE", "Net FTE",
@@ -5266,7 +5364,8 @@ def _month_axis() -> "alt.Axis":
 def _today_rule(weeks: list[str]):
     """Dashed amber 'today' marker at the current week, when it's in-horizon."""
     import altair as alt
-    tw = (date.today() - timedelta(days=date.today().weekday())).isoformat()
+    _t = _today()                     # the one clock read (CP_TODAY honours it)
+    tw = (_t - timedelta(days=_t.weekday())).isoformat()
     if tw not in weeks:
         return None
     df = pd.DataFrame({"Week": [tw]})
@@ -7576,6 +7675,8 @@ else:
                 "lands near a sixth of the real figure. "
                 "In production this table is written to the shared database "
                 "by the scheduled engine.")
+
+        render_attrition_trend(plan, lob["roster"], view)
 
         with brand.section("recon", "Actuals & variance"):
             recon = build_reconciliation(plan, lob, view)
