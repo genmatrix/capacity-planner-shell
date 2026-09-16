@@ -4968,12 +4968,31 @@ def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.nda
     months = [period_key(w, "Monthly") for w in weeks]
     order = list(dict.fromkeys(months))
     xo = np.zeros(len(rec)) if xo is None else xo
-    rows, ytd_r, ytd_m = [], 0.0, 0.0
+    rows, ytd_r, ytd_m, cum_proj = [], 0.0, 0.0, 0.0
     for m in order:
         idx_all = [i for i, k in enumerate(months) if k == m]
         idx = [i for i in idx_all if i <= last]
+        # The WHOLE year (user 2026-09-18: "show me the rest of the months
+        # with just projected"): every month gets a row. `Projected` is the
+        # modelled figure over ALL of the month's weeks; `Modelled` stays the
+        # like-for-like figure over the weeks actually recorded, so a partial
+        # month's Δ still compares two weeks against two. Months past the
+        # last record carry Projected only — Recorded and Δ blank, never 0.
+        proj = float(mod[idx_all].sum())
+        h_all = float(hc[idx_all].sum())
+        cum_proj += proj
         if not idx:
-            break
+            rows.append({
+                "Month": m, "Weeks": f"{len(idx_all)} (projected)",
+                "Departures": np.nan, "Transfers out": np.nan,
+                "Recorded": np.nan, "Modelled": np.nan, "Δ": np.nan,
+                "Recorded %/yr": np.nan,
+                "Assumed %/yr": (round(proj * 52 / h_all * 100, 1) if h_all > 0 else np.nan),
+                "Projected": round(proj, 1),
+                "YTD recorded": np.nan, "YTD modelled": np.nan, "YTD Δ": np.nan,
+                "Year projected (cum.)": round(cum_proj, 1),
+            })
+            continue
         dep, x, md, h = (float(rec[idx].sum()), float(xo[idx].sum()),
                          float(mod[idx].sum()), float(hc[idx].sum()))
         r = dep + x                    # recorded = departures + transfers out
@@ -4986,8 +5005,10 @@ def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.nda
             "Recorded": round(r, 1), "Modelled": round(md, 1), "Δ": round(r - md, 1),
             "Recorded %/yr": (round(r * 52 / h * 100, 1) if h > 0 else np.nan),
             "Assumed %/yr": (round(md * 52 / h * 100, 1) if h > 0 else np.nan),
+            "Projected": round(proj, 1),
             "YTD recorded": round(ytd_r, 1), "YTD modelled": round(ytd_m, 1),
             "YTD Δ": round(ytd_r - ytd_m, 1),
+            "Year projected (cum.)": round(cum_proj, 1),
         })
     return pd.DataFrame(rows)
 
@@ -5036,14 +5057,14 @@ def attrition_by_month_consolidated(lobs: dict, line: str = "all") -> pd.DataFra
 def _render_month_table(df: pd.DataFrame, key: str):
     """The monthly table plus a recorded-vs-modelled bar pair per month."""
     import altair as alt
-    long = df.melt("Month", value_vars=["Recorded", "Modelled"],
-                   var_name="Series", value_name="People")
+    long = df.melt("Month", value_vars=["Recorded", "Projected"],
+                   var_name="Series", value_name="People").dropna()
     ch = alt.Chart(long).mark_bar(cornerRadius=2).encode(
         x=alt.X("Month:O", sort=None, axis=alt.Axis(title=None, labelAngle=0)),
         xOffset="Series:N",
         y=alt.Y("People:Q", title="Departures"),
         color=alt.Color("Series:N",
-                        scale=alt.Scale(domain=["Modelled", "Recorded"],
+                        scale=alt.Scale(domain=["Projected", "Recorded"],
                                         range=[brand.MUTED, brand.DEMAND]),
                         legend=alt.Legend(title=None, orient="top")),
         tooltip=["Month", "Series", alt.Tooltip("People:Q", format=".1f")])
@@ -5097,12 +5118,14 @@ def render_attrition_trend(plan: pd.DataFrame, roster: pd.DataFrame, view: str):
         _mm = attrition_by_month(plan, roster, "all")
         if _mm is not None and not _mm.empty:
             st.markdown("**Month over month, to date**")
-            st.caption("A week counts in the month its Monday falls in (the Budget "
-                       "page's calendar). Recorded = departures (full-time and "
-                       "part-time) + transfers out of this line. Modelled is summed "
-                       "over the same weeks you have recorded, so a partial month "
-                       "compares like with like. Rates: recorded × 52 ÷ start-of-week "
-                       "headcount, both lines.")
+            st.caption("Every month of the year. A week counts in the month its Monday "
+                       "falls in (the Budget page's calendar). Recorded = departures "
+                       "(full-time and part-time) + transfers out of this line. "
+                       "Modelled is summed over the same weeks you have recorded, so a "
+                       "partial month compares like with like; Projected is the whole "
+                       "month at the assumed rate, and months past your last record "
+                       "carry Projected only. Rates: × 52 ÷ start-of-week headcount, "
+                       "both lines.")
             _render_month_table(_mm, _safe_name(view))
 
 
