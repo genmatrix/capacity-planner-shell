@@ -243,6 +243,7 @@ ASSUMPTION_LABELS = {
     "members_end": "Members — year-end",
     "start_sync_year": "Start synced from (year)",
     "start_sync_version": "Start synced from (version)",
+    "carried_classes": "Classes carried from the prior year",
     "supervisors": "Supervisors (legacy flat)",
     "leads": "Leads/Project (legacy flat)",
 }
@@ -2253,6 +2254,57 @@ def measured_attrition_pct(lob_data: dict, line: str = "ft") -> tuple[float, int
     return (float(act[weeks_with].sum() / at_risk * 52 * 100), int(weeks_with.sum()))
 
 
+def straddling_class_rows(nh: pd.DataFrame, weeks: list[str], new_week0: str) -> list[dict]:
+    """NH classes whose graduation lands beyond this year's horizon, re-entered
+    at the new year's week 1 with their REMAINING training/coaching weeks
+    (stage attrition kept only for a stage with weeks left — survivors of a
+    finished stage are not attrited twice). Shared by rollover and the
+    sync-start panel so the two can never disagree. Each row carries
+    `src_start` (the class's start week in the OLD year) as its identity."""
+    idx = {w: i for i, w in enumerate(weeks)}
+
+    def _n(v, default=0.0):
+        x = pd.to_numeric(v, errors="coerce")
+        return float(default) if pd.isna(x) else float(x)
+
+    rows = []
+    if nh is None or nh.empty or "Class Start Week" not in nh.columns:
+        return rows
+    for _, r in nh.dropna(subset=["Class Start Week"]).iterrows():
+        if r["Class Start Week"] not in idx:
+            continue
+        if _n(r.get("Class Size")) <= 0:
+            continue                  # half-typed row: nothing to carry
+        tr, co = int(_n(r.get("Training Wks"))), int(_n(r.get("Coaching Wks")))
+        done = len(idx) - idx[r["Class Start Week"]]  # weeks elapsed by Dec 31
+        rem = tr + co - done
+        if rem <= 0:
+            continue                      # graduated inside the old year
+        rem_tr = max(0, tr - done)
+        rows.append({
+            "src_start": str(r["Class Start Week"]),
+            "Class Start Week": new_week0,
+            "Class Size": _n(r.get("Class Size")),
+            "Training Wks": float(rem_tr),
+            "Coaching Wks": float(rem - rem_tr),
+            "Training Attr %": (_n(r.get("Training Attr %")) if rem_tr > 0 else 0.0),
+            "Coaching Attr %": _n(r.get("Coaching Attr %")),
+            "Actual Grads": np.nan,      # hasn't graduated yet
+        })
+    return rows
+
+
+def _stored_rows(rows: list[dict]) -> list[dict]:
+    """JSON-safe copy of carried rows (NaN → None) for the assumptions dict."""
+    return [{k: (None if _is_blank(v) else v) for k, v in r.items()} for r in rows]
+
+
+def _row_matches(row, stored: dict) -> bool:
+    """A grid row equals a stored carried row on every grid field (blank- and
+    float-tolerant). `src_start` is identity, not a grid field."""
+    return all(_cells_equal(row.get(k), v) for k, v in stored.items() if k != "src_start")
+
+
 def roll_over_plan(cpm_seed: dict | None = None) -> None:
     """Seed next year's working plan from the current one. Carry rules:
     ending production HC → starting HC; year-end members → starting members
@@ -2326,34 +2378,11 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
             "Leads/Project": [last("Leads/Project", ros)
                               if "Leads/Project" in ros.columns else 0.0] * n,
         })
-        nh_rows = []
-        idx = {w: i for i, w in enumerate(dem["Week"].tolist())}
-
-        def _n(v, default=0.0):
-            x = pd.to_numeric(v, errors="coerce")
-            return float(default) if pd.isna(x) else float(x)
-
-        for _, r in nh.dropna(subset=["Class Start Week"]).iterrows():
-            if r["Class Start Week"] not in idx:
-                continue
-            if _n(r.get("Class Size")) <= 0:
-                continue                  # half-typed row: nothing to carry
-            tr, co = int(_n(r.get("Training Wks"))), int(_n(r.get("Coaching Wks")))
-            done = len(idx) - idx[r["Class Start Week"]]  # weeks elapsed by Dec 31
-            rem = tr + co - done
-            if rem <= 0:
-                continue                      # graduated inside the old year
-            rem_tr = max(0, tr - done)
-            nh_rows.append({
-                "Class Start Week": new_weeks[0],
-                "Class Size": _n(r.get("Class Size")),
-                "Training Wks": float(rem_tr),
-                "Coaching Wks": float(rem - rem_tr),
-                "Training Attr %": (_n(r.get("Training Attr %")) if rem_tr > 0 else 0.0),
-                "Coaching Attr %": _n(r.get("Coaching Attr %")),
-                "Actual Grads": np.nan,      # hasn't graduated yet
-            })
+        nh_rows = straddling_class_rows(nh, dem["Week"].tolist(), new_weeks[0])
         a = dict(d["assumptions"])
+        # The rows carried in, remembered so a later sync can tell an
+        # untouched carried class (replace) from one the planner edited (keep).
+        a["carried_classes"] = _stored_rows(nh_rows)
         # Ending FULL-TIME walk seeds the new year's FT count; the flat PT
         # count rides along unchanged in the assumptions copy.
         a["starting_hc"] = float(plan["Prod HC — FT"].iloc[-1])
@@ -2409,11 +2438,13 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
 # and merging derived rows with typed ones is where this would get messy.
 # ----------------------------------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=16)
-def _prior_year_end_cached(scen_dir: str, fname: str) -> dict:
+def _prior_year_end_cached(scen_dir: str, fname: str, prior_year: int) -> dict:
     """What a published plan ENDS with, per LOB. Keyed on the version file,
     which is immutable, so this costs one computation per version ever."""
     snap = _cached_snapshot(scen_dir, fname)
     lobs = _payload_lobs(snap)
+    n = int(snap.get("n_weeks", 52) or 52)
+    new_week0 = week_starts(n, int(prior_year) + 1)[0].isoformat()
     out = {}
     for name, d in lobs.items():
         # Closures do not touch the headcount walk, so an explicit empty
@@ -2421,10 +2452,15 @@ def _prior_year_end_cached(scen_dir: str, fname: str) -> dict:
         plan = compute_plan(d, closures=({}, (DEFAULT_WEEKDAY_HOURS,
                                               DEFAULT_SATURDAY_HOURS)))
         a = d.get("assumptions") or {}
+        ros = d["roster"]
+        loa_last = pd.to_numeric(ros["LOA"], errors="coerce").iloc[-1] if "LOA" in ros.columns else np.nan
         out[name] = {"ft": float(plan["Prod HC — FT"].iloc[-1]),
                      "pt": float(plan["Prod HC — PT"].iloc[-1]),
                      "own": _lob_owns_members(a),
-                     "members_end_own": float(a.get("members_end_own", 0.0) or 0.0)}
+                     "members_end_own": float(a.get("members_end_own", 0.0) or 0.0),
+                     "loa": float(loa_last) if pd.notna(loa_last) else 0.0,
+                     "classes": straddling_class_rows(d["nh"], d["demand"]["Week"].tolist(),
+                                                      new_week0)}
     m_end = float(snap.get("members_end", 0.0) or 0.0)
     ma = snap.get("members_actual") or []
     last_actual = ma[-1] if ma else None
@@ -2442,7 +2478,7 @@ def prior_year_end_state(year: int) -> dict | None:
     act = collab.read_active(SCENARIO_DIR, py)
     if not act:
         return None
-    st_ = dict(_prior_year_end_cached(str(SCENARIO_DIR), act["file"]))
+    st_ = dict(_prior_year_end_cached(str(SCENARIO_DIR), act["file"], py))
     st_["year"] = py
     st_["version"] = int(act["version"])
     st_["name"] = act.get("name", "")
@@ -2492,6 +2528,17 @@ def start_sync_preview(year: int, lobs: dict, members_start_now: float) -> list[
             rows.append({"LOB": name, "Line": "Members (own)", "Now": now,
                          col_from: src["members_end_own"],
                          "Δ": src["members_end_own"] - now})
+        ros = d["roster"]
+        loa_now = (float(pd.to_numeric(ros["LOA"], errors="coerce").fillna(0).iloc[0])
+                   if "LOA" in ros.columns and len(ros) else 0.0)
+        rows.append({"LOB": name, "Line": "LOA (week 1 level)", "Now": loa_now,
+                     col_from: src["loa"], "Δ": round(src["loa"] - loa_now, 1)})
+        carried = a.get("carried_classes") or []
+        present = sum(1 for c in carried
+                      if any(_row_matches(r, c) for _, r in d["nh"].iterrows()))
+        rows.append({"LOB": name, "Line": "Classes straddling Dec 31",
+                     "Now": float(present), col_from: float(len(src["classes"])),
+                     "Δ": None})
     rows.append({"LOB": "Members (org-wide)",
                  "Line": "actual" if st_["members_from_actual"] else "forecast",
                  "Now": float(members_start_now),
@@ -2500,14 +2547,26 @@ def start_sync_preview(year: int, lobs: dict, members_start_now: float) -> list[
     return rows
 
 
-def sync_start_from_prior_year() -> list[str]:
-    """Apply the sync to the working plan. Returns the LOBs changed. Touches
-    counts only — never frames — and re-seeds the sidebar widgets."""
+def sync_start_from_prior_year() -> dict:
+    """Apply the sync to the working plan. Returns {"changed": [LOBs],
+    "kept": [(LOB, what)]} — `kept` names carried rows the planner had edited
+    here, which the sync leaves alone rather than overwrite or duplicate.
+
+    LOA (2026-09-16): the prior year's final level replaces this plan's
+    LEADING run — week 1 up to the first week whose LOA differs from week 1's.
+    That run is what rollover seeded; a level the planner typed from week 20
+    on is theirs and stays.
+    Straddling classes: identity is the class's start week in the prior year
+    (`src_start`). A carried row still exactly as carried is REPLACED by the
+    fresh derivation (remaining weeks may have changed); one the planner
+    edited or deleted is KEPT as they left it and no fresh copy is added; a
+    class that no longer straddles (removed in the prior year) is dropped if
+    untouched; a newly straddling class is appended."""
     year = plan_year()
     st_ = prior_year_end_state(year)
     if st_ is None:
-        return []
-    changed = []
+        return {"changed": [], "kept": []}
+    changed, kept = [], []
     for name, d in st.session_state.lobs.items():
         src = st_["lobs"].get(name)
         if src is None:
@@ -2517,12 +2576,46 @@ def sync_start_from_prior_year() -> list[str]:
         a["starting_hc_pt"] = src["pt"]
         if _lob_owns_members(a):
             a["members_start_own"] = src["members_end_own"]
+        # LOA: replace the leading constant run only.
+        ros = d["roster"]
+        if "LOA" in ros.columns and len(ros):
+            # .copy(): pandas 3 CoW can hand back a read-only view here.
+            loa = pd.to_numeric(ros["LOA"], errors="coerce").fillna(0).to_numpy(dtype=float).copy()
+            first = loa[0]
+            k = int(np.argmax(loa != first)) if (loa != first).any() else len(loa)
+            loa[:k] = src["loa"]
+            ros["LOA"] = loa
+        # Classes.
+        nh = d["nh"]
+        carried = {c.get("src_start"): c for c in (a.get("carried_classes") or [])}
+        fresh = {r["src_start"]: r for r in src["classes"]}
+        keep_mask = np.ones(len(nh), dtype=bool)
+        new_rows, new_carried = [], []
+        for src_start, c in carried.items():
+            hits = [i for i, (_, r) in enumerate(nh.iterrows()) if _row_matches(r, c)]
+            if not hits:                   # edited or deleted here → theirs
+                if src_start in fresh:
+                    kept.append((name, f"class from {src_start}"))
+                    new_carried.append(c)  # still remembered so it is not re-added
+                continue
+            keep_mask[hits[0]] = False     # untouched carried row → replaced/dropped
+            if src_start in fresh:
+                new_rows.append(fresh[src_start])
+                new_carried.append(fresh[src_start])
+        for src_start, r in fresh.items():
+            if src_start not in carried:   # newly straddling → append
+                new_rows.append(r)
+                new_carried.append(r)
+        cols = list(nh.columns)
+        d["nh"] = pd.concat([nh[keep_mask], pd.DataFrame(new_rows, columns=cols)],
+                            ignore_index=True) if new_rows else nh[keep_mask].reset_index(drop=True)
+        a["carried_classes"] = _stored_rows(new_carried)
         a["start_sync_year"] = st_["year"]
         a["start_sync_version"] = st_["version"]
         changed.append(name)
     st.session_state.members_start = st_["members_start_next"]
     _purge_assumption_widgets()
-    return changed
+    return {"changed": changed, "kept": kept}
 
 
 # ----------------------------------------------------------------------
@@ -4343,10 +4436,12 @@ with st.sidebar:
                         f"(now v{_sd['current_version']}).")
             st.caption(
                 f"Copies {_py}'s ending walk (last week of its *published* plan) into "
-                "this year's starting FT and PT counts, and its final membership "
-                "(last recorded actual, else the year-end forecast) into Members — "
-                "start. Classes straddling December and the LOA level are NOT touched "
-                "— those are rows you may have edited here. Preview first:")
+                "this year's starting FT and PT counts, its final membership (last "
+                "recorded actual, else the year-end forecast) into Members — start, "
+                "its final LOA level into this plan's opening weeks (up to the first "
+                "week you set a different level), and re-derives the classes still in "
+                "training on Dec 31. A carried class you edited here is kept as you "
+                "left it, never overwritten or duplicated. Preview first:")
             _rows = start_sync_preview(_yr, st.session_state.lobs,
                                        float(st.session_state.get("members_start", 0.0) or 0.0))
             if _rows:
@@ -4354,10 +4449,16 @@ with st.sidebar:
             _sure = st.checkbox(f"Replace this plan's starting counts with {_py}'s ending walk",
                                 key="sync_confirm", disabled=RO)
             if st.button(f"Sync start from {_py}", disabled=RO or not _sure, key="sync_btn"):
-                _done = sync_start_from_prior_year()
-                st.success(f"Synced {len(_done)} LOB(s) from {_py} v{_sd['current_version']}. "
-                           "Publish when you're happy with it.")
+                _res = sync_start_from_prior_year()
+                st.session_state["_sync_report"] = (
+                    f"Synced {len(_res['changed'])} LOB(s) from {_py} "
+                    f"v{_sd['current_version']}. Publish when you're happy with it."
+                    + ((" Kept as you edited them: "
+                        + ", ".join(f"{l} ({w})" for l, w in _res["kept"]) + ".")
+                       if _res["kept"] else ""))
                 st.rerun()
+            if st.session_state.get("_sync_report"):
+                st.success(st.session_state.pop("_sync_report"))
 
     st.subheader("Membership (all LOBs)")
     st.caption("One org-wide member base — spreads linearly from start (actual) to "
