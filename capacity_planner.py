@@ -5943,8 +5943,10 @@ the number moved from 6 to 33.
 3. Enter the new year-end member forecast, review, then publish.
 4. **As this year's actuals keep landing**, the new year's start drifts from
    the truth. Sidebar → **Sync start from <this year>** copies the ending walk
-   (FT and PT) and the final membership from this year's *published* plan
-   into the new year's starting counts, with a preview of every delta. The
+   (FT and PT), the final membership, the final LOA level and the classes
+   still in training on Dec 31 from this year's *published* plan into the new
+   year, with a preview of every delta. Anything you already edited in the
+   new year is kept as you left it, never overwritten or duplicated. The
    panel and the weekly checklist say when this year has moved to a newer
    version than the start was synced from, so nothing has to be remembered.
 5. **This year keeps running.** Each year is its own plan with its own versions
