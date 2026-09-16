@@ -4883,23 +4883,19 @@ def attrition_trend_frame(plan: pd.DataFrame, roster: pd.DataFrame,
     Recorded figures come from the ROSTER, not the plan row: the engine
     writes 0 into the plan's actual row for elapsed blank weeks (its
     blank-elapsed-is-0 rule), which would make every elapsed week look
-    recorded."""
-    act_col, mod_col = (("Attrition (actual)", "Attrition (modelled)") if line == "ft"
-                        else ("PT Attrition (actual)", "Attrition — PT (modelled)"))
-    if act_col not in roster.columns or mod_col not in plan.columns or len(roster) != len(plan):
+    recorded.
+    Since 2026-09-17 the recorded series INCLUDES transfers out of the line
+    (negative `Transfers +/-`) — see `_attrition_weekly`."""
+    w = _attrition_weekly(plan, roster, line)
+    if w is None:
         return None
-    act = pd.to_numeric(roster[act_col], errors="coerce").to_numpy(dtype=float)
-    if not np.isfinite(act).any():
-        return None
-    last = int(np.flatnonzero(np.isfinite(act)).max())
-    mod = pd.to_numeric(plan[mod_col], errors="coerce").fillna(0).to_numpy(dtype=float)
-    cum_act = np.cumsum(np.nan_to_num(act, nan=0.0))
+    act, mod, _hc, last, xo = w
+    cum_act = np.cumsum(act + xo)
     cum_mod = np.cumsum(mod)
-    out = pd.DataFrame({"Week": plan["Week"].tolist(),
-                        "Modelled": cum_mod.round(2),
-                        "Recorded": np.where(np.arange(len(act)) <= last, cum_act, np.nan).round(2),
-                        "recorded_through": last})
-    return out
+    return pd.DataFrame({"Week": plan["Week"].tolist(),
+                         "Modelled": cum_mod.round(2),
+                         "Recorded": np.where(np.arange(len(act)) <= last, cum_act, np.nan).round(2),
+                         "recorded_through": last})
 
 
 def _attrition_weekly(plan: pd.DataFrame, roster: pd.DataFrame, line: str):
@@ -4921,11 +4917,21 @@ def _attrition_weekly(plan: pd.DataFrame, roster: pd.DataFrame, line: str):
         start = (pd.to_numeric(plan["Prod HC — PT"], errors="coerce").fillna(0).to_numpy(dtype=float)
                  + pd.to_numeric(plan["Attrition — PT"], errors="coerce").fillna(0).to_numpy(dtype=float)
                  - pd.to_numeric(plan["PT Hires +/-"], errors="coerce").fillna(0).to_numpy(dtype=float))
-    return np.nan_to_num(act, nan=0.0), mod, start, last
+    # A transfer OUT of the line is a departure from the line (user 2026-09-17:
+    # "negative transfers need to count toward attrition"). Reporting only —
+    # the walk already subtracts transfers, and the assumed RATE stays pure
+    # attrition (Adopt must not learn a rate that includes transfers the plan
+    # also types, or future ones would be subtracted twice).
+    if line == "ft" and "Transfers +/-" in roster.columns:
+        xo = np.clip(-pd.to_numeric(roster["Transfers +/-"], errors="coerce")
+                     .fillna(0).to_numpy(dtype=float), 0.0, None)
+    else:
+        xo = np.zeros(len(act))
+    return np.nan_to_num(act, nan=0.0), mod, start, last, xo
 
 
 def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.ndarray,
-                  last: int) -> pd.DataFrame:
+                  last: int, xo: np.ndarray | None = None) -> pd.DataFrame:
     """Month-over-month to date. A week belongs to the month its MONDAY is in
     (`period_key`, the Budget page's calendar — one calendar for contacts and
     attrition). "To date" = through the last recorded week; the modelled
@@ -4937,18 +4943,22 @@ def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.nda
     headcount-weighted blend of the LOBs' assumptions for free."""
     months = [period_key(w, "Monthly") for w in weeks]
     order = list(dict.fromkeys(months))
+    xo = np.zeros(len(rec)) if xo is None else xo
     rows, ytd_r, ytd_m = [], 0.0, 0.0
     for m in order:
         idx_all = [i for i, k in enumerate(months) if k == m]
         idx = [i for i in idx_all if i <= last]
         if not idx:
             break
-        r, md, h = float(rec[idx].sum()), float(mod[idx].sum()), float(hc[idx].sum())
+        dep, x, md, h = (float(rec[idx].sum()), float(xo[idx].sum()),
+                         float(mod[idx].sum()), float(hc[idx].sum()))
+        r = dep + x                    # recorded = departures + transfers out
         ytd_r += r
         ytd_m += md
         rows.append({
             "Month": m,
             "Weeks": (f"{len(idx)} of {len(idx_all)}" if len(idx) < len(idx_all) else str(len(idx))),
+            "Departures": round(dep, 1), "Transfers out": round(x, 1),
             "Recorded": round(r, 1), "Modelled": round(md, 1), "Δ": round(r - md, 1),
             "Recorded %/yr": (round(r * 52 / h * 100, 1) if h > 0 else np.nan),
             "Assumed %/yr": (round(md * 52 / h * 100, 1) if h > 0 else np.nan),
@@ -4964,8 +4974,8 @@ def attrition_by_month(plan: pd.DataFrame, roster: pd.DataFrame,
     w = _attrition_weekly(plan, roster, line)
     if w is None:
         return None
-    rec, mod, hc, last = w
-    return _monthly_rows(plan["Week"].tolist(), rec, mod, hc, last)
+    rec, mod, hc, last, xo = w
+    return _monthly_rows(plan["Week"].tolist(), rec, mod, hc, last, xo)
 
 
 def attrition_by_month_consolidated(lobs: dict, line: str = "ft") -> pd.DataFrame | None:
@@ -4981,37 +4991,38 @@ def attrition_by_month_consolidated(lobs: dict, line: str = "ft") -> pd.DataFram
         w = _attrition_weekly(plan, d["roster"], line)
         if w is None:
             continue
-        rec, mod, hc, last = w
+        rec, mod, hc, last, xo = w
         if tot_r is None:
             n = len(rec)
             weeks = plan["Week"].tolist()
-            tot_r, tot_m, tot_h = np.zeros(n), np.zeros(n), np.zeros(n)
+            tot_r, tot_m, tot_h, tot_x = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
         if len(rec) != n:
             continue
         mask = np.arange(n) <= last
         tot_r += np.where(mask, rec, 0.0)
         tot_m += np.where(mask, mod, 0.0)
         tot_h += np.where(mask, hc, 0.0)
+        tot_x += np.where(mask, xo, 0.0)
         last_any = max(last_any, last)
     if tot_r is None:
         return None
-    return _monthly_rows(weeks, tot_r, tot_m, tot_h, last_any)
+    return _monthly_rows(weeks, tot_r, tot_m, tot_h, last_any, tot_x)
 
 
 def _render_month_table(df: pd.DataFrame, key: str):
     """The monthly table plus a recorded-vs-modelled bar pair per month."""
     import altair as alt
     long = df.melt("Month", value_vars=["Recorded", "Modelled"],
-                   var_name="Series", value_name="Departures")
+                   var_name="Series", value_name="People")
     ch = alt.Chart(long).mark_bar(cornerRadius=2).encode(
         x=alt.X("Month:O", sort=None, axis=alt.Axis(title=None, labelAngle=0)),
         xOffset="Series:N",
-        y=alt.Y("Departures:Q", title="Departures"),
+        y=alt.Y("People:Q", title="Departures"),
         color=alt.Color("Series:N",
                         scale=alt.Scale(domain=["Modelled", "Recorded"],
                                         range=[brand.MUTED, brand.DEMAND]),
                         legend=alt.Legend(title=None, orient="top")),
-        tooltip=["Month", "Series", alt.Tooltip("Departures:Q", format=".1f")])
+        tooltip=["Month", "Series", alt.Tooltip("People:Q", format=".1f")])
     brand.chart(ch, height=160)
     st.dataframe(df, hide_index=True, width="stretch")
     st.download_button("Download month-over-month CSV",
@@ -5029,7 +5040,8 @@ def render_attrition_trend(plan: pd.DataFrame, roster: pd.DataFrame, view: str):
     with brand.section("attr_trend", "Attrition — recorded vs. modelled",
                        "Cumulative departures from week 1. The dashed line is what the "
                        "assumed rate takes each week on the real headcount; the solid "
-                       "line is what you recorded. Where they part is where the rate "
+                       "line is what you recorded PLUS transfers out of this line "
+                       "(negative Transfers +/-). Where they part is where the rate "
                        "assumption is wrong."):
         if ft is None and pt is None:
             st.caption("No departures recorded yet — enter them week by week in the "
@@ -5069,9 +5081,10 @@ def render_attrition_trend(plan: pd.DataFrame, roster: pd.DataFrame, view: str):
                 if _mm is not None and not _mm.empty:
                     st.markdown("**Month over month, to date**")
                     st.caption("A week counts in the month its Monday falls in (the Budget "
-                               "page's calendar). Modelled is summed over the same weeks "
-                               "you have recorded, so a partial month compares like with "
-                               "like. Rates: departures × 52 ÷ start-of-week headcount.")
+                               "page's calendar). Recorded = departures + transfers out of "
+                               "this line. Modelled is summed over the same weeks you have "
+                               "recorded, so a partial month compares like with like. "
+                               "Rates: recorded × 52 ÷ start-of-week headcount.")
                     _render_month_table(_mm, f"{_safe_name(view)}_{'ft' if name == 'Full-time' else 'pt'}")
 
 
@@ -7519,9 +7532,12 @@ elif view == CONSOLIDATED:
     render_plan_grid(plan, "Consolidated totals. Select an LOB in the sidebar to edit its inputs.")
     with brand.section("attr_month_all", "Attrition — month over month, all LOBs",
                        "Recorded vs modelled departures summed across every line, each "
-                       "counted through its own last recorded week. Rates are departures "
-                       "× 52 ÷ start-of-week headcount; Assumed %/yr is the headcount-"
-                       "weighted blend of the lines' assumptions."):
+                       "counted through its own last recorded week. Recorded = departures "
+                       "+ transfers out of each line; a transfer between two lines here "
+                       "lands as a transfer IN elsewhere, so read Departures for org-level "
+                       "leavers. Rates are recorded × 52 ÷ start-of-week headcount; "
+                       "Assumed %/yr is the headcount-weighted blend of the lines' "
+                       "assumptions."):
         _any = False
         for _line, _label in (("ft", "Full-time"), ("pt", "Part-time")):
             _mm = attrition_by_month_consolidated(st.session_state.lobs, _line)
