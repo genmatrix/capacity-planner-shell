@@ -2271,6 +2271,60 @@ def _bench_series(key: str, col: str, lob: str | None, weeks) -> pd.Series | Non
     return aligned if aligned.notna().any() else None
 
 
+def actual_required_and_staffed(lob_names: list[str], weeks: list[str]
+                                ) -> tuple[np.ndarray, np.ndarray]:
+    """(required actual, staffed actual) FTE per plan week, summed over
+    `lob_names`, NaN where there is no complete actual week.
+
+    REQUIRED ACTUAL (director ask 2026-10-14) = what the plan's own math says
+    was needed for the volume and handle time that ACTUALLY arrived: each
+    LOB's plan is recomputed with its actual contacts as the forecast and its
+    actual AHT, and every other assumption unchanged (shrinkage, occupancy,
+    margin, Erlang/workload basis). So the two Required lines differ ONLY by
+    what came in — a like-for-like comparison, never two formulas.
+    STAFFED ACTUAL = the ACD's measured staffed FTE.
+
+    A summed week needs EVERY LOB that plans demand that week to have its
+    actual — summing the ones that do would understate the total and read as
+    good news. Partial feed weeks are excluded (`_bench_series`)."""
+    lobs = st.session_state.get("lobs") or {}
+    n = len(weeks)
+    req_tot, stf_tot = np.zeros(n), np.zeros(n)
+    req_ok, stf_ok = np.ones(n, dtype=bool), np.ones(n, dtype=bool)
+    any_req, any_stf = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+    for name in lob_names:
+        d = lobs.get(name)
+        if d is None or len(d["demand"]) != n:
+            continue
+        planned = compute_plan(d)["Required FTE"].to_numpy(dtype=float)
+        needs = planned > 0
+        c = _bench_series("acd_weekly", "Actual Contacts", name, weeks)
+        h = _bench_series("acd_weekly", "Actual AHT (sec)", name, weeks)
+        if c is not None and h is not None:
+            c, h = c.to_numpy(dtype=float), h.to_numpy(dtype=float)
+            have = np.isfinite(c) & np.isfinite(h) & (h > 0)
+            dem = d["demand"].copy()
+            dem.loc[have, "Fcst Override"] = c[have]
+            dem.loc[have, "AHT (sec)"] = h[have]
+            act = compute_plan({**d, "demand": dem})["Required FTE"].to_numpy(dtype=float)
+            req_tot += np.where(have, act, 0.0)
+            any_req |= have
+            req_ok &= have | ~needs
+        else:
+            req_ok &= ~needs
+        sa = _bench_series("acd_weekly", "Actual Staffed FTE", name, weeks)
+        if sa is not None:
+            sa = sa.to_numpy(dtype=float)
+            stf_tot += np.nan_to_num(sa, nan=0.0)
+            any_stf |= np.isfinite(sa)
+            stf_ok &= np.isfinite(sa) | ~needs
+        else:
+            stf_ok &= ~needs
+    req = np.where(req_ok & any_req, req_tot, np.nan)
+    stf = np.where(stf_ok & any_stf, stf_tot, np.nan)
+    return req, stf
+
+
 CPM_MIN_WEEKS = 8    # same discipline as attrition/seasonality: few weeks = noise
 
 
@@ -6097,19 +6151,106 @@ def render_executive_view():
         brand.chart(heat, height=32 * len(lobs) + 60)
 
     # ---- demand vs supply walk ----------------------------------------
-    with brand.section("walk", "Demand vs. supply — consolidated"):
-        ln = pd.DataFrame({"Week": weeks, "Required": cons_req, "Staffed": cons_stf}) \
-            .melt("Week", var_name="Series", value_name="FTE")
-        ln_chart = alt.Chart(ln).mark_line(strokeWidth=2.5).encode(
-            x=alt.X("Week:O", sort=None, axis=_month_axis()),
-            y=alt.Y("FTE:Q", title="FTE"),
-            color=alt.Color("Series:N",
-                            scale=alt.Scale(domain=["Required", "Staffed"],
-                                            range=[brand.DEMAND, brand.SUPPLY]),
-                            legend=alt.Legend(title=None, orient="top")),
-            tooltip=["Week", "Series", alt.Tooltip("FTE:Q", format=".1f")])
+    # Director's layout (2026-10-14): Required as LINES, Staffing as SHADED
+    # AREAS, planned and actual of each. Stakeholders outside WFM read it at a
+    # glance — the shaded body is the people we have, the line is the people
+    # the work needs, and wherever the line rides above the shading we are
+    # short. Planned vs actual is carried by ENCODING, not new colours: the two
+    # validated data hues stay (DEMAND for required, SUPPLY for staffing);
+    # planned is the dashed line / pale fill, actual the solid line / deeper
+    # fill. Actuals stop at the last complete ACD week.
+    _req_act, _stf_act = actual_required_and_staffed(lobs, weeks)
+    _has_act = bool(np.isfinite(_req_act).any() or np.isfinite(_stf_act).any())
+    _scope_name = "all lines of business" if scope is None else scope
+    with brand.section("walk", f"Demand vs. supply — {_scope_name}"):
+        wide = pd.DataFrame({
+            "Week": weeks,
+            "Required — planned": np.round(cons_req, 1),
+            "Required — actual": np.round(_req_act, 1),
+            "Staffing — planned": np.round(cons_stf, 1),
+            "Staffing — actual": np.round(_stf_act, 1),
+        })
+        _sw = [("Staffing — planned", "area", 0.2), ("Staffing — actual", "area", 0.42),
+               ("Required — planned", "dash", 0), ("Required — actual", "line", 0)]
+        _legend = []
+        for _name, _kind, _op in _sw:
+            if _name.endswith("actual") and not _has_act:
+                continue
+            if _kind == "area":
+                _icon = (f'<svg width="22" height="12" aria-hidden="true"><rect x="0" y="1" '
+                         f'width="22" height="10" rx="2" fill="{brand.SUPPLY}" '
+                         f'fill-opacity="{_op + (0.1 if _op < 0.3 else 0)}" '
+                         f'stroke="{brand.SUPPLY}" stroke-width="1"/></svg>')
+            else:
+                _da = ' stroke-dasharray="5 3"' if _kind == "dash" else ""
+                _icon = (f'<svg width="22" height="12" aria-hidden="true"><line x1="1" y1="6" '
+                         f'x2="21" y2="6" stroke="{brand.DEMAND}" stroke-width="2.5"'
+                         f'{_da} stroke-linecap="round"/></svg>')
+            _legend.append(f'<span style="display:inline-flex;align-items:center;gap:6px;'
+                           f'margin-right:18px;color:{brand.TEXT};font-size:12px">'
+                           f'{_icon}{_name}</span>')
+        st.markdown('<div style="margin:2px 0 6px">' + "".join(_legend) + "</div>",
+                    unsafe_allow_html=True)
+        _x = alt.X("Week:O", sort=None, axis=_month_axis())
+        _y = alt.Y("FTE:Q", title="FTE")
+        base = alt.Chart(wide)
+        layers = [
+            base.mark_area(color=brand.SUPPLY, opacity=0.2, interpolate="monotone")
+                .encode(x=_x, y=alt.Y("Staffing — planned:Q", title="FTE")),
+            base.mark_line(color=brand.SUPPLY, strokeWidth=1.5, opacity=0.85,
+                           interpolate="monotone")
+                .encode(x=_x, y="Staffing — planned:Q"),
+        ]
+        if _has_act:
+            layers += [
+                base.transform_filter("isValid(datum['Staffing — actual'])")
+                    .mark_area(color=brand.SUPPLY, opacity=0.42, interpolate="monotone")
+                    .encode(x=_x, y="Staffing — actual:Q"),
+            ]
+        layers += [
+            base.mark_line(color=brand.DEMAND, strokeWidth=2, strokeDash=[5, 3],
+                           interpolate="monotone")
+                .encode(x=_x, y="Required — planned:Q"),
+        ]
+        if _has_act:
+            layers += [
+                base.transform_filter("isValid(datum['Required — actual'])")
+                    .mark_line(color=brand.DEMAND, strokeWidth=2.5, interpolate="monotone")
+                    .encode(x=_x, y="Required — actual:Q"),
+            ]
+        # Hover: a crosshair on the nearest week with every series in one
+        # tooltip, plus the gap the reader is really asking about.
+        wide["Net — planned"] = np.round(cons_stf - cons_req, 1)
+        wide["Net — actual"] = np.round(_stf_act - _req_act, 1)
+        _tip = [alt.Tooltip("Week:O")] + [
+            alt.Tooltip(f"{c}:Q", format=".1f") for c in
+            ("Required — planned", "Staffing — planned", "Net — planned")] + (
+            [alt.Tooltip(f"{c}:Q", format=".1f") for c in
+             ("Required — actual", "Staffing — actual", "Net — actual")] if _has_act else [])
+        _hover = alt.selection_point(fields=["Week"], nearest=True, on="pointerover",
+                                     empty=False, clear="pointerout")
+        layers += [
+            alt.Chart(wide).mark_rule(color=brand.MUTED, strokeWidth=1).encode(
+                x=_x, opacity=alt.condition(_hover, alt.value(0.6), alt.value(0)),
+                tooltip=_tip).add_params(_hover),
+        ]
+        walk = alt.layer(*layers)
         _tr = _today_rule(weeks)
-        brand.chart(ln_chart + _tr if _tr is not None else ln_chart, height=240)
+        brand.chart(walk + _tr if _tr is not None else walk, height=260)
+        if _has_act:
+            st.caption("Actuals run to the last complete ACD week. **Required — actual** "
+                       "is what the plan's own math says you needed for the volume and "
+                       "handle time that actually arrived — same shrinkage, occupancy and "
+                       "basis as the plan, so the two Required lines differ only by what "
+                       "came in. **Staffing — actual** is measured logged-in time from the "
+                       "ACD; planned staffing counts people on payroll, so the actual area "
+                       "runs below the planned one by roughly your out-of-office shrinkage "
+                       "(vacation, sick, off-phone training).")
+        else:
+            st.caption("Planned only — load the ACD export (Real Data) and the actual "
+                       "Required line and Staffing area appear for the weeks it covers.")
+        with st.expander("Show the numbers"):
+            st.dataframe(wide.set_index("Week"), width="stretch")
         nf = pd.DataFrame({"Week": weeks, "Net": cons_net})
         nf_chart = alt.Chart(nf).mark_bar(opacity=.85, cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
