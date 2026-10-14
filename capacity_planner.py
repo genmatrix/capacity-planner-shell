@@ -4404,14 +4404,17 @@ with st.sidebar:
             del st.session_state.lobs[view]
             st.rerun()
 
-    # Keyed ("as_" prefix → purged with the other assumption widgets on plan
-    # load/rollover): its default is the value init_state() writes back, which
-    # without a stable key churns identity → the two-click bug.
-    n_weeks = st.slider("Planning horizon (weeks)", 12, 52, st.session_state.n_weeks,
-                        key="as_horizon", disabled=RO)
-    if n_weeks != st.session_state.n_weeks and not RO:
-        init_state(n_weeks)
-        st.rerun()
+    # The planning-horizon slider was RETIRED 2026-10-14 (audit high #1; user:
+    # "no one uses it"). Moving it rebuilt every LOB from blank frames with no
+    # confirm, and a plan shorter than a year no longer fits the app — each
+    # plan is a calendar year, rollover would carry the short length forward,
+    # and sync-start, the attrition tables and the budget assume 52 weeks.
+    # A plan published at another length (made with the old slider) still
+    # loads at its own length; say so, since nothing here can change it now.
+    if int(st.session_state.n_weeks) != WEEKS_PER_YEAR:
+        st.caption(f"This plan covers {int(st.session_state.n_weeks)} weeks — it was "
+                   "made with the retired horizon setting. New plans are always a "
+                   f"full {WEEKS_PER_YEAR}-week year.")
 
     _yr = plan_year()
     st.caption(f"Plan year: **{_yr}** (Monday-anchored weeks from Jan 1)")
