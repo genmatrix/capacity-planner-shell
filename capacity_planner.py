@@ -2271,32 +2271,45 @@ def _bench_series(key: str, col: str, lob: str | None, weeks) -> pd.Series | Non
     return aligned if aligned.notna().any() else None
 
 
-def actual_required_and_staffed(lob_names: list[str], weeks: list[str]
-                                ) -> tuple[np.ndarray, np.ndarray]:
-    """(required actual, staffed actual) FTE per plan week, summed over
-    `lob_names`, NaN where there is no complete actual week.
+def demand_supply_available(lob_names: list[str], weeks: list[str]) -> dict:
+    """Required and Staffing, planned and actual, all in FTE AVAILABLE TO TAKE
+    CALLS — logged in and not in AUX — summed over `lob_names`.
 
-    REQUIRED ACTUAL (director ask 2026-10-14) = what the plan's own math says
-    was needed for the volume and handle time that ACTUALLY arrived: each
-    LOB's plan is recomputed with its actual contacts as the forecast and its
-    actual AHT, and every other assumption unchanged (shrinkage, occupancy,
-    margin, Erlang/workload basis). So the two Required lines differ ONLY by
-    what came in — a like-for-like comparison, never two formulas.
-    STAFFED ACTUAL = the ACD's measured staffed FTE.
+    Why this basis (decided 2026-10-14, with the director's chart): the plan's
+    Required FTE and Staffed FTE count people ON PAYROLL, but the ACD measures
+    people LOGGED IN, so plotting them together put actual staffing below plan
+    every week by the out-of-office share even when nothing was wrong. On the
+    "available" basis the actual side is MEASURED end to end — no assumption:
+        staffing actual  = ACD staffed time − AUX time, ÷ paid hours
+                         = Actual Staffed FTE × (1 − In-Office Shrink %)
+        staffing planned = Staffed FTE × (1 − that week's Shrinkage %)
+        required planned = Required FTE × (1 − that week's Shrinkage %)
+                         = workload ÷ (paid × occupancy) — the shrinkage
+                           gross-up taken back out (Erlang the same way)
+        required actual  = the same, with the plan recomputed on ACTUAL
+                           contacts and AHT, every other assumption unchanged
+    The plan's own Required/Staffed/Net FTE — the HIRING numbers, in payroll
+    heads — are untouched; available = payroll × (1 − shrinkage).
 
-    A summed week needs EVERY LOB that plans demand that week to have its
-    actual — summing the ones that do would understate the total and read as
-    good news. Partial feed weeks are excluded (`_bench_series`)."""
+    A summed actual week needs EVERY LOB that plans demand that week to have
+    its actual (else blank — a partial sum would read as good news). Partial
+    feed weeks are excluded (`_bench_series`)."""
     lobs = st.session_state.get("lobs") or {}
     n = len(weeks)
-    req_tot, stf_tot = np.zeros(n), np.zeros(n)
+    out = {k: np.zeros(n) for k in ("req_plan", "stf_plan", "req_act", "stf_act")}
     req_ok, stf_ok = np.ones(n, dtype=bool), np.ones(n, dtype=bool)
     any_req, any_stf = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
     for name in lob_names:
         d = lobs.get(name)
         if d is None or len(d["demand"]) != n:
             continue
-        planned = compute_plan(d)["Required FTE"].to_numpy(dtype=float)
+        a = d["assumptions"]
+        avail = 1 - _weekly_assumption(d["demand"], "Shrinkage %",
+                                       a.get("shrinkage_pct", 32.0), n) / 100
+        pf = compute_plan(d)
+        planned = pf["Required FTE"].to_numpy(dtype=float)
+        out["req_plan"] += np.nan_to_num(planned * avail)
+        out["stf_plan"] += np.nan_to_num(pf["Staffed FTE"].to_numpy(dtype=float) * avail)
         needs = planned > 0
         c = _bench_series("acd_weekly", "Actual Contacts", name, weeks)
         h = _bench_series("acd_weekly", "Actual AHT (sec)", name, weeks)
@@ -2307,22 +2320,112 @@ def actual_required_and_staffed(lob_names: list[str], weeks: list[str]
             dem.loc[have, "Fcst Override"] = c[have]
             dem.loc[have, "AHT (sec)"] = h[have]
             act = compute_plan({**d, "demand": dem})["Required FTE"].to_numpy(dtype=float)
-            req_tot += np.where(have, act, 0.0)
+            out["req_act"] += np.where(have, act * avail, 0.0)
             any_req |= have
             req_ok &= have | ~needs
         else:
             req_ok &= ~needs
         sa = _bench_series("acd_weekly", "Actual Staffed FTE", name, weeks)
-        if sa is not None:
-            sa = sa.to_numpy(dtype=float)
-            stf_tot += np.nan_to_num(sa, nan=0.0)
-            any_stf |= np.isfinite(sa)
-            stf_ok &= np.isfinite(sa) | ~needs
+        io = _bench_series("acd_weekly", "In-Office Shrink %", name, weeks)
+        if sa is not None and io is not None:
+            av = sa.to_numpy(dtype=float) * (1 - io.to_numpy(dtype=float) / 100)
+            out["stf_act"] += np.nan_to_num(av, nan=0.0)
+            any_stf |= np.isfinite(av)
+            stf_ok &= np.isfinite(av) | ~needs
         else:
             stf_ok &= ~needs
-    req = np.where(req_ok & any_req, req_tot, np.nan)
-    stf = np.where(stf_ok & any_stf, stf_tot, np.nan)
-    return req, stf
+    out["req_act"] = np.where(req_ok & any_req, out["req_act"], np.nan)
+    out["stf_act"] = np.where(stf_ok & any_stf, out["stf_act"], np.nan)
+    return out
+
+
+AVAILABLE_BASIS_NOTE = (
+    "**FTE available to take calls** — logged in and not in AUX. The plan's "
+    "Required and Staffed FTE count people on payroll; each is shown here × (1 − "
+    "that week's shrinkage), so 100 on payroll at 32% shrinkage is 68 available. "
+    "The actual side is measured by the ACD with no assumption: staffed time "
+    "minus AUX. **Required — actual** is the plan's own math on the calls and "
+    "handle time that actually arrived.")
+
+
+def render_demand_supply_chart(lob_names: list[str], weeks: list[str]) -> bool:
+    """The director's demand-vs-supply chart (2026-10-14): Required as LINES
+    (planned dashed, actual solid), Staffing as SHADED AREAS (planned pale,
+    actual deeper), all on the available basis above. Used by the Executive
+    View and the Capacity Plan so the two can never disagree. Planned vs
+    actual is carried by ENCODING, not new colours — the validated DEMAND and
+    SUPPLY hues stay. Returns True when any actual week was drawn."""
+    import altair as alt
+    ser = demand_supply_available(lob_names, weeks)
+    has_act = bool(np.isfinite(ser["req_act"]).any() or np.isfinite(ser["stf_act"]).any())
+    wide = pd.DataFrame({
+        "Week": weeks,
+        "Required — planned": np.round(ser["req_plan"], 1),
+        "Required — actual": np.round(ser["req_act"], 1),
+        "Staffing — planned": np.round(ser["stf_plan"], 1),
+        "Staffing — actual": np.round(ser["stf_act"], 1),
+    })
+    legend = []
+    for name, kind, op in (("Staffing — planned", "area", 0.2),
+                           ("Staffing — actual", "area", 0.42),
+                           ("Required — planned", "dash", 0),
+                           ("Required — actual", "line", 0)):
+        if name.endswith("actual") and not has_act:
+            continue
+        if kind == "area":
+            icon = (f'<svg width="22" height="12" aria-hidden="true"><rect x="0" y="1" '
+                    f'width="22" height="10" rx="2" fill="{brand.SUPPLY}" '
+                    f'fill-opacity="{op + (0.1 if op < 0.3 else 0)}" '
+                    f'stroke="{brand.SUPPLY}" stroke-width="1"/></svg>')
+        else:
+            da = ' stroke-dasharray="5 3"' if kind == "dash" else ""
+            icon = (f'<svg width="22" height="12" aria-hidden="true"><line x1="1" y1="6" '
+                    f'x2="21" y2="6" stroke="{brand.DEMAND}" stroke-width="2.5"'
+                    f'{da} stroke-linecap="round"/></svg>')
+        legend.append(f'<span style="display:inline-flex;align-items:center;gap:6px;'
+                      f'margin-right:18px;color:{brand.TEXT};font-size:12px">'
+                      f'{icon}{name}</span>')
+    st.markdown('<div style="margin:2px 0 6px">' + "".join(legend) + "</div>",
+                unsafe_allow_html=True)
+    x = alt.X("Week:O", sort=None, axis=_month_axis())
+    base = alt.Chart(wide)
+    layers = [
+        base.mark_area(color=brand.SUPPLY, opacity=0.2, interpolate="monotone")
+            .encode(x=x, y=alt.Y("Staffing — planned:Q",
+                                 title="FTE available to take calls")),
+        base.mark_line(color=brand.SUPPLY, strokeWidth=1.5, opacity=0.85,
+                       interpolate="monotone").encode(x=x, y="Staffing — planned:Q"),
+    ]
+    if has_act:
+        layers.append(base.transform_filter("isValid(datum['Staffing — actual'])")
+                      .mark_area(color=brand.SUPPLY, opacity=0.42, interpolate="monotone")
+                      .encode(x=x, y="Staffing — actual:Q"))
+    layers.append(base.mark_line(color=brand.DEMAND, strokeWidth=2, strokeDash=[5, 3],
+                                 interpolate="monotone")
+                  .encode(x=x, y="Required — planned:Q"))
+    if has_act:
+        layers.append(base.transform_filter("isValid(datum['Required — actual'])")
+                      .mark_line(color=brand.DEMAND, strokeWidth=2.5, interpolate="monotone")
+                      .encode(x=x, y="Required — actual:Q"))
+    # Hover: a crosshair on the nearest week, every series in one tooltip.
+    cols = ["Required — planned", "Staffing — planned"] + (
+        ["Required — actual", "Staffing — actual"] if has_act else [])
+    hover = alt.selection_point(fields=["Week"], nearest=True, on="pointerover",
+                                empty=False, clear="pointerout")
+    layers.append(alt.Chart(wide).mark_rule(color=brand.MUTED, strokeWidth=1).encode(
+        x=x, opacity=alt.condition(hover, alt.value(0.6), alt.value(0)),
+        tooltip=[alt.Tooltip("Week:O")] + [alt.Tooltip(f"{c}:Q", format=".1f")
+                                           for c in cols]).add_params(hover))
+    chart = alt.layer(*layers)
+    tr = _today_rule(weeks)
+    brand.chart(chart + tr if tr is not None else chart, height=260)
+    st.caption(AVAILABLE_BASIS_NOTE + (
+        " Actuals run to the last complete ACD week." if has_act else
+        " Planned only — load the ACD export (Real Data) and the actual line "
+        "and area appear for the weeks it covers."))
+    with st.expander("Show the numbers"):
+        st.dataframe(wide.set_index("Week"), width="stretch")
+    return has_act
 
 
 CPM_MIN_WEEKS = 8    # same discipline as attrition/seasonality: few weeks = noise
@@ -3945,34 +4048,48 @@ def render_real_data_page():
     # the plan's workload math applied to its forecast volume). What remains
     # is the comparison that was always the honest one — the plan's OWN
     # requirement against measured staffing.
+    # Compared in FTE AVAILABLE TO TAKE CALLS (see demand_supply_available):
+    # the ACD's staffed time is logged-in time, the plan's Required FTE is
+    # payroll heads, so a raw comparison read "short" by the out-of-office
+    # share every week.
     plan_req = {}
     for _lob, _d in st.session_state.lobs.items():
         _pf = compute_plan(_d)
-        plan_req[_lob] = dict(zip(_pf["Week"], _pf["Required FTE"]))
-    comb["Plan Required FTE"] = [
+        _av = 1 - _weekly_assumption(_d["demand"], "Shrinkage %",
+                                     _d["assumptions"].get("shrinkage_pct", 32.0),
+                                     len(_pf)) / 100
+        plan_req[_lob] = dict(zip(_pf["Week"], _pf["Required FTE"].to_numpy(dtype=float) * _av))
+    comb["Required available (plan)"] = [
         round(plan_req.get(r["LOB"], {}).get(r["Week"], np.nan), 1)
         for _, r in comb.iterrows()]
-    comb["Net (staffed − required)"] = (
-        comb["Actual Staffed FTE"] - comb["Plan Required FTE"]).round(1)
+    comb["Staffed available (actual)"] = (
+        comb["Actual Staffed FTE"] * (1 - comb.get("In-Office Shrink %", np.nan) / 100)).round(1)
+    comb["Net available (actual − plan)"] = (
+        comb["Staffed available (actual)"] - comb["Required available (plan)"]).round(1)
 
     show_cols = ["LOB", "Week", "Days Covered", "Actual Contacts",
                  "Actual AHT (sec)", "Actual SL %", "Abandon %",
                  "Actual ASA (sec)", "Occupancy % (actual)",
-                 "Plan Required FTE", "Actual Staffed FTE",
-                 "In-Office Shrink %", "Net (staffed − required)"]
+                 "Actual Staffed FTE", "In-Office Shrink %",
+                 "Staffed available (actual)", "Required available (plan)",
+                 "Net available (actual − plan)"]
     show = comb[[c for c in show_cols if c in comb.columns]]
     fmt = {c: "{:,.0f}" for c in ["Actual Contacts", "Actual AHT (sec)",
                                   "Actual ASA (sec)"] if c in show.columns}
     fmt.update({c: "{:,.1f}" for c in
-                ["Plan Required FTE", "Actual Staffed FTE", "In-Office Shrink %",
-                 "Actual SL %", "Abandon %", "Occupancy % (actual)",
-                 "Net (staffed − required)"] if c in show.columns})
+                ["Actual Staffed FTE", "In-Office Shrink %", "Staffed available (actual)",
+                 "Required available (plan)", "Net available (actual − plan)",
+                 "Actual SL %", "Abandon %", "Occupancy % (actual)"] if c in show.columns})
     st.dataframe(show.style.format(fmt, na_rep="—"), hide_index=True, width="stretch")
-    st.caption("Net = Actual Staffed FTE − the PLAN's Required FTE for that "
-               "week. Weeks outside the plan horizon show a dash rather than a "
-               "comparison the plan cannot make.")
-    if "Plan Required FTE" in comb.columns:
-        chart = comb.groupby("LOB")[["Plan Required FTE", "Actual Staffed FTE"]] \
+    st.caption("Compared in FTE available to take calls. **Actual Staffed FTE** is "
+               "logged-in time ÷ paid hours; **Staffed available** takes the AUX "
+               "share out of it (measured). **Required available** is the plan's "
+               "Required FTE × (1 − that week's shrinkage) — payroll heads turned "
+               "into heads on the phones. Net = available actual − available "
+               "required. Weeks outside the plan horizon show a dash.")
+    if "Required available (plan)" in comb.columns:
+        chart = comb.groupby("LOB")[["Required available (plan)",
+                                     "Staffed available (actual)"]] \
             .sum(min_count=1)   # all-missing stays a gap, never a 0-height bar
         st.bar_chart(chart)
 
@@ -5476,32 +5593,13 @@ def render_plan_grid(plan: pd.DataFrame, note: str):
 
 
 def plan_chart_with_benchmarks(plan: pd.DataFrame, lob: str | None):
-    """Model Required/Staffed FTE, plus the measured actual-staffed overlay for
-    any weeks that overlap the loaded ACD data.
-
-    The WFM feed's own Required FTE overlay was removed with that feed
-    (2026-07-31). It was per-15-min minimum staffing, which inflates small
-    queues roughly 2x (SMB 3.8 vs 1.9 on the sample) — the team already
-    distrusted it, and an operational requirement sitting on a long-range
-    capacity chart is exactly the confusion the removal was asked for."""
-    weeks = plan["Week"].tolist()
-    chart = plan.set_index("Week")[["Required FTE", "Staffed FTE"]].copy()
-    overlaid = []
-    a = _bench_series("acd_weekly", "Actual Staffed FTE", lob, weeks)
-    if a is not None:
-        chart["Actual Staffed (ACD)"] = a.values
-        overlaid.append("Actual Staffed (ACD)")
-    st.line_chart(chart)
-    if overlaid:
-        st.caption("Overlay from your real data: " + ", ".join(overlaid)
-                   + " (only weeks that overlap the plan horizon).")
+    """The Capacity Plan's chart IS the Executive View's demand-vs-supply chart
+    for this page's scope (2026-10-14) — one chart, one basis, so the two
+    pages can never disagree. (The WFM feed's interval Required FTE overlay
+    went with that feed on 2026-07-31.)"""
+    names = [lob] if lob else list(st.session_state.lobs)
+    if render_demand_supply_chart(names, plan["Week"].tolist()):
         _partial_note(lob)
-    elif st.session_state.get("acd_weekly") is not None:
-        st.caption("ℹ️ ACD data is loaded, but none of its weeks fall inside "
-                   "the current plan horizon — export the plan's weeks to overlay them.")
-    else:
-        st.caption("Tip: load the ACD export on the Real Data page to overlay "
-                   "measured actual FTE here.")
 
 
 def _model_members(lob: str | None, weeks) -> np.ndarray | None:
@@ -5641,9 +5739,17 @@ def build_reconciliation(plan: pd.DataFrame, lob_data: dict, lob: str) -> pd.Dat
     if sla is not None:
         triple("SL %", const(a.get("sl_target_pct")), sla)
     stf = _bench_series("acd_weekly", "Actual Staffed FTE", lob, weeks)
-    if stf is not None:
-        triple("FTE (req vs staffed)", pf["Required FTE"], stf)
     shr = _bench_series("acd_weekly", "In-Office Shrink %", lob, weeks)
+    if stf is not None and shr is not None:
+        # Both sides in FTE AVAILABLE TO TAKE CALLS (demand_supply_available):
+        # payroll Required × (1 − planned shrinkage) vs logged-in time minus
+        # AUX. Comparing payroll Required with logged-in time read "short" by
+        # the out-of-office share every week.
+        _av = 1 - _weekly_assumption(dem, "Shrinkage %",
+                                     a.get("shrinkage_pct", 32.0), len(weeks)) / 100
+        triple("Available FTE (req vs staffed)",
+               pd.Series(pf["Required FTE"].to_numpy(dtype=float) * _av, index=pf.index).round(1),
+               stf * (1 - shr / 100))
     if shr is not None:
         # Plan side is the weekly column now, not one scalar for the year.
         triple("Shrink %", dem.get("Shrinkage %",
@@ -6159,98 +6265,10 @@ def render_executive_view():
     # validated data hues stay (DEMAND for required, SUPPLY for staffing);
     # planned is the dashed line / pale fill, actual the solid line / deeper
     # fill. Actuals stop at the last complete ACD week.
-    _req_act, _stf_act = actual_required_and_staffed(lobs, weeks)
-    _has_act = bool(np.isfinite(_req_act).any() or np.isfinite(_stf_act).any())
     _scope_name = "all lines of business" if scope is None else scope
     with brand.section("walk", f"Demand vs. supply — {_scope_name}"):
-        wide = pd.DataFrame({
-            "Week": weeks,
-            "Required — planned": np.round(cons_req, 1),
-            "Required — actual": np.round(_req_act, 1),
-            "Staffing — planned": np.round(cons_stf, 1),
-            "Staffing — actual": np.round(_stf_act, 1),
-        })
-        _sw = [("Staffing — planned", "area", 0.2), ("Staffing — actual", "area", 0.42),
-               ("Required — planned", "dash", 0), ("Required — actual", "line", 0)]
-        _legend = []
-        for _name, _kind, _op in _sw:
-            if _name.endswith("actual") and not _has_act:
-                continue
-            if _kind == "area":
-                _icon = (f'<svg width="22" height="12" aria-hidden="true"><rect x="0" y="1" '
-                         f'width="22" height="10" rx="2" fill="{brand.SUPPLY}" '
-                         f'fill-opacity="{_op + (0.1 if _op < 0.3 else 0)}" '
-                         f'stroke="{brand.SUPPLY}" stroke-width="1"/></svg>')
-            else:
-                _da = ' stroke-dasharray="5 3"' if _kind == "dash" else ""
-                _icon = (f'<svg width="22" height="12" aria-hidden="true"><line x1="1" y1="6" '
-                         f'x2="21" y2="6" stroke="{brand.DEMAND}" stroke-width="2.5"'
-                         f'{_da} stroke-linecap="round"/></svg>')
-            _legend.append(f'<span style="display:inline-flex;align-items:center;gap:6px;'
-                           f'margin-right:18px;color:{brand.TEXT};font-size:12px">'
-                           f'{_icon}{_name}</span>')
-        st.markdown('<div style="margin:2px 0 6px">' + "".join(_legend) + "</div>",
-                    unsafe_allow_html=True)
-        _x = alt.X("Week:O", sort=None, axis=_month_axis())
-        _y = alt.Y("FTE:Q", title="FTE")
-        base = alt.Chart(wide)
-        layers = [
-            base.mark_area(color=brand.SUPPLY, opacity=0.2, interpolate="monotone")
-                .encode(x=_x, y=alt.Y("Staffing — planned:Q", title="FTE")),
-            base.mark_line(color=brand.SUPPLY, strokeWidth=1.5, opacity=0.85,
-                           interpolate="monotone")
-                .encode(x=_x, y="Staffing — planned:Q"),
-        ]
-        if _has_act:
-            layers += [
-                base.transform_filter("isValid(datum['Staffing — actual'])")
-                    .mark_area(color=brand.SUPPLY, opacity=0.42, interpolate="monotone")
-                    .encode(x=_x, y="Staffing — actual:Q"),
-            ]
-        layers += [
-            base.mark_line(color=brand.DEMAND, strokeWidth=2, strokeDash=[5, 3],
-                           interpolate="monotone")
-                .encode(x=_x, y="Required — planned:Q"),
-        ]
-        if _has_act:
-            layers += [
-                base.transform_filter("isValid(datum['Required — actual'])")
-                    .mark_line(color=brand.DEMAND, strokeWidth=2.5, interpolate="monotone")
-                    .encode(x=_x, y="Required — actual:Q"),
-            ]
-        # Hover: a crosshair on the nearest week with every series in one
-        # tooltip, plus the gap the reader is really asking about.
-        wide["Net — planned"] = np.round(cons_stf - cons_req, 1)
-        wide["Net — actual"] = np.round(_stf_act - _req_act, 1)
-        _tip = [alt.Tooltip("Week:O")] + [
-            alt.Tooltip(f"{c}:Q", format=".1f") for c in
-            ("Required — planned", "Staffing — planned", "Net — planned")] + (
-            [alt.Tooltip(f"{c}:Q", format=".1f") for c in
-             ("Required — actual", "Staffing — actual", "Net — actual")] if _has_act else [])
-        _hover = alt.selection_point(fields=["Week"], nearest=True, on="pointerover",
-                                     empty=False, clear="pointerout")
-        layers += [
-            alt.Chart(wide).mark_rule(color=brand.MUTED, strokeWidth=1).encode(
-                x=_x, opacity=alt.condition(_hover, alt.value(0.6), alt.value(0)),
-                tooltip=_tip).add_params(_hover),
-        ]
-        walk = alt.layer(*layers)
+        render_demand_supply_chart(lobs, weeks)
         _tr = _today_rule(weeks)
-        brand.chart(walk + _tr if _tr is not None else walk, height=260)
-        if _has_act:
-            st.caption("Actuals run to the last complete ACD week. **Required — actual** "
-                       "is what the plan's own math says you needed for the volume and "
-                       "handle time that actually arrived — same shrinkage, occupancy and "
-                       "basis as the plan, so the two Required lines differ only by what "
-                       "came in. **Staffing — actual** is measured logged-in time from the "
-                       "ACD; planned staffing counts people on payroll, so the actual area "
-                       "runs below the planned one by roughly your out-of-office shrinkage "
-                       "(vacation, sick, off-phone training).")
-        else:
-            st.caption("Planned only — load the ACD export (Real Data) and the actual "
-                       "Required line and Staffing area appear for the weeks it covers.")
-        with st.expander("Show the numbers"):
-            st.dataframe(wide.set_index("Week"), width="stretch")
         nf = pd.DataFrame({"Week": weeks, "Net": cons_net})
         nf_chart = alt.Chart(nf).mark_bar(opacity=.85, cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
