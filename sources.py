@@ -383,6 +383,28 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
                                      for c in auto))
 
     df = df.copy()
+    # Split codes are NUMBERS. A report footer ("Grand Total"), a stray header
+    # row or a typo used to reach `int(c)` in the warning below and raise —
+    # and the boot-time autoload had nothing above it, so one cell crashed
+    # every page for every planner (audit 2026-10-14). Non-numeric codes are
+    # now named and set aside like any other row the mapping cannot place.
+    _codes = pd.to_numeric(df["split"], errors="coerce")
+    _txt = df["split"].astype(str).str.strip()
+    # Only finite WHOLE numbers are split codes: "inf" would crash the int
+    # cast, "1e30" would saturate, and 101.5 would silently land in split 101.
+    _arr = _codes.to_numpy(dtype=float)
+    _whole = np.isfinite(_arr) & (_arr == np.floor(np.where(np.isfinite(_arr), _arr, 0)))
+    _whole &= np.abs(np.where(np.isfinite(_arr), _arr, 0)) < 1e12
+    _codes = _codes.where(_whole)
+    _bad = _codes.isna() & df["split"].notna() & (_txt != "") & (_txt.str.lower() != "nan")
+    if _bad.any():
+        _ex = list(dict.fromkeys(_txt[_bad].tolist()))
+        rep.warnings.append(
+            f"{int(_bad.sum()):,} row(s) with an invalid split code excluded — "
+            f"not a whole number (e.g. {', '.join(repr(x) for x in _ex[:3])}); "
+            "usually a report total or a repeated header row in the export.")
+    df = df[_codes.notna()].copy()
+    df["split"] = _codes[_codes.notna()].astype("int64")
     df["LOB"] = df["split"].map(mapping.lob_for_split)
     unmapped = sorted(set(df.loc[df["LOB"].isna(), "split"].dropna().unique()))
     if unmapped:
@@ -397,8 +419,11 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
     # The measurement columns get the SAME coercion discipline as the time
     # columns — they are optional, so only the ones this export actually
     # carried are touched.
-    for c in ["i_stafftime", "i_auxtime"] + [m for m in MEASURE_COLS
-                                             if m in df.columns]:
+    # i_availtime joined this list 2026-10-14: it feeds the occupancy residual,
+    # and left as raw text a "-" or "1,000" made the weekly sum raise.
+    for c in (["i_stafftime", "i_auxtime"]
+              + (["i_availtime"] if "i_availtime" in df.columns else [])
+              + [m for m in MEASURE_COLS if m in df.columns]):
         raw = df[c]
         coerced = pd.to_numeric(raw, errors="coerce")
         blank = raw.isna() | (raw.astype(str).str.strip() == "")
@@ -411,14 +436,18 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
             # the measurement columns landed (2026-07-31) — a corrupt
             # callsoffered does not cost you staffing, it costs you volume.
             _lost = ("staffing" if c in ("i_stafftime", "i_auxtime")
+                     else "occupancy" if c == "i_availtime"
                      else "this measurement")
             rep.warnings.append(
                 f"ACD '{field_label(c)}' ({c}): {malformed:,} MALFORMED non-blank value(s) kept as "
                 f"missing — affected weeks show missing {_lost}, not an "
                 "understated figure. Check the export format.")
         # legitimate blanks = 0 (an interval with no AUX/staffed seconds);
-        # malformed non-blanks stay NaN (unknown), valid values pass through
-        df[c] = coerced.mask(blank & coerced.isna(), 0.0)
+        # malformed non-blanks stay NaN (unknown), valid values pass through.
+        # EXCEPT idle time: a blank i_availtime is "not measured", and filling
+        # it with 0 reads as "never idle" → occupancy 100%. Left NaN, a column
+        # that is present but empty omits occupancy exactly like a missing one.
+        df[c] = coerced if c == "i_availtime" else coerced.mask(blank & coerced.isna(), 0.0)
     df["Week"] = _week_start(df["row_date"])
     df["_date"] = pd.to_datetime(df["row_date"], errors="coerce").dt.date
     bad_dates = int(df["_date"].isna().sum())

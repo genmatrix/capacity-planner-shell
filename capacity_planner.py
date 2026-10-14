@@ -65,6 +65,7 @@ def _serialize_lobs() -> dict:
             "assumptions": d["assumptions"],
         }
     _ma = st.session_state.get("members_actual")
+    # Keep in step with PLAN_PAYLOAD_KEYS (restore_payload_check pins it).
     return {
         "n_weeks": st.session_state.n_weeks,
         "plan_year": plan_year(),
@@ -425,6 +426,31 @@ def _cached_snapshot(scen_dir: str, fname: str):
     return collab.load_snapshot(scen_dir, fname)
 
 
+# Every key that IS the plan in a payload (everything else on a snapshot is
+# metadata: version, author, note…). Anything that rebuilds a plan payload from
+# a snapshot copies THIS list — Restore used a hand-written list that predated
+# members_actual and dropped it (audit 2026-10-14).
+PLAN_PAYLOAD_KEYS = ("n_weeks", "plan_year", "members_start", "members_end",
+                     "members_actual", "lobs")
+
+
+def _members_actual_from_lobs(lobs: dict) -> np.ndarray | None:
+    """The org-wide actual-membership series as the LOB grids hold it: the
+    first LOB on the org-wide base whose "Members (actual)" has any value.
+    Used to HEAL a payload that lost the key while its grids kept the column
+    — exactly what the pre-2026-10-14 Restore produced."""
+    for d in lobs.values():
+        if _lob_owns_members(d.get("assumptions") or {}):
+            continue
+        dem = d.get("demand")
+        if dem is None or "Members (actual)" not in dem.columns:
+            continue
+        arr = pd.to_numeric(dem["Members (actual)"], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(arr).any():
+            return arr
+    return None
+
+
 def _apply_payload(p: dict):
     """Load a snapshot payload into session as the working plan."""
     st.session_state.n_weeks = p["n_weeks"]
@@ -436,6 +462,12 @@ def _apply_payload(p: dict):
     st.session_state.members_start = p.get("members_start")
     st.session_state.members_end = p.get("members_end")
     st.session_state.lobs = _payload_lobs(p)
+    if st.session_state["members_actual"] is None:
+        # Heal: a payload without the series but whose grids still carry it.
+        # Without this the org-wide mirror would overwrite those grids with
+        # NaN on the very next run.
+        st.session_state["members_actual"] = _members_actual_from_lobs(
+            st.session_state.lobs)
     _purge_assumption_widgets()
     if st.session_state.members_start is None or st.session_state.members_end is None:
         first = next(iter(st.session_state.lobs.values()), None)
@@ -3271,6 +3303,22 @@ def _cached_mapping(sig: tuple, fmap_json: str):
                            json.loads(fmap_json) if fmap_json != "{}" else None)
 
 
+def _load_split_safe(files, mapping, fmap):
+    """`sources.load_split` that cannot take a page down: an exception becomes
+    an import ERROR in the report (empty frame), which every caller already
+    shows. Known bad cells are handled inside sources; this is the boundary
+    for the one nobody has seen yet (audit 2026-10-14) — above all on Real
+    Data, the page that fixes a bad file and so must always open."""
+    try:
+        return sx.load_split(files, mapping, fmap)
+    except Exception as e:                  # noqa: BLE001 — see docstring
+        rep = sx.ImportReport()
+        rep.errors.append(f"The ACD export could not be read ({type(e).__name__}: "
+                          f"{str(e)[:200]}). Check the file, or its Column "
+                          "mapping above.")
+        return pd.DataFrame(), rep
+
+
 @st.cache_resource(show_spinner=False)
 def _cached_feed_raw(feed: str, sig: tuple, map_sig: tuple, fmap_json: str,
                      _mapping) -> tuple:
@@ -3280,8 +3328,8 @@ def _cached_feed_raw(feed: str, sig: tuple, map_sig: tuple, fmap_json: str,
     files = [Path(x[0]) for x in sig]
     mb = sum(x[2] for x in sig) / 1e6
     t0 = time.perf_counter()
-    df, rep = sx.load_split(files, _mapping,
-                            json.loads(fmap_json) if fmap_json != "{}" else None)
+    df, rep = _load_split_safe(files, _mapping,
+                               json.loads(fmap_json) if fmap_json != "{}" else None)
     return df, rep, time.perf_counter() - t0, mb
 
 
@@ -3316,6 +3364,25 @@ def autoload_feeds():
     if "acd_weekly" in st.session_state:
         return
     st.session_state["acd_weekly"] = None
+    # Runs at the top of EVERY page, before anything renders. An exception
+    # here used to be a traceback on every page for every planner — and the
+    # Column-mapping UI that fixes a bad file sat behind it (audit
+    # 2026-10-14). Known bad cells are handled in sources; this guard is for
+    # the failure nobody has thought of yet: name it on the data-health band
+    # and let the app open without actuals. Set to None ABOVE, so a failure
+    # is not retried on every rerun.
+    try:
+        _autoload_feeds_inner()
+    except Exception as e:                  # noqa: BLE001 — see above
+        st.session_state["acd_weekly"] = None
+        st.session_state["_feed_errors"] = [
+            f"Feed auto-load failed ({type(e).__name__}: {str(e)[:200]}). "
+            "The app opened without actuals — open Real Data to check the "
+            "file and its column mapping."]
+        st.session_state.setdefault("_feed_perf", {})
+
+
+def _autoload_feeds_inner():
     saved = load_data_paths()
     m_files, s_files = _feed_sources_from_saved(saved)
     if not m_files or not s_files:
@@ -3593,7 +3660,7 @@ def render_real_data_page():
     fmaps = load_field_maps()
     sw = None
     if s_up or _msig is None:              # uploads bypass the cache
-        sdf, r = sx.load_split(s_src, mapping, fmaps.get("acd"))
+        sdf, r = _load_split_safe(s_src, mapping, fmaps.get("acd"))
     else:
         sdf, r, _secs, _mb = _cached_feed_raw(
             "acd", _files_sig(s_src), _msig,
@@ -3602,14 +3669,23 @@ def render_real_data_page():
                    "the file changes.")
     _show_report(r)
     if r.ok:
-        sdf = apply_acd_toggles(sdf)
-        if sdf.empty:
-            st.warning("All ACD splits are excluded by the Shrinkage page "
-                       "mapping — nothing to roll up.")
-        sw = sx.split_weekly(sdf, assume) if not sdf.empty else None
-        st.caption("ACD numbers here honor the split include/exclude and AUX "
-                   "shrink toggles from the Shrinkage page — one shrinkage "
-                   "truth everywhere.")
+        # Guarded like the loader (audit 2026-10-14): a failure in the toggles
+        # or the rollup must not take down the page that fixes a bad file —
+        # everything above (locations, closures, column mapping) still renders.
+        try:
+            sdf = apply_acd_toggles(sdf)
+            if sdf.empty:
+                st.warning("All ACD splits are excluded by the Shrinkage page "
+                           "mapping — nothing to roll up.")
+            sw = sx.split_weekly(sdf, assume) if not sdf.empty else None
+            st.caption("ACD numbers here honor the split include/exclude and AUX "
+                       "shrink toggles from the Shrinkage page — one shrinkage "
+                       "truth everywhere.")
+        except Exception as e:              # noqa: BLE001 — see above
+            sw = None
+            st.error(f"The ACD export loaded but could not be rolled up into weeks "
+                     f"({type(e).__name__}: {str(e)[:200]}). Check the file and its "
+                     "column mapping above.")
 
     # Persist so the Capacity Plan chart can overlay these benchmarks.
     st.session_state["acd_weekly"] = sw
@@ -4078,8 +4154,16 @@ def render_publish_panel(mode: str):
             if mode == "editor" and cols[1].button("Restore", width="stretch",
                                                    key=f"restore_{_k}"):
                 j = collab.load_snapshot(SCENARIO_DIR, j["_file"]) or j
-                payload = {k: j[k] for k in ("n_weeks", "members_start", "members_end", "lobs")}
+                payload = {k: j[k] for k in PLAN_PAYLOAD_KEYS if k in j}
                 payload["plan_year"] = j.get("plan_year", DEFAULT_PLAN_YEAR)
+                if payload.get("members_actual") is None:
+                    # Deep copy: _payload_lobs migrates assumptions IN PLACE, and the
+                    # restored payload must republish the version as it was.
+                    _heal = _members_actual_from_lobs(
+                        _payload_lobs(json.loads(json.dumps(payload, default=str))))
+                    if _heal is not None:
+                        payload["members_actual"] = [
+                            None if not np.isfinite(v) else float(v) for v in _heal]
                 _wrong_yr = _payload_year_mismatch(payload)
                 if _wrong_yr is not None:
                     # Same gate as Publish: restoring would republish another
