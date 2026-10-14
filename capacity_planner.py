@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -105,6 +106,21 @@ def _float_cols(df: pd.DataFrame, keep_text) -> pd.DataFrame:
     return df
 
 
+# The sidebar's fallback for every assumption it writes — kept identical to
+# the defaults in make_lob / make_blank_lob and to each widget's
+# `a.get(k, default)`. `replace_rescue_check` holds them in step.
+ASSUMPTION_DEFAULTS = {
+    "starting_hc_pt": 0.0, "annual_attrition_pct_pt": 0.0,
+    "members_own": False, "members_start_own": 0.0, "members_end_own": 0.0,
+    "lab_productivity_pct": 50.0, "workload_margin_pct": 5.0,
+    "req_basis": "workload", "sl_target_pct": 80.0, "sl_threshold_sec": 40.0,
+    "open_hrs_week": 60.0, "ramp_weeks": 0, "ramp_start_pct": 60.0,
+    "transfer_ramp_weeks": 2, "transfer_ramp_start_pct": 75.0,
+    "class_gap_weeks": 4, "class_min_size": 1, "class_max_size": 12,
+    "one_class_at_a_time": False,
+}
+
+
 def _payload_lobs(p: dict) -> dict:
     """Parse a snapshot payload's LOB frames into the {lob: {demand, roster, nh,
     assumptions}} shape compute_plan takes, applying every legacy-column
@@ -179,6 +195,15 @@ def _payload_lobs(p: dict) -> dict:
         # is filled — the planner's new NH class stayed a client-side phantom
         # and vanished on navigation (diagnosed live 2026-07-14). Grid rows
         # are positional; the index carries nothing — normalize it at load.
+        # Every assumption the sidebar writes, seeded with EXACTLY the value
+        # the sidebar would write for a missing key (its own `a.get(k, default)`
+        # fallback), so this is numerically inert. Without it, a version saved
+        # before a setting existed differs from the same plan one render later
+        # — phantom "unsaved changes" on boot, and a junk "before …" what-if on
+        # every click (auditor, 2026-10-14). LAST, so the specific migrations
+        # above (PT split, PT hours) win.
+        for _k, _v in ASSUMPTION_DEFAULTS.items():
+            d["assumptions"].setdefault(_k, _v)
         lobs[lob] = {
             "demand": _float_cols(dem.reset_index(drop=True), TEXT_GRID_COLS),
             "roster": _float_cols(ros.reset_index(drop=True), TEXT_GRID_COLS),
@@ -451,8 +476,152 @@ def _members_actual_from_lobs(lobs: dict) -> np.ndarray | None:
     return None
 
 
+def _set_safe(payload: dict) -> None:
+    """The session now equals `payload`, which is stored safely elsewhere — a
+    published version or a what-if file (immutable), or what was just
+    published. Taken from the STORED copy, not from the session, and DEEP-
+    copied: `_serialize_lobs` hands back the live assumptions dicts the
+    sidebar writes into, so a shallow baseline silently tracked every
+    assumption edit and never saw it as a change (auditor, 2026-10-14).
+    `diff_payloads` is migration- and float-tolerant, so a stored snapshot
+    compares equal to the session it was loaded into."""
+    st.session_state["_safe_payload"] = copy.deepcopy(payload)
+    st.session_state["_capture_safe"] = False
+
+
+def _mark_safe() -> None:
+    """Only for a fresh `init_state` scaffold, which has no stored copy: the
+    baseline is captured (deep-copied) at the END of the next run, after the
+    org-wide membership spread, so the untouched scaffold compares equal."""
+    st.session_state["_capture_safe"] = True
+
+
+def _rescue_unsaved(reason: str) -> bool:
+    """Before a button REPLACES the working plan, save unpublished edits as a
+    personal what-if named "before <reason>" (audit 2026-10-14, high #3).
+    Take control always did this; Reload, Exit sandbox, a version's Sandbox,
+    Load what-if and Restore did not, and the next autosave then overwrote
+    the draft too. "Unpublished" = differs from the last SAFE copy (see
+    `_mark_safe`); a resumed draft is not safe, because the draft file is
+    overwritten by the next autosave. Clean sessions save nothing.
+    Returns False only if the edits exist and could NOT be saved — the caller
+    must then not replace anything."""
+    try:
+        cur = _serialize_lobs()
+    except Exception:                       # noqa: BLE001 — can't preserve it: refuse
+        return False
+    base = st.session_state.get("_safe_payload")
+    try:
+        clean = base is not None and not diff_payloads(base, cur)
+    except Exception:                       # noqa: BLE001 — can't tell: save it
+        clean = False
+    if clean:
+        return True
+    try:
+        name = f"before {reason}"
+        collab.save_personal(SCENARIO_DIR, cur, name, st.session_state.user)
+        st.session_state["_rescued_whatif"] = name
+        # The what-if now holds exactly this — a second click must not save it
+        # again (e.g. Exit sandbox on a year with nothing published, which
+        # rescues but cannot replace).
+        _set_safe(cur)
+        return True
+    except Exception:                       # noqa: BLE001 — refuse rather than lose
+        return False
+
+
+_RESCUE_FAILED = ("Your unpublished changes could not be saved first, so nothing "
+                  "was replaced. Check the share is reachable, or use Sandbox → "
+                  "Save as personal what-if, then try again.")
+
+
+STAGED_MAX_AGE_S = 15.0
+
+
+def _stage_replace(kind: str, **kw) -> None:
+    """A button that REPLACES the working plan does not act on the click —
+    it stages the action, and `_run_staged_replace()` performs it at the END
+    of the run. Streamlit delivers a pending widget edit (a number typed in
+    the sidebar, a grid cell) in the SAME run as the next click, and the
+    sidebar status panel runs before the assumption widgets and grids have
+    copied that run's edits into the plan — so a rescue taken on the click
+    missed the very edit the planner just made (auditor, 2026-10-14). At
+    the end of the run every edit has landed."""
+    st.session_state["_staged_replace"] = (kind, kw, time.monotonic())
+
+
+def _run_staged_replace() -> None:
+    """Perform a staged replacement: rescue unpublished edits first (refuse if
+    that fails), then replace, then rerun. Called just before the autosave."""
+    staged = st.session_state.pop("_staged_replace", None)
+    if not staged:
+        return
+    kind, kw, t0 = staged
+    # A staged action normally runs at the bottom of the SAME run (or the run
+    # a mid-page st.rerun() hands it to, milliseconds later). If a page raised
+    # before the bottom, it would otherwise fire on the planner's NEXT,
+    # unrelated keystroke — including a Restore publishing a team version with
+    # no click (auditor, 2026-10-14). Stale → drop it and say so.
+    if time.monotonic() - t0 > STAGED_MAX_AGE_S:
+        st.session_state["_replace_msg"] = ("That action did not complete, so "
+                                            "nothing was changed — click it again.")
+        st.rerun()
+    reason = kw.get("reason", kind)
+    if kind == "restore" and not collab.holds_lock(
+            SCENARIO_DIR, _plan_year(), st.session_state.user,
+            st.session_state.get(f"lock_token_{_plan_year()}")):
+        st.session_state["_replace_msg"] = ("You no longer hold edit control — "
+                                            "nothing was restored.")
+        st.rerun()
+    if kind == "open_version" or kind == "load_whatif":
+        full = collab.load_snapshot(SCENARIO_DIR, kw["file"])
+        if full is None:
+            st.session_state["_replace_msg"] = (
+                "That version could not be read." if kind == "open_version"
+                else "That what-if could not be read.")
+            st.rerun()
+    if not _rescue_unsaved(reason):
+        st.session_state["_replace_msg"] = _RESCUE_FAILED
+        st.rerun()
+    if kind == "reload":
+        _load_active_into_session()
+    elif kind == "exit_sandbox":
+        st.session_state.sandbox = False
+        if not _load_active_into_session():
+            st.session_state.loaded_version = None
+    elif kind in ("open_version", "load_whatif"):
+        st.session_state.sandbox = True
+        _apply_payload(full)
+        _set_safe(full)
+        if kind == "open_version":
+            st.session_state.loaded_version = None
+    elif kind == "restore":
+        meta, _ = collab.publish(SCENARIO_DIR, kw["payload"], kw["name"],
+                                 st.session_state.user,
+                                 st.session_state.get("loaded_version"),
+                                 note=kw["note"])
+        _apply_payload(meta)
+        _set_safe(meta)
+        st.session_state.loaded_version = meta["version"]
+    elif kind == "resume":
+        d = kw["draft"]
+        _apply_payload(d["payload"])               # a draft is NOT safe
+        st.session_state.sandbox = bool(d.get("sandbox"))
+        st.session_state.loaded_version = d.get("base_version")
+        st.session_state["_draft_pending"] = None
+        # The offer is answered — drop the parked copy, or every future
+        # boot re-offers work the planner already took back.
+        _resume_path().unlink(missing_ok=True)
+        st.session_state.pop("_draft_blob", None)   # force a fresh autosave
+    st.rerun()
+
+
 def _apply_payload(p: dict):
     """Load a snapshot payload into session as the working plan."""
+    # Not safe by default: a resumed draft or a fresh rollover lives only in
+    # the draft file. Callers loading a stored version call _mark_safe().
+    st.session_state["_safe_payload"] = None
+    st.session_state["_capture_safe"] = False
     st.session_state.n_weeks = p["n_weeks"]
     st.session_state.plan_year = int(p.get("plan_year", DEFAULT_PLAN_YEAR))
     _ma = p.get("members_actual")
@@ -528,6 +697,8 @@ def _autosave_draft():
     try:
         t0 = time.perf_counter()
         payload = _serialize_lobs()
+        if st.session_state.pop("_capture_safe", False):
+            st.session_state["_safe_payload"] = copy.deepcopy(payload)   # see _mark_safe
         blob = json.dumps(payload, sort_keys=True)
         st.session_state["_perf_draft_ser"] = time.perf_counter() - t0
         if st.session_state.get("_draft_blob") == blob:
@@ -782,6 +953,7 @@ def _load_active_into_session():
     snap = _cached_snapshot(str(SCENARIO_DIR), act["file"]) if act else None
     if snap:
         _apply_payload(snap)
+        _set_safe(snap)
         st.session_state.loaded_version = act["version"]
         _wrong = _payload_year_mismatch(snap)
         if _wrong is not None:
@@ -960,6 +1132,8 @@ def _mapped_blank_lobs(n_weeks: int) -> dict | None:
 def init_state(n_weeks: int):
     st.session_state.plan_year = plan_year()   # keep year across horizon changes
     st.session_state.n_weeks = n_weeks
+    st.session_state["_safe_payload"] = None
+    _mark_safe()                               # a fresh scaffold: nothing typed yet
     mapped = _mapped_blank_lobs(n_weeks)
     if mapped:
         # Real mapped LOBs, blank for the planner to fill with CPM per LOB.
@@ -3920,30 +4094,27 @@ def render_team_status() -> tuple[bool, str]:
     if act and lv is not None and act["version"] > lv and not st.session_state.sandbox and not i_edit:
         st.info(f"The {year} plan advanced to v{act['version']} (you're on v{lv}).")
         if st.button("Reload active plan", width="stretch", key="reload_active"):
-            _load_active_into_session()
-            st.rerun()
+            _stage_replace("reload", reason=f"reloading {year} v{act['version']}")
 
     if st.button("Check for updates", width="stretch", key="refresh_collab"):
         st.rerun()
+
+    if st.session_state.get("_replace_msg"):
+        st.error(st.session_state.pop("_replace_msg"))
+    # A button replaced the plan while it held unpublished edits — say where
+    # they went, once, in whatever mode the click landed us in.
+    if st.session_state.get("_rescued_whatif"):
+        st.info(f"Your unpublished changes were saved as the what-if "
+                f"**“{st.session_state['_rescued_whatif']}”** (sidebar → My "
+                "what-ifs) — open it in Sandbox to copy anything across.")
+        st.session_state.pop("_rescued_whatif", None)
 
     # --- Sandbox mode -------------------------------------------------
     if st.session_state.sandbox:
         st.success("**Sandbox** — private what-if. Nothing here touches the team plan.")
         if st.button("Exit sandbox → active plan", width="stretch"):
-            st.session_state.sandbox = False
-            if not _load_active_into_session():
-                st.session_state.loaded_version = None
-            st.rerun()
+            _stage_replace("exit_sandbox", reason="exiting sandbox")
         return True, "sandbox"
-
-    # Taking control pulled a colleague's newer version over work we were
-    # holding — say where that work went, once.
-    if st.session_state.get("_rescued_whatif"):
-        st.info("The plan had advanced, so taking control loaded the published "
-                "version. What you were holding was saved as the what-if "
-                "**“before taking control”** (sidebar → My what-ifs) — open it "
-                "in Sandbox to copy anything across.")
-        st.session_state.pop("_rescued_whatif", None)
 
     # --- We hold edit control ----------------------------------------
     if i_edit:
@@ -4034,7 +4205,7 @@ def render_team_status() -> tuple[bool, str]:
                 _, _f = collab.save_personal(
                     SCENARIO_DIR, _serialize_lobs(),
                     f"before taking control of {year}", user)
-                st.session_state["_rescued_whatif"] = _f
+                st.session_state["_rescued_whatif"] = f"before taking control of {year}"
             except OSError:
                 pass
             _load_active_into_session()
@@ -4090,6 +4261,7 @@ def render_publish_panel(mode: str):
                     meta, _ = collab.publish(SCENARIO_DIR, _pl,
                                              name, user, parent, note)
                     st.session_state.loaded_version = meta["version"]
+                    _set_safe(_pl)                   # what was published, exactly
                     if release:
                         collab.release_lock(
                             SCENARIO_DIR, _plan_year(), user,
@@ -4102,7 +4274,9 @@ def render_publish_panel(mode: str):
         st.subheader("Sandbox")
         name = st.text_input("What-if name", value="my what-if", key="sb_name")
         if st.button("Save as personal what-if", width="stretch"):
-            _, f = collab.save_personal(SCENARIO_DIR, _serialize_lobs(), name, user)
+            _sv = _serialize_lobs()
+            _, f = collab.save_personal(SCENARIO_DIR, _sv, name, user)
+            _set_safe(_sv)
             st.success(f"Saved → {f}")
 
     _yr = _plan_year()
@@ -4141,16 +4315,10 @@ def render_publish_panel(mode: str):
                               help="Open this version privately. Nothing shared "
                                    "changes; publish deliberately if you want it live."):
                 # changelog() entries are METADATA ONLY (see collab._all_snapshots)
-                # — the plan payload is fetched here, on the click, instead of
-                # for every version on every rerun.
-                _full = collab.load_snapshot(SCENARIO_DIR, j["_file"])
-                if _full is None:
-                    st.error("That version could not be read.")
-                else:
-                    st.session_state.sandbox = True
-                    _apply_payload(_full)
-                    st.session_state.loaded_version = None
-                    st.rerun()
+                # — the plan payload is fetched when the staged action runs,
+                # instead of for every version on every rerun.
+                _stage_replace("open_version", file=j["_file"],
+                               reason=f"opening v{j['version']} in sandbox")
             if mode == "editor" and cols[1].button("Restore", width="stretch",
                                                    key=f"restore_{_k}"):
                 j = collab.load_snapshot(SCENARIO_DIR, j["_file"]) or j
@@ -4173,12 +4341,10 @@ def render_publish_panel(mode: str):
                              f"it would republish the wrong year's numbers. "
                              f"Open it in Sandbox to inspect instead.")
                 else:
-                    meta, _ = collab.publish(SCENARIO_DIR, payload, j.get("name", "restored"),
-                                             user, st.session_state.get("loaded_version"),
-                                             note=f"restored from v{j['version']}")
-                    _apply_payload(meta)
-                    st.session_state.loaded_version = meta["version"]
-                    st.rerun()
+                    _stage_replace("restore", payload=payload,
+                                   name=j.get("name", "restored"),
+                                   note=f"restored from v{j['version']}",
+                                   reason=f"restoring v{j['version']}")
 
     with st.expander("How the team plan works"):
         st.markdown(
@@ -4230,16 +4396,11 @@ def render_publish_panel(mode: str):
     mine = collab.personal_snapshots(SCENARIO_DIR, user)
     if mine:
         with st.expander("My what-ifs"):
-            labels = {f"{j.get('name')} · {_when(j.get('published_at',''))}": j for j in mine}
+            labels = {f"{j.get('name')} · {str(j.get('published_at', ''))[:19]}": j for j in mine}
             pick = st.selectbox("Load one (opens in sandbox)", list(labels), key="load_whatif")
             if st.button("Load what-if"):
-                _full = collab.load_snapshot(SCENARIO_DIR, labels[pick]["_file"])
-                if _full is None:
-                    st.error("That what-if could not be read.")
-                else:
-                    st.session_state.sandbox = True
-                    _apply_payload(_full)
-                    st.rerun()
+                _stage_replace("load_whatif", file=labels[pick]["_file"],
+                               reason=f"loading what-if {labels[pick].get('name', '')}".strip())
 
 
 # ----------------------------------------------------------------------
@@ -4354,15 +4515,10 @@ with st.sidebar:
                    "never published.")
         _c1, _c2 = st.columns(2)
         if _c1.button("Resume them", width="stretch", key="draft_resume"):
-            _apply_payload(_d["payload"])
-            st.session_state.sandbox = bool(_d.get("sandbox"))
-            st.session_state.loaded_version = _d.get("base_version")
-            st.session_state["_draft_pending"] = None
-            # The offer is answered — drop the parked copy, or every future
-            # boot re-offers work the planner already took back.
-            _resume_path().unlink(missing_ok=True)
-            st.session_state.pop("_draft_blob", None)   # force a fresh autosave
-            st.rerun()
+            # Staged like the other replacements: a planner who ignored the
+            # banner, took control and edited must not lose those edits to
+            # the older draft (auditor, 2026-10-14).
+            _stage_replace("resume", draft=_d, reason="resuming an unpublished draft")
         if _c2.button("Discard", width="stretch", key="draft_discard"):
             # Delete the file the check actually READ — which may be the
             # pre-per-year name, in which case deleting _draft_path() would
@@ -7975,6 +8131,9 @@ else:
                     "Load the ACD export on the Real Data page to reconcile plan vs. actuals "
                     "here — one Plan / Actual / Variance row per metric.")
 
+# Staged plan replacements run HERE — after every widget and grid has copied
+# this run's edits into the plan — so their rescue sees those edits.
+_run_staged_replace()
 _autosave_draft()
 
 
