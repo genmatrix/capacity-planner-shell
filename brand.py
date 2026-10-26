@@ -18,7 +18,7 @@ import streamlit as st
 # ---------------------------------------------------------------- identity
 # The wordmark is a LOCAL setting, not part of the code.
 #
-# Why it works this way: the work copy has to carry the real organisation's
+# Why it works this way: the production copy has to carry the real organisation's
 # name, and nothing carrying that name may ever reach the public shell. So the
 # name lives in a file that is NOT in the distribution — not in publish
 # ALLOWLIST, not in git — and the code ships only these generic defaults. Three
@@ -26,7 +26,7 @@ import streamlit as st
 #
 #   * Re-extracting a shell ZIP over the app folder does NOT clobber it. A ZIP
 #     adds and overwrites what it contains; branding.json is not in it, so a
-#     work-side update keeps the organisation's branding without re-entering.
+#     production-side update keeps the organisation's branding without re-entering.
 #   * It sits beside the app, so on the share every planner sees the same
 #     wordmark — same pattern as data_paths.json and holidays.json.
 #   * DEFAULT_MARK and DEFAULT_WORD must stay STRING LITERALS. The publish

@@ -1424,7 +1424,7 @@ def derive_seasonality_from_history(bench: pd.DataFrame | None, lob: str,
     trustworthy history. "Full week" is judged against THIS QUEUE'S normal
     operating pattern (the modal Days Covered), not a hard-coded 7: a Mon-Fri
     queue's complete weeks show Days Covered = 5, and demanding 7 rejected an
-    entire real history as partial (found at work, 2026-07-13). Truncated
+    entire real history as partial (found in production, 2026-07-13). Truncated
     boundary weeks (below the queue's norm) are still excluded."""
     if bench is None or bench.empty or "Actual Contacts" not in bench.columns:
         return None, ("No ACD history with volume loaded — open the Real Data "
@@ -7734,9 +7734,9 @@ def render_advisor_page(ro: bool):
     one_att = bool(da.get("one_class_at_a_time", False))
     lead = int(template["training_wks"]) + int(template["coaching_wks"])
     eff_sp = max(gap, lead) if one_att else gap
-    # Hoisted out of the f-string when work ran Python 3.11 (a multi-line
+    # Hoisted out of the f-string when production ran Python 3.11 (a multi-line
     # replacement field is PEP 701, 3.12+, and this line failed the whole app's
-    # parse). Work moved to 3.14 on 2026-09-04, so the constraint is gone;
+    # parse). Production moved to 3.14 on 2026-09-04, so the constraint is gone;
     # the hoist is harmless and stays.
     cadence = f"≥ {gap} weeks between class starts" if gap else "unconstrained"
     st.caption(f"Hiring cadence: **{cadence}**"

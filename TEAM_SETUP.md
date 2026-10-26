@@ -120,7 +120,7 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
   corporate AppLocker/WDAC blocking the unsigned `streamlit.exe` shim that pip
   creates. You never need that file: **always start the app with the launcher
   .bat**, which runs Streamlit as a Python module inside the signed (allowed)
-  python.exe. Never type `streamlit run ...` in a terminal at work; the manual
+  python.exe. Never type `streamlit run ...` in a terminal on a team PC; the manual
   equivalent, if you ever need it, is:
   `%LOCALAPPDATA%\CapacityPlanner\venv\Scripts\python.exe -m streamlit run capacity_planner.py`
 - **Corporate proxy blocks pip** — either use the `wheels\` offline mode, or
