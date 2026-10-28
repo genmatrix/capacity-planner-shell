@@ -32,7 +32,7 @@ import socket
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------- team folder
@@ -90,6 +90,70 @@ def age_min(iso: str) -> float:
     """Minutes since the given timestamp (huge number if unparseable)."""
     dt = _parse(iso or "")
     return 1e9 if dt is None else (_now() - dt).total_seconds() / 60.0
+
+
+# Lock times are judged in UTC (field report 2026-10-28: a planner in PST saw
+# an EST colleague's lock as FREE a minute after its last heartbeat). The
+# stamps above are naive LOCAL wall-clock strings, so a heartbeat written at
+# 13:01 Eastern read as 13:01 Pacific on the other PC: three hours stale.
+#
+# Each lock time is now written TWICE: the legacy local field, unchanged, plus
+# `<field>_utc` ("...Z"). The legacy field stays so a session still running
+# the previous code keeps reading the format it knows: had it changed, that
+# old parser would fail, call every new lock stale, and offer to take a lock
+# someone is actively using. New code prefers the UTC field. A record with
+# only the legacy field (written by old code) is read as THIS machine's local
+# time, which is the old behaviour and right whenever both PCs share a zone.
+# That mixed state ends when everyone has relaunched on the update.
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc(s: str):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def lock_stamp(info: dict | None, key: str):
+    """An aware datetime for a lock time (`heartbeat` / `acquired_at`): the
+    UTC field when present, else the legacy local one read as local time."""
+    if not info:
+        return None
+    dt = _parse_utc(info.get(f"{key}_utc") or "")
+    if dt is not None:
+        return dt
+    dt = _parse(info.get(key) or "")
+    return dt.astimezone() if dt is not None else None   # naive = local
+
+
+def lock_age_min(info: dict | None) -> float:
+    """Minutes since the lock's last heartbeat (else its acquisition), in
+    UTC. Huge if neither parses — an unreadable lock is a stale one."""
+    dt = lock_stamp(info, "heartbeat") or lock_stamp(info, "acquired_at")
+    return 1e9 if dt is None else (_utcnow() - dt).total_seconds() / 60.0
+
+
+def lock_local_str(info: dict | None, key: str) -> str:
+    """A lock time in THE VIEWER's own clock, `YYYY-MM-DD HH:MM` — so a
+    colleague in another zone sees when it was in their time, not the
+    writer's."""
+    dt = lock_stamp(info, key)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt is not None else ""
+
+
+def _stamp_now(rec: dict, *keys: str) -> dict:
+    """Set lock time fields to now: the legacy local form and its UTC twin."""
+    now = _utcnow()
+    for k in keys:
+        rec[k] = _iso(now.astimezone().replace(tzinfo=None))
+        rec[f"{k}_utc"] = _iso_utc(now)
+    return rec
 
 
 # ---------------------------------------------------------------- low-level io
@@ -540,8 +604,7 @@ def read_lock(d, year):
 def lock_is_stale(info: dict | None) -> bool:
     if not info:
         return True
-    hb = info.get("heartbeat") or info.get("acquired_at") or ""
-    return age_min(hb) > LOCK_STALE_MIN
+    return lock_age_min(info) > LOCK_STALE_MIN
 
 
 def _lock_record(user: str, extra: dict | None = None) -> dict:
@@ -549,8 +612,8 @@ def _lock_record(user: str, extra: dict | None = None) -> dict:
     # tell two sessions of the same Windows login apart — two tabs were both
     # silently granted edit control. The session that acquired keeps the token
     # in its own state; heartbeat/release/holds require it to match.
-    rec = {"user": user, "host": host(), "token": uuid.uuid4().hex,
-           "acquired_at": _iso(_now()), "heartbeat": _iso(_now())}
+    rec = _stamp_now({"user": user, "host": host(), "token": uuid.uuid4().hex},
+                     "acquired_at", "heartbeat")
     if extra:
         rec.update(extra)
     return rec
@@ -632,10 +695,9 @@ def heartbeat(d, year, user: str, token: str | None = None) -> bool:
         # LOCK_STALE_MIN (5 min), so refreshing more often than
         # HEARTBEAT_MIN_SEC bought nothing and cost a share write on every
         # rerun, i.e. every keystroke in a grid (measured 2026-08-10).
-        if age_min(cur.get("heartbeat") or cur.get("acquired_at") or "") * 60 \
-                < HEARTBEAT_MIN_SEC:
+        if lock_age_min(cur) * 60 < HEARTBEAT_MIN_SEC:
             return True
-        cur["heartbeat"] = _iso(_now())
+        _stamp_now(cur, "heartbeat")
         # write back to the file we READ — which may still be the legacy
         # edit.lock during a transition (see _live_lock_path)
         _atomic_write(_live_lock_path(d, year), json.dumps(cur))

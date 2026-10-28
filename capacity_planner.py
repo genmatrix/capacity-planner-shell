@@ -4511,7 +4511,7 @@ def render_team_status() -> tuple[bool, str]:
             st.rerun()
         st.session_state[_we_key] = True
         st.success(f"You have **edit control of {year}** "
-                   f"(since {_when(lock.get('acquired_at',''))}).")
+                   f"(since {collab.lock_local_str(lock, 'acquired_at')}).")
         if st.button("Release edit control", width="stretch"):
             collab.release_lock(SCENARIO_DIR, year, user, tok)
             st.session_state.pop(f"lock_token_{year}", None)
@@ -4527,8 +4527,8 @@ def render_team_status() -> tuple[bool, str]:
                        "HERE — the other session becomes read-only.")
         else:
             st.warning(f"**{lock.get('user')}** is editing **{year}** "
-                       f"(since {_when(lock.get('acquired_at',''))}, "
-                       f"active {int(collab.age_min(lock.get('heartbeat','')))}m ago). "
+                       f"(since {collab.lock_local_str(lock, 'acquired_at')}, "
+                       f"active {max(0, int(collab.lock_age_min(lock)))}m ago). "
                        "You're read-only.")
     elif lock:
         st.caption(f"Stale lock on {year} from {lock.get('user')} — free to take.")
