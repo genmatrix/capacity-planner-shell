@@ -7,3 +7,5 @@ data_paths.json
 acd_maps.json
 field_maps.json
 Skill_Mapping.csv
+branding.json
+banned_terms.local.txt

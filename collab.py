@@ -332,10 +332,20 @@ def async_write(path: Path, text: str) -> None:
         _ASYNC_CV.notify_all()
 
 
-def async_cancel(path: Path) -> None:
-    """Drop any pending write for this path (call BEFORE deleting the file)."""
+def async_cancel(path: Path, timeout: float = 5.0) -> None:
+    """Drop any pending write for this path (call BEFORE deleting the file),
+    and wait out one already IN FLIGHT — otherwise it lands after the delete
+    and resurrects the draft the planner just discarded (audit 2026-10-14
+    #15)."""
+    key = str(path)
+    deadline = time.monotonic() + timeout
     with _ASYNC_CV:
-        _ASYNC_PENDING.pop(str(path), None)
+        _ASYNC_PENDING.pop(key, None)
+        while _ASYNC_BUSY == key:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            _ASYNC_CV.wait(left)
 
 
 def async_flush(timeout: float = 5.0) -> bool:
@@ -427,8 +437,22 @@ def read_budget(d, year):
 
 def write_budget(d, year, meta: dict):
     """Point `year`'s budget at a published version. Carries the previous
-    designation into `history` (oldest first) so a re-baseline is additive."""
-    prev = read_budget(d, year)
+    designation into `history` (oldest first) so a re-baseline is additive.
+
+    The previous pointer is read FRESH here, past the memo and the liveness
+    cache, and only a MISSING file means "no history". Any other failure
+    raises: a share hiccup used to read as "no baseline" and the write then
+    stored `history: []`, erasing the number the year was committed to
+    (auditor 2026-10-28)."""
+    p = budget_path(_dir(d), int(year))
+    try:
+        prev = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        prev = None
+    except (OSError, ValueError) as exc:
+        raise OSError(f"the current {int(year)} budget pointer could not be read "
+                      f"({exc.__class__.__name__}) — not overwriting its "
+                      "history") from exc
     hist = list(prev.get("history", [])) if prev else []
     if prev:
         hist.append({k: v for k, v in prev.items() if k != "history"})
@@ -740,6 +764,16 @@ def next_version(d) -> int:
     """
     vs = [j.get("version") for j in _all_snapshots(d)
           if isinstance(j.get("version"), int)]
+    # Plus a FRESH listing, past the liveness window: the cached one can be up
+    # to LIVENESS_MIN_SEC behind a colleague's publish, and two publishes in
+    # that window would mint the same number. The number is in the filename
+    # (`vNNNN <stamp> <name>.json`), so names alone are enough — one round
+    # trip, paid only on publish.
+    try:
+        vs += [int(m.group(1)) for n in os.listdir(d)
+               if (m := re.match(r"v(\d+) ", n))]
+    except OSError:
+        pass
     return (max(vs) + 1) if vs else 1
 
 

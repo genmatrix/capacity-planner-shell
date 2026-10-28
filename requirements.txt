@@ -1,21 +1,23 @@
 # Tested versions, pinned deliberately — not the newest available.
 #
-# Work runs Python 3.14 (approved 2026-09-04); verified on 3.14.5. The numpy
-# pin dates from when 3.11 was the floor (2.4.6 was the last cp311 build) —
-# it may be raised, but only after the full check suite is green on the new pin.
+# Production runs Python 3.14 (approved 2026-09-04); verified on 3.14.5.
+# Bumped 2026-10-28 from streamlit 1.57.0 / pandas 3.0.3 / numpy 2.4.6 /
+# altair 6.1.0 / pyarrow 24.0.0 after the full check suite ran green on this
+# exact set (and on the old one), with win_amd64 cp314 wheels confirmed for
+# every compiled package.
 #
 # If you bump anything here, run the full check suite against it first — the
 # launcher re-syncs every environment from this file automatically.
-streamlit==1.57.0
-pandas==3.0.3
-numpy==2.4.6
-altair==6.1.0
+streamlit==1.66.1
+pandas==3.1.0
+numpy==2.5.4
+altair==6.3.0
 # pyarrow is a TRANSITIVE dependency (streamlit requires it, to ship DataFrames
 # to the browser) and is pinned here on purpose, not by accident: the version
 # matters — newer pandas/numpy/pyarrow wheels segfaulted the demo host — and the
 # rule for this file is pin what you tested. Removing the line would not remove
 # the package, only the control over which build lands.
-pyarrow==24.0.0
+pyarrow==26.0.0
 # NOT here on purpose: openpyxl. It is reachable only through data_io.py, which
 # is deliberately never imported (manual entry is the model, user decision
 # 2026-07-10). Verified 2026-08-04 by running the whole suite against a venv

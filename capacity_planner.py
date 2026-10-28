@@ -1,5 +1,6 @@
 import copy
 import json
+import functools
 import os
 import re
 import time
@@ -24,9 +25,10 @@ st.set_page_config(page_title=f"{brand.identity()['word']} Capacity Planner",
                    layout="wide")
 brand.inject()
 
-# Where the shared team plan lives. Point this at the WFM network share so all
-# planners read/write the same active.json + snapshots, e.g.
-#   SCENARIO_DIR = Path(r"\\your-share\WFM\CapacityPlanner\scenarios")
+# Where the shared team plan lives. RELATIVE on purpose — do not hardcode a
+# share path here: the launcher `pushd`es into the app folder on the share, so
+# this already resolves to the team's copy, and every local run and check
+# relies on it resolving against the working directory.
 SCENARIO_DIR = Path("scenarios")
 if (Path(__file__).parent / "demo.flag").exists():
     if "_demo_scen_dir" not in st.session_state:
@@ -446,9 +448,30 @@ def diff_payloads(old: dict, new: dict) -> list[dict]:
 #
 # st.cache_data returns a COPY per call, so callers can treat the result as
 # theirs without a shared-mutation hazard.
+#
+# A FAILED read is never cached (audit 2026-10-14 #14). Immutability makes
+# the content a safe key, not the outcome: a share hiccup at boot used to be
+# remembered as "no snapshot" for the life of the process — a blank plan that
+# could be published over the team's, and a change log stuck on "(no field
+# changes)". st.cache_data does not cache a raised exception, so the miss is
+# raised inside and turned back into None outside.
+class _SnapshotUnreadable(Exception):
+    pass
+
+
 @st.cache_data(show_spinner=False, max_entries=64)
+def _cached_snapshot_ok(scen_dir: str, fname: str):
+    snap = collab.load_snapshot(scen_dir, fname)
+    if snap is None:
+        raise _SnapshotUnreadable(fname)
+    return snap
+
+
 def _cached_snapshot(scen_dir: str, fname: str):
-    return collab.load_snapshot(scen_dir, fname)
+    try:
+        return _cached_snapshot_ok(scen_dir, fname)
+    except _SnapshotUnreadable:
+        return None
 
 
 # Every key that IS the plan in a payload (everything else on a snapshot is
@@ -547,7 +570,8 @@ def _stage_replace(kind: str, **kw) -> None:
     copied that run's edits into the plan — so a rescue taken on the click
     missed the very edit the planner just made (auditor, 2026-10-14). At
     the end of the run every edit has landed."""
-    st.session_state["_staged_replace"] = (kind, kw, time.monotonic())
+    st.session_state["_staged_replace"] = (kind, kw, time.monotonic(),
+                                           st.session_state.get("_run_seq", 0))
 
 
 def _run_staged_replace() -> None:
@@ -556,13 +580,17 @@ def _run_staged_replace() -> None:
     staged = st.session_state.pop("_staged_replace", None)
     if not staged:
         return
-    kind, kw, t0 = staged
+    kind, kw, t0 = staged[:3]
+    same_run = len(staged) > 3 and staged[3] == st.session_state.get("_run_seq", 0)
     # A staged action normally runs at the bottom of the SAME run (or the run
     # a mid-page st.rerun() hands it to, milliseconds later). If a page raised
     # before the bottom, it would otherwise fire on the planner's NEXT,
     # unrelated keystroke — including a Restore publishing a team version with
-    # no click (auditor, 2026-10-14). Stale → drop it and say so.
-    if time.monotonic() - t0 > STAGED_MAX_AGE_S:
+    # no click (auditor, 2026-10-14). Stale → drop it and say so. The SAME
+    # run is never stale, however long the page took: on the share a slow
+    # page (Real Data parsing an upload) outlasted the window and every retry
+    # was dropped too (auditor 2026-10-28).
+    if not same_run and time.monotonic() - t0 > STAGED_MAX_AGE_S:
         st.session_state["_replace_msg"] = ("That action did not complete, so "
                                             "nothing was changed — click it again.")
         st.rerun()
@@ -588,7 +616,18 @@ def _run_staged_replace() -> None:
     elif kind == "exit_sandbox":
         st.session_state.sandbox = False
         if not _load_active_into_session():
-            st.session_state.loaded_version = None
+            if collab.read_active(SCENARIO_DIR, _plan_year()):
+                # Published, but unreadable right now (a share hiccup). Leaving
+                # Sandbox anyway would make its private frames look like the
+                # team plan — one Take control + Publish from overwriting it
+                # (auditor 2026-10-28). Stay put; the edits are already rescued.
+                st.session_state.sandbox = True
+                st.session_state["_replace_msg"] = (
+                    "The team plan could not be read just now, so you are still "
+                    "in Sandbox and nothing was lost — try again "
+                    "in a moment.")
+            else:
+                st.session_state.loaded_version = None
     elif kind in ("open_version", "load_whatif"):
         st.session_state.sandbox = True
         _apply_payload(full)
@@ -702,7 +741,14 @@ def _autosave_draft():
         blob = json.dumps(payload, sort_keys=True)
         st.session_state["_perf_draft_ser"] = time.perf_counter() - t0
         if st.session_state.get("_draft_blob") == blob:
-            return
+            # Unchanged — unless the background write of it FAILED. The worker
+            # cannot clear `_draft_blob` (it has no session), so without this
+            # a failed write was never retried and the edit stayed unprotected
+            # until the planner changed something else (audit 2026-10-14 #15).
+            last = collab.async_last_write(_draft_path())
+            if not (last and last[1]):
+                return
+            st.session_state["_draft_dir_ready"] = False   # folder may be gone
         # mkdir once per session, not per change — exist_ok on SMB still costs
         # a round trip every autosave. The except below clears the flag, so a
         # drafts folder deleted mid-session is recreated on the next change.
@@ -930,7 +976,7 @@ def _switch_year(year: int) -> None:
             st.rerun()
         # No draft either: the year genuinely has nothing. Give it its own
         # blank scaffold rather than another year's numbers.
-        init_state(int(st.session_state.n_weeks))
+        init_state(WEEKS_PER_YEAR)        # a new year is always a full year
         st.session_state.plan_year = int(year)
         st.rerun()
     # A year WITH a published version may still hold unpublished work on top
@@ -1117,7 +1163,8 @@ def _mapped_blank_lobs(n_weeks: int) -> dict | None:
         try:
             sdf, r, _secs, _mb = _cached_feed_raw(
                 "acd", _files_sig([s_path]), _msig,
-                json.dumps(load_field_maps().get("acd") or {}), mapping)
+                json.dumps(load_field_maps().get("acd") or {}), mapping,
+                json.dumps(load_field_maps().get("mapping") or {}))
             if r.ok:
                 _sw = sx.split_weekly(sdf)
                 if "Actual AHT (sec)" in _sw.columns:
@@ -1459,6 +1506,7 @@ def derive_seasonality_from_history(bench: pd.DataFrame | None, lob: str,
                  "(unmatched weeks stay 1.0).")
 
 
+@functools.lru_cache(maxsize=8192)
 def erlang_c_agents(calls_per_hr: float, aht_sec: float, sl_target_pct: float,
                     threshold_sec: float, max_occ_pct: float | None = None) -> int:
     """Minimum concurrent agents to answer `sl_target_pct`% of calls within
@@ -1466,15 +1514,21 @@ def erlang_c_agents(calls_per_hr: float, aht_sec: float, sl_target_pct: float,
     caps agent occupancy (a/s) — the planner's occupancy assumption acts as a
     floor on staffing, not a divisor, because Erlang already prices the idle
     time needed to hit the SL. Iterative Erlang B keeps it numerically stable
-    at any traffic volume (no factorials)."""
+    at any traffic volume (no factorials).
+
+    Perf (2026-10-28): B(s) is carried forward from B(s-1) — one recursion
+    step per extra agent instead of recomputing from k=1 every time, which was
+    O(s²) per interval. Same float operations in the same order, so the
+    answer is bit-identical (20k random inputs, 0 mismatches); ~19× faster.
+    Memoized per run: the same interval inputs recur across weeks and LOBs."""
     a = calls_per_hr * aht_sec / 3600.0          # offered load in erlangs
     if a <= 0 or aht_sec <= 0:
         return 0
     s = max(1, int(np.ceil(a)))
+    b = 1.0                                       # Erlang B, recursively
+    for k in range(1, s + 1):
+        b = a * b / (k + a * b)
     while True:
-        b = 1.0                                   # Erlang B, recursively
-        for k in range(1, s + 1):
-            b = a * b / (k + a * b)
         if s > a:
             pw = b / (1 - (a / s) * (1 - b))      # Erlang C: P(wait > 0)
             sl = 1 - pw * np.exp(-(s - a) * threshold_sec / aht_sec)
@@ -1484,6 +1538,7 @@ def erlang_c_agents(calls_per_hr: float, aht_sec: float, sl_target_pct: float,
                 max_occ_pct is None or s == 0 or a / s <= max_occ_pct / 100):
             return s
         s += 1
+        b = a * b / (s + a * b)                   # B(s) from B(s-1)
 
 
 def _weekly_assumption(d: pd.DataFrame, col: str, scalar, n: int) -> np.ndarray:
@@ -2252,7 +2307,30 @@ def _partial_note(lob: str | None):
                    + ("…" if len(wks) > 8 else ""))
 
 
+# Per-run memo for `_bench_series` (perf 2026-10-28: the Executive View asked
+# for the same series ~40 times a run, each a filter + a groupby mode). The
+# main script re-executes every run, so this dict is fresh every run. A hit
+# also requires the SAME frame object (`is`, with the frame held in the memo
+# so its id cannot be reused): `refresh_acd_rollup` or a Real Data visit can
+# swap `acd_weekly` mid-run, and a stale series must never be served.
+_BS_MEMO: dict = {}
+
+
 def _bench_series(key: str, col: str, lob: str | None, weeks) -> pd.Series | None:
+    if get_script_run_ctx(suppress_warning=True) is None:
+        # Bare mode (a check importing the module): no run boundary to scope
+        # the memo to, and frames are mutated in place between calls.
+        return _bench_series_uncached(key, col, lob, weeks)
+    bench = st.session_state.get(key)
+    mk = (key, col, lob, tuple(weeks))
+    hit = _BS_MEMO.get(mk)
+    if hit is None or hit[0] is not bench:
+        hit = _BS_MEMO[mk] = (bench, _bench_series_uncached(key, col, lob, weeks))
+    return None if hit[1] is None else hit[1].copy()
+
+
+def _bench_series_uncached(key: str, col: str, lob: str | None, weeks
+                           ) -> pd.Series | None:
     """Pull a persisted ACD benchmark column, aligned to the plan weeks.
 
     `lob=None` sums across all LOBs (for the consolidated view). Returns None if
@@ -2271,7 +2349,8 @@ def _bench_series(key: str, col: str, lob: str | None, weeks) -> pd.Series | Non
     return aligned if aligned.notna().any() else None
 
 
-def demand_supply_available(lob_names: list[str], weeks: list[str]) -> dict:
+def demand_supply_available(lob_names: list[str], weeks: list[str],
+                            plans: dict | None = None) -> dict:
     """Required and Staffing, planned and actual, all in FTE AVAILABLE TO TAKE
     CALLS — logged in and not in AUX — summed over `lob_names`.
 
@@ -2299,6 +2378,7 @@ def demand_supply_available(lob_names: list[str], weeks: list[str]) -> dict:
     out = {k: np.zeros(n) for k in ("req_plan", "stf_plan", "req_act", "stf_act")}
     req_ok, stf_ok = np.ones(n, dtype=bool), np.ones(n, dtype=bool)
     any_req, any_stf = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+    plan_gap = np.zeros(n, dtype=bool)     # a LOB's planned figure is NaN
     for name in lob_names:
         d = lobs.get(name)
         if d is None or len(d["demand"]) != n:
@@ -2306,17 +2386,29 @@ def demand_supply_available(lob_names: list[str], weeks: list[str]) -> dict:
         a = d["assumptions"]
         avail = 1 - _weekly_assumption(d["demand"], "Shrinkage %",
                                        a.get("shrinkage_pct", 32.0), n) / 100
-        pf = compute_plan(d)
+        pf = (plans or {}).get(name)
+        if pf is None:
+            pf = compute_plan(d)
         planned = pf["Required FTE"].to_numpy(dtype=float)
+        # A NaN week is a hole in the plan, not "this LOB needs nobody":
+        # zeroing it would drop the LOB from the summed line and let the
+        # actual-coverage gate pass that week (auditor 2026-10-28).
+        plan_gap |= ~np.isfinite(planned)
         out["req_plan"] += np.nan_to_num(planned * avail)
         out["stf_plan"] += np.nan_to_num(pf["Staffed FTE"].to_numpy(dtype=float) * avail)
-        needs = planned > 0
+        needs = (planned > 0) | ~np.isfinite(planned)
         c = _bench_series("acd_weekly", "Actual Contacts", name, weeks)
         h = _bench_series("acd_weekly", "Actual AHT (sec)", name, weeks)
         if c is not None and h is not None:
             c, h = c.to_numpy(dtype=float), h.to_numpy(dtype=float)
             have = np.isfinite(c) & np.isfinite(h) & (h > 0)
             dem = d["demand"].copy()
+            # Float first: a whole-number grid column is int64, and pandas 3
+            # refuses a fractional actual AHT into it — which crashed both
+            # pages on every rerun (auditor 2026-10-28).
+            for _col in ("Fcst Override", "AHT (sec)"):
+                if _col in dem.columns:
+                    dem[_col] = pd.to_numeric(dem[_col], errors="coerce").astype(float)
             dem.loc[have, "Fcst Override"] = c[have]
             dem.loc[have, "AHT (sec)"] = h[have]
             act = compute_plan({**d, "demand": dem})["Required FTE"].to_numpy(dtype=float)
@@ -2336,6 +2428,7 @@ def demand_supply_available(lob_names: list[str], weeks: list[str]) -> dict:
             stf_ok &= ~needs
     out["req_act"] = np.where(req_ok & any_req, out["req_act"], np.nan)
     out["stf_act"] = np.where(stf_ok & any_stf, out["stf_act"], np.nan)
+    out["req_plan"] = np.where(plan_gap, np.nan, out["req_plan"])
     return out
 
 
@@ -2348,7 +2441,8 @@ AVAILABLE_BASIS_NOTE = (
     "handle time that actually arrived.")
 
 
-def render_demand_supply_chart(lob_names: list[str], weeks: list[str]) -> bool:
+def render_demand_supply_chart(lob_names: list[str], weeks: list[str],
+                               plans: dict | None = None) -> bool:
     """The director's demand-vs-supply chart (2026-10-14): Required as LINES
     (planned dashed, actual solid), Staffing as SHADED AREAS (planned pale,
     actual deeper), all on the available basis above. Used by the Executive
@@ -2356,7 +2450,7 @@ def render_demand_supply_chart(lob_names: list[str], weeks: list[str]) -> bool:
     actual is carried by ENCODING, not new colours — the validated DEMAND and
     SUPPLY hues stay. Returns True when any actual week was drawn."""
     import altair as alt
-    ser = demand_supply_available(lob_names, weeks)
+    ser = demand_supply_available(lob_names, weeks, plans)
     has_act = bool(np.isfinite(ser["req_act"]).any() or np.isfinite(ser["stf_act"]).any())
     wide = pd.DataFrame({
         "Week": weeks,
@@ -2388,7 +2482,10 @@ def render_demand_supply_chart(lob_names: list[str], weeks: list[str]) -> bool:
     st.markdown('<div style="margin:2px 0 6px">' + "".join(legend) + "</div>",
                 unsafe_allow_html=True)
     x = alt.X("Week:O", sort=None, axis=_month_axis())
-    base = alt.Chart(wide)
+    # Layers carry NO data; the frame goes on the layer chart once. Altair
+    # hashes each sub-chart's frame as a string, so per-layer data cost ~25 ms
+    # a rerun for an identical spec (profiled 2026-10-28).
+    base = alt.Chart()
     layers = [
         base.mark_area(color=brand.SUPPLY, opacity=0.2, interpolate="monotone")
             .encode(x=x, y=alt.Y("Staffing — planned:Q",
@@ -2412,11 +2509,11 @@ def render_demand_supply_chart(lob_names: list[str], weeks: list[str]) -> bool:
         ["Required — actual", "Staffing — actual"] if has_act else [])
     hover = alt.selection_point(fields=["Week"], nearest=True, on="pointerover",
                                 empty=False, clear="pointerout")
-    layers.append(alt.Chart(wide).mark_rule(color=brand.MUTED, strokeWidth=1).encode(
+    layers.append(alt.Chart().mark_rule(color=brand.MUTED, strokeWidth=1).encode(
         x=x, opacity=alt.condition(hover, alt.value(0.6), alt.value(0)),
         tooltip=[alt.Tooltip("Week:O")] + [alt.Tooltip(f"{c}:Q", format=".1f")
                                            for c in cols]).add_params(hover))
-    chart = alt.layer(*layers)
+    chart = alt.layer(*layers, data=wide)
     tr = _today_rule(weeks)
     brand.chart(chart + tr if tr is not None else chart, height=260)
     st.caption(AVAILABLE_BASIS_NOTE + (
@@ -2691,16 +2788,19 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
     only for stages with weeks remaining — survivors of a finished stage
     aren't attrited twice). Touches only the working plan — published
     snapshots are untouched until the new year is itself published."""
-    yr, n = plan_year(), st.session_state.n_weeks
+    # A new year is always a FULL year — never a legacy short horizon carried
+    # forward, which nothing could fix once the slider was retired (auditor
+    # 2026-10-28).
+    yr, n = plan_year(), WEEKS_PER_YEAR
     new_weeks = [w.isoformat() for w in week_starts(n, yr + 1)]
     new_lobs = {}
     for name, d in st.session_state.lobs.items():
         plan = compute_plan(d)
         dem, ros, nh = d["demand"], d["roster"], d["nh"]
 
-        def last(col, df=dem):
+        def last(col, df=dem, blank=0.0):
             v = pd.to_numeric(df[col], errors="coerce").iloc[-1]
-            return float(v) if pd.notna(v) else 0.0
+            return float(v) if pd.notna(v) else blank
 
         _seed = (cpm_seed or {}).get(name)
         # DEMAND DRIVERS START CLEAN (user decision 2026-08-10: "I want it to
@@ -2731,7 +2831,10 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
             # year, which is the one direction a staffing model must never
             # guess in. It is also an operating reality that does not reset on
             # Jan 1 — closer to the LOA level than to next year's CPM.
-            "Shrinkage %": [last("Shrinkage %")] * n,
+            # A blank final week carries what the engine actually used for it
+            # (the scalar fallback in `_weekly_assumption`), never 0%.
+            "Shrinkage %": [last("Shrinkage %", blank=float(
+                d["assumptions"].get("shrinkage_pct", 32.0)))] * n,
         })
         new_ros = pd.DataFrame({
             "Week": new_weeks,
@@ -2782,6 +2885,7 @@ def roll_over_plan(cpm_seed: dict | None = None) -> None:
         }
     st.session_state.lobs = new_lobs
     st.session_state.plan_year = yr + 1
+    st.session_state.n_weeks = n
     me = float(st.session_state.get("members_end", 0.0) or 0.0)
     st.session_state.members_start = me
     st.session_state.members_end = me   # planner enters the new year-end forecast
@@ -3221,17 +3325,35 @@ def apply_interim(spec_lob: str, donor_lob: str, start_i: int, end_i: int,
 AUX_COLS = [f"i_auxtime{i}" for i in range(100)]
 
 
-def load_acd(sources) -> pd.DataFrame:
-    frames = [pd.read_csv(s, encoding="utf-8-sig") for s in sources]
+def load_acd(sources) -> tuple[pd.DataFrame, str | None]:
+    """(frame, split-code warning or None). Parsed ONCE per file version per
+    process (audit 2026-10-14 #23): this page used to re-read the whole
+    export — ~100 MB on the share — on every rerun. The frame is a SHARED
+    reference; treat it as immutable."""
+    return _cached_acd(_files_sig(sources),
+                       json.dumps(load_field_maps().get("acd") or {}))
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _cached_acd(sig: tuple, fmap_json: str) -> tuple[pd.DataFrame, str | None]:
+    frames = [pd.read_csv(x[0], encoding="utf-8-sig") for x in sig]
     df = pd.concat(frames, ignore_index=True)
     # Same canonical-field resolution as the Real Data page, so a mapped
     # non-standard export works on BOTH pages (one mapping, one truth).
-    df, _, _, _ = sx.resolve_columns(df, "acd", load_field_maps().get("acd"))
+    df, _, _, _ = sx.resolve_columns(
+        df, "acd", json.loads(fmap_json) if fmap_json != "{}" else None)
     keep = ["row_date", "starttime", "split", "i_stafftime", "i_auxtime",
             "i_availtime", "i_acdtime", "i_acwtime", "i_othertime"]
     present = [c for c in keep if c in df.columns]
     aux_present = [c for c in AUX_COLS if c in df.columns]
-    return df[present + aux_present]
+    df = df[present + aux_present]
+    # A "Grand Total" footer used to crash this page in the split sort below;
+    # the same whole-number rule as the Real Data import now sets it aside.
+    if "split" not in df.columns:
+        return df, None
+    df, w1 = sx.clean_split_codes(df)
+    df, w2 = sx.drop_overlapping_rows(df)
+    return df, " ".join(w for w in (w1, w2) if w) or None
 
 
 UNMAPPED_LOB = "— unmapped —"
@@ -3470,7 +3592,9 @@ def render_shrinkage_page():
                 "page will pick them up automatically.")
         return
 
-    df = load_acd(sources)
+    df, _split_warn = load_acd(sources)
+    if _split_warn:
+        st.warning(_split_warn)
     ensure_maps(df, mapping)
 
     # Surface splits present in the data but absent from the mapping (not dropped).
@@ -3627,7 +3751,9 @@ def _files_sig(files) -> tuple:
     return tuple(out)
 
 
-@st.cache_resource(show_spinner=False)
+# Bounded (audit 2026-10-14 #24): each new daily export is a new key, and an
+# unbounded cache kept every parsed ~100 MB frame for the life of the process.
+@st.cache_resource(show_spinner=False, max_entries=4)
 def _cached_mapping(sig: tuple, fmap_json: str):
     """(mapping, report) — parsed once per file version per process."""
     return sx.load_mapping(Path(sig[0][0]),
@@ -3650,12 +3776,13 @@ def _load_split_safe(files, mapping, fmap):
         return pd.DataFrame(), rep
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=4)
 def _cached_feed_raw(feed: str, sig: tuple, map_sig: tuple, fmap_json: str,
-                     _mapping) -> tuple:
+                     _mapping, map_fmap_json: str = "{}") -> tuple:
     """(raw_df, report, parse_secs, mb) for one interval feed. `_mapping` is
-    keyed by `map_sig` (the object itself is unhashable). The returned frame
-    is a shared reference — NEVER mutate it."""
+    keyed by `map_sig` + `map_fmap_json` — the mapping file AND its column
+    map, which together decide the parsed mapping (the object itself is
+    unhashable). The returned frame is a shared reference — NEVER mutate it."""
     files = [Path(x[0]) for x in sig]
     mb = sum(x[2] for x in sig) / 1e6
     t0 = time.perf_counter()
@@ -3672,6 +3799,48 @@ def _feed_sources_from_saved(saved: dict) -> tuple:
     c = resolve_data_path("acd", saved) or \
         ([_autoload("split.csv")] if _autoload("split.csv") else [])
     return m, c
+
+
+def _rollup_inputs_sig() -> str:
+    """Everything the weekly ACD rollup reads besides the raw frame: each
+    LOB's paid hours (the FTE divisor) and the Shrinkage page's split / AUX
+    toggles. Small — cheap enough to compare on every rerun."""
+    paid = sorted((l, d["assumptions"].get("paid_hours_per_week"))
+                  for l, d in st.session_state.get("lobs", {}).items())
+    maps = [st.session_state.get(k) for k in ("split_map", "aux_map")]
+    return json.dumps([paid] + [m.to_json() if m is not None else None
+                                for m in maps], default=str)
+
+
+def _remember_acd_raw(sraw):
+    """Keep the raw frame the current rollup came from (a shared cache
+    reference, not a copy) and the inputs it was built with, so
+    `refresh_acd_rollup` can rebuild it when those inputs move."""
+    st.session_state["_acd_raw"] = sraw
+    st.session_state["_acd_roll_sig"] = _rollup_inputs_sig()
+
+
+def refresh_acd_rollup():
+    """Keep `acd_weekly` LIVE (audit 2026-10-14 #20). It used to be built at
+    boot and on Real Data only, so a paid-hours change or a Shrinkage-page
+    toggle left every actuals overlay and the reconciliation on the old
+    numbers until the planner happened to visit Real Data. Rebuilt only when
+    the inputs actually moved — the rollup walks the whole interval frame,
+    which is too slow to redo on every keystroke."""
+    raw = st.session_state.get("_acd_raw")
+    if raw is None or st.session_state.get("acd_weekly") is None:
+        return
+    sig = _rollup_inputs_sig()
+    if sig == st.session_state.get("_acd_roll_sig"):
+        return
+    st.session_state["_acd_roll_sig"] = sig
+    try:
+        st.session_state["acd_weekly"] = _rollups_from_raw(raw)
+    except Exception as e:                  # noqa: BLE001 — never take a page down
+        st.session_state["_feed_errors"] = (
+            list(st.session_state.get("_feed_errors") or [])
+            + [f"ACD rollup could not be refreshed ({type(e).__name__}) — "
+               "showing the last good one. Open Real Data to check."])
 
 
 def _rollups_from_raw(sraw):
@@ -3730,13 +3899,16 @@ def _autoload_feeds_inner():
             t0 = time.perf_counter()
             df, rep, secs, mb = _cached_feed_raw(
                 "acd", _files_sig(s_files), map_sig,
-                json.dumps(fmaps.get("acd") or {}), mapping)
+                json.dumps(fmaps.get("acd") or {}), mapping,
+                json.dumps(fmaps.get("mapping") or {}))
             errors += rep.errors
             perf["ACD"] = {"mb": mb, "parse_s": secs,
                            "wall_s": time.perf_counter() - t0,
                            "files": len(s_files)}
             st.session_state["acd_weekly"] = (_rollups_from_raw(df)
                                               if rep.ok else None)
+            if rep.ok:
+                _remember_acd_raw(df)
     perf["total_s"] = time.perf_counter() - t_all
     st.session_state["_feed_perf"] = perf
     st.session_state["_feed_errors"] = errors
@@ -3995,10 +4167,12 @@ def render_real_data_page():
     else:
         sdf, r, _secs, _mb = _cached_feed_raw(
             "acd", _files_sig(s_src), _msig,
-            json.dumps(fmaps.get("acd") or {}), mapping)
+            json.dumps(fmaps.get("acd") or {}), mapping,
+            json.dumps(fmaps.get("mapping") or {}))
         st.caption(f"{_mb:.0f} MB parsed in {_secs:.1f}s — cached until "
                    "the file changes.")
     _show_report(r)
+    _sraw = sdf                            # pre-toggle, for refresh_acd_rollup
     if r.ok:
         # Guarded like the loader (audit 2026-10-14): a failure in the toggles
         # or the rollup must not take down the page that fixes a bad file —
@@ -4020,6 +4194,8 @@ def render_real_data_page():
 
     # Persist so the Capacity Plan chart can overlay these benchmarks.
     st.session_state["acd_weekly"] = sw
+    if sw is not None:
+        _remember_acd_raw(_sraw)
 
     # 3 — Combined benchmark ---------------------------------------------
     st.subheader("3 · Plan vs. actuals")
@@ -4102,10 +4278,13 @@ def render_real_data_page():
         agg["Measured In-Office Shrink %"] = ("In-Office Shrink %", "mean")
     meas = comb.groupby("LOB").agg(**agg).round(1) if agg else pd.DataFrame()
 
+    # Both buttons below change the PLAN, so they follow read-only like every
+    # other plan input (audit 2026-10-14 #16).
+    _ro = not st.session_state.get("editable", False)
     missing = [l for l in mapping.lobs if l not in st.session_state.lobs]
     if missing:
         st.caption(f"These mapped LOBs aren't in the model yet: {', '.join(missing)}")
-        if st.button(f"Create {len(missing)} model LOB(s) from mapping"):
+        if st.button(f"Create {len(missing)} model LOB(s) from mapping", disabled=_ro):
             for l in missing:
                 aht = 400.0
                 if not meas.empty and "Measured AHT (sec)" in meas and l in meas.index \
@@ -4122,18 +4301,27 @@ def render_real_data_page():
             "In-office shrink is AUX ÷ staffed time — it excludes out-of-office "
             "(PTO, absence). Layer OOO on top before trusting it as total shrinkage.")
         in_model = [l for l in meas.index if l in st.session_state.lobs]
-        if in_model and st.button("Apply measured AHT & shrinkage to matching model LOBs"):
+        if in_model and st.button("Apply measured AHT & shrinkage to matching model LOBs",
+                                  disabled=_ro):
             applied = []
             for lob in in_model:
                 a = st.session_state.lobs[lob]
                 if "Measured AHT (sec)" in meas and pd.notna(meas.loc[lob, "Measured AHT (sec)"]):
-                    a["demand"]["AHT (sec)"] = round(float(meas.loc[lob, "Measured AHT (sec)"]))
+                    # float, never int: a whole-number column turns the grid
+                    # into an integer editor that rejects decimals.
+                    a["demand"]["AHT (sec)"] = float(round(float(
+                        meas.loc[lob, "Measured AHT (sec)"])))
                 if "Measured In-Office Shrink %" in meas and pd.notna(
                         meas.loc[lob, "Measured In-Office Shrink %"]):
                     a["assumptions"]["shrinkage_pct"] = round(
                         float(meas.loc[lob, "Measured In-Office Shrink %"]), 1)
                 applied.append(lob)
-            st.success(f"Applied measured AHT/shrinkage to: {', '.join(applied)}.")
+            # The measured figure is IN-OFFICE shrink only, so it lands as the
+            # seed (used for blank weeks), never over the weekly cells — writing
+            # it there would drop out-of-office time and understate Required.
+            st.success(f"Applied measured AHT to every week, and in-office "
+                       f"shrinkage as the shrinkage seed (blank weeks only), for: "
+                       f"{', '.join(applied)}.")
             st.rerun()
 
 
@@ -4634,7 +4822,7 @@ PAGES = [p for p in ALL_PAGES if p not in HIDDEN_PAGES]
 # horizon are set by sidebar widgets hundreds of lines further down, so they
 # would render one run stale — they stay on the Executive View instead.
 brand.header(st.session_state.get("nav_page", PAGES[0]),
-             f"Plan year {plan_year()} · {datetime.now():%b %d, %Y}")
+             f"Plan year {plan_year()} · {_today():%b %d, %Y}")
 
 # Navigation lives at the TOP OF THE MAIN BODY, styled as a site nav bar. It is
 # still a radio, deliberately: the widget TYPE is what keeps `nav_page` stable
@@ -4717,8 +4905,18 @@ with st.sidebar:
     # unkeyed selectbox re-derives its identity from that index — editing any
     # LOB's HC would churn the widget and snap the view (the "two clicks"
     # family; introduced+caught 2026-07-16 when the default went data-driven).
+    #
+    # Its state is ALSO kept under a non-widget key (audit 2026-10-14 #19).
+    # Take control, Release, Check for updates, Reload and Sandbox all
+    # `st.rerun()` from render_team_status, ABOVE this widget, so the run ends
+    # before it renders and Streamlit drops its state — the next run snapped
+    # back to the default LOB, and a planner could edit the wrong line. "No
+    # state" therefore means "keep what we had", never "the default".
+    _kept = st.session_state.get("_lob_view_kept")
+    _start = _kept if _kept in options else default_view
     view = st.selectbox("Line of Business", options,
-                        index=options.index(default_view), key="lob_view")
+                        index=options.index(_start), key="lob_view")
+    st.session_state["_lob_view_kept"] = view
 
     with st.expander("Add / remove LOB"):
         new_lob = st.text_input("New LOB name", disabled=RO)
@@ -4840,6 +5038,8 @@ with st.sidebar:
                 + (f" — CPM projected from the measured trend for "
                    f"{len(_seeds)} LOB(s)." if _seeds else " — CPM carried flat.")
                 + " Set the new year-end member forecast, review, then publish.")
+            # Untick: a confirm that stays ticked guards only the first use.
+            st.session_state.pop("roll_confirm", None)
             st.rerun()
 
     # --- Sync start from the prior year (2026-09-15) ----------------------
@@ -4881,6 +5081,7 @@ with st.sidebar:
                     + ((" Kept as you edited them: "
                         + ", ".join(f"{l} ({w})" for l, w in _res["kept"]) + ".")
                        if _res["kept"] else ""))
+                st.session_state.pop("sync_confirm", None)    # guard every use
                 st.rerun()
             if st.session_state.get("_sync_report"):
                 st.success(st.session_state.pop("_sync_report"))
@@ -5369,7 +5570,9 @@ def _attrition_weekly(plan: pd.DataFrame, roster: pd.DataFrame, line: str = "all
 
 
 def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.ndarray,
-                  last: int, xo: np.ndarray | None = None) -> pd.DataFrame:
+                  last: int, xo: np.ndarray | None = None,
+                  proj_mod: np.ndarray | None = None,
+                  proj_hc: np.ndarray | None = None) -> pd.DataFrame:
     """Month-over-month to date. A week belongs to the month its MONDAY is in
     (`period_key`, the Budget page's calendar — one calendar for contacts and
     attrition). "To date" = through the last recorded week; the modelled
@@ -5378,8 +5581,15 @@ def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.nda
     52 ÷ Σ start-of-week headcount over the counted weeks — the sidebar's
     measured definition, so the two agree. Assumed %/yr is derived the same
     way from the modelled departures, which makes the consolidated figure a
-    headcount-weighted blend of the LOBs' assumptions for free."""
+    headcount-weighted blend of the LOBs' assumptions for free.
+
+    `proj_mod`/`proj_hc` (default: `mod`/`hc`) feed the whole-year
+    `Projected` columns. The consolidated view passes them UNMASKED: its
+    `mod`/`hc` stop at each LOB's last record, which is right for the
+    like-for-like comparison and wrong for a projection."""
     months = [period_key(w, "Monthly") for w in weeks]
+    proj_mod = mod if proj_mod is None else proj_mod
+    proj_hc = hc if proj_hc is None else proj_hc
     order = list(dict.fromkeys(months))
     xo = np.zeros(len(rec)) if xo is None else xo
     rows, ytd_r, ytd_m, cum_proj = [], 0.0, 0.0, 0.0
@@ -5392,8 +5602,8 @@ def _monthly_rows(weeks: list[str], rec: np.ndarray, mod: np.ndarray, hc: np.nda
         # like-for-like figure over the weeks actually recorded, so a partial
         # month's Δ still compares two weeks against two. Months past the
         # last record carry Projected only — Recorded and Δ blank, never 0.
-        proj = float(mod[idx_all].sum())
-        h_all = float(hc[idx_all].sum())
+        proj = float(proj_mod[idx_all].sum())
+        h_all = float(proj_hc[idx_all].sum())
         cum_proj += proj
         if not idx:
             rows.append({
@@ -5445,8 +5655,14 @@ def attrition_by_month_consolidated(lobs: dict, line: str = "all") -> pd.DataFra
     tot_r = tot_m = tot_h = None
     weeks = None
     last_any = -1
+    proj = []          # (modelled, start HC) of EVERY line, recorded or not
     for d in lobs.values():
         plan = compute_plan(d)
+        lines = ("ft", "pt") if line == "all" else (line,)
+        parts = [x for x in (_line_arrays(plan, d["roster"], ln) for ln in lines)
+                 if x is not None]
+        if parts:
+            proj.append((sum(x[1] for x in parts), sum(x[2] for x in parts)))
         w = _attrition_weekly(plan, d["roster"], line)
         if w is None:
             continue
@@ -5465,7 +5681,13 @@ def attrition_by_month_consolidated(lobs: dict, line: str = "all") -> pd.DataFra
         last_any = max(last_any, last)
     if tot_r is None:
         return None
-    return _monthly_rows(weeks, tot_r, tot_m, tot_h, last_any, tot_x)
+    # The projection is the whole org's modelled year — every line through
+    # every week, including a line that has recorded nothing yet.
+    proj = [(m, h) for m, h in proj if len(m) == n]
+    p_mod = sum((m for m, _ in proj), np.zeros(n))
+    p_hc = sum((h for _, h in proj), np.zeros(n))
+    return _monthly_rows(weeks, tot_r, tot_m, tot_h, last_any, tot_x,
+                         proj_mod=p_mod, proj_hc=p_hc)
 
 
 def _render_month_table(df: pd.DataFrame, key: str):
@@ -6083,14 +6305,18 @@ def render_executive_view():
     _ref_hc = (ref_.get("hc") if ref_ else None)
     _hd = (hc_now - _ref_hc[now_i]) if (_ref_hc and len(_ref_hc) == len(weeks)) else None
 
-    act_vol = _bench_series("acd_weekly", "Actual Contacts", None, weeks)
+    act_vol = _bench_series("acd_weekly", "Actual Contacts", scope, weeks)
     if act_vol is not None:
         _av = pd.to_numeric(act_vol, errors="coerce").dropna()
         act_vol = (float(_av.sum()), int(len(_av))) if len(_av) else None
     aht = _org_actual_aht(lobs, weeks)
     attr = _org_measured_attrition(plans)
 
-    _no_feed = "no WFM actuals loaded"
+    # Say WHICH gap it is: no feed at all, or a feed (staffing actuals
+    # loaded) whose export simply lacks the volume / handle-time columns.
+    _swk = st.session_state.get("acd_weekly")
+    _no_feed = ("no ACD actuals loaded" if _swk is None or _swk.empty
+                else "not in the ACD export")
     tiles = [
         {"label": "Forecast Volume", "value": _compact(fcst_total),
          "sub": f"{fcst_total:,.0f} contacts · {len(weeks)} wks",
@@ -6107,7 +6333,7 @@ def render_executive_view():
          "sub": (f"contact-weighted · {aht[1]} wk(s)" if aht else _no_feed),
          "sub_warn": aht is None},
         {"label": "Production HC", "value": f"{hc_now:,.1f}",
-         "sub": f"week of {wk_lbl[now_i]} · all LOBs",
+         "sub": f"week of {wk_lbl[now_i]} · {scope or 'all LOBs'}",
          "delta": (f"{_hd:+.1f}" if _hd is not None and abs(_hd) >= 0.05
                    else ("· 0" if _hd is not None else None)),
          "delta_tone": ("good" if (_hd or 0) > 0 else "bad") if _hd else "",
@@ -6219,7 +6445,7 @@ def render_executive_view():
                                   "Cell colour shades by Net ÷ Required, so a "
                                   "small team's shortfall reads as deep as it "
                                   "is for them.")
-        heat = alt.Chart(hm_long).mark_rect(cornerRadius=2).encode(
+        heat = alt.Chart().mark_rect(cornerRadius=2).encode(
             x=alt.X("Week:O", sort=None, axis=_month_axis()),
             y=alt.Y("LOB:N", sort=lobs, title=None),
             # THREE-point domain to match the three-colour range — one pivot
@@ -6247,13 +6473,15 @@ def render_executive_view():
             # capped — not on the FTE the label prints.
             _dark = (f"datum['Short %'] <= {-0.62 * HEAT_CAP_PCT} || "
                      f"datum['Short %'] >= {0.83 * HEAT_CAP_PCT}")
-            heat = heat + alt.Chart(hm_long).mark_text(
+            heat = heat + alt.Chart().mark_text(
                 fontSize=9, fontWeight=500).encode(
                 x=alt.X("Week:O", sort=None, axis=_month_axis()),
                 y=alt.Y("LOB:N", sort=lobs, title=None),
                 text=alt.Text("Net FTE:Q", format="+.0f"),
                 color=alt.condition(_dark, alt.value("#ffffff"),
                                     alt.value(brand.TEXT)))
+        # Data once, on the outer chart (see the demand-vs-supply chart).
+        heat = heat.properties(data=hm_long)
         brand.chart(heat, height=32 * len(lobs) + 60)
 
     # ---- demand vs supply walk ----------------------------------------
@@ -6267,7 +6495,7 @@ def render_executive_view():
     # fill. Actuals stop at the last complete ACD week.
     _scope_name = "all lines of business" if scope is None else scope
     with brand.section("walk", f"Demand vs. supply — {_scope_name}"):
-        render_demand_supply_chart(lobs, weeks)
+        render_demand_supply_chart(lobs, weeks, plans)
         _tr = _today_rule(weeks)
         nf = pd.DataFrame({"Week": weeks, "Net": cons_net})
         nf_chart = alt.Chart(nf).mark_bar(opacity=.85, cornerRadius=2).encode(
@@ -6456,7 +6684,7 @@ def render_executive_view():
                 st.markdown(f"**{t}**")
                 st.markdown(by_title[t])
         st.markdown("**Where the plan stands right now**")
-        weekly_checklist()
+        weekly_checklist(plans if scope is None else None)
         st.caption("Full task list on the Guide page.")
 
     brand.band("<b>Data health</b> — " + " · ".join(bits)
@@ -6473,8 +6701,10 @@ GUIDE_SECTIONS = [
     ("Every week — the plan review", """
 1. Open **Real Data**. The ACD feed loads from the remembered
    locations automatically — check the notes at the top for warnings.
-2. Look at **Days Covered** in the table. A week under 7 days is partial —
-   don't treat its totals as a full week.
+2. Look at **Days Covered** in the table. A week below that queue's normal
+   week (most weeks' Days Covered, less any holiday closures) is partial —
+   don't treat its totals as a full week; the app leaves it out of every
+   comparison.
 3. Go to **Capacity Plan** and open each line of business. The
    **reconciliation table** at the bottom shows Plan / Actual / Variance for
    contacts, AHT, SL%, staffing and shrinkage — red variances are where
@@ -6600,8 +6830,9 @@ the number moved from 6 to 33.
   Holiday closures.
 """),
     ("Data health warnings", """
-- **Partial weeks** (Days Covered < 7): totals reflect only the days present.
-  Fine for within-week comparisons; not a real weekly number.
+- **Partial weeks** (Days Covered below the queue's normal week, less holiday
+  closures): totals reflect only the days present. Left out of every
+  plan-vs-actual comparison; not a real weekly number.
 - **Unmapped splits/queues**: surfaced with a warning, excluded by default —
   never silently dropped. Blend/overhead skills belong excluded; a real LOB
   split needs a row in the mapping file.
@@ -6780,7 +7011,7 @@ def page_help(page: str):
         st.caption("Full task list on the Guide page.")
 
 
-def weekly_checklist():
+def weekly_checklist(plans: dict | None = None):
     """Self-checking weekly review: every item is COMPUTED from live state, so
     it cannot go stale. Not documentation — a status panel."""
     sw = st.session_state.get("acd_weekly")
@@ -6810,7 +7041,10 @@ def weekly_checklist():
                             "(remembered locations load them automatically)"))
 
     # 2 — does the plan cover the horizon?
-    plans = {l: compute_plan(d) for l, d in st.session_state.lobs.items()}
+    # A caller that already computed every LOB's plan this run passes it in
+    # (perf 2026-10-28: the Executive View computed each plan three times).
+    if plans is None or set(plans) != set(st.session_state.lobs):
+        plans = {l: compute_plan(d) for l, d in st.session_state.lobs.items()}
     short = [l for l, p in plans.items()
              if float(p["Required FTE"].mean()) > 0 and float(p["Net FTE"].min()) < 0]
     if not any(float(p["Required FTE"].mean()) > 0 for p in plans.values()):
@@ -7467,6 +7701,10 @@ def render_budget_baseline(grain: str, yr: int):
     the working plan has drifted from it (manager ask 2026-08-02)."""
     ptr = budget_baseline(yr)
     RO = not st.session_state.get("editable", False)
+    # The baseline is a SHARED team file, so editing a private Sandbox copy
+    # is not enough to move it — only the edit-control holder can (audit
+    # 2026-10-14 #13).
+    _sandbox = bool(st.session_state.get("sandbox"))
 
     with brand.section(
             "budget_lock", f"Budget baseline — {yr}",
@@ -7500,8 +7738,10 @@ def render_budget_baseline(grain: str, yr: int):
         if not vers:
             st.caption(f"Nothing published for {yr} yet — publish the approved "
                        "plan first, then lock it here.")
-        elif RO:
-            st.caption("Take control (sidebar) to lock or change the baseline.")
+        elif RO or _sandbox:
+            st.caption("Sandbox is private — leave it and take control (sidebar) "
+                       "to lock or change the shared baseline." if _sandbox and not RO
+                       else "Take control (sidebar) to lock or change the baseline.")
         else:
             opts = {f"v{j['version']} · {j.get('name', '')} · "
                     f"{_when(j.get('published_at', ''))}": j for j in vers}
@@ -7523,16 +7763,22 @@ def render_budget_baseline(grain: str, yr: int):
             if b1.button(_label, width="stretch", disabled=not _sure,
                          key="bl_lock"):
                 j = opts[pick]
-                collab.write_budget(SCENARIO_DIR, yr, {
-                    "file": j["_file"], "version": j["version"],
-                    "name": j.get("name", ""), "locked_by": st.session_state.user,
-                    "locked_at": collab._iso(collab._now()), "note": note})
-                st.success(f"v{j['version']} is now the {yr} budget baseline.")
-                st.rerun()
+                try:
+                    collab.write_budget(SCENARIO_DIR, yr, {
+                        "file": j["_file"], "version": j["version"],
+                        "name": j.get("name", ""), "locked_by": st.session_state.user,
+                        "locked_at": collab._iso(collab._now()), "note": note})
+                except OSError as exc:
+                    st.error(f"Baseline NOT changed — {exc}. Try again in a moment.")
+                else:
+                    st.success(f"v{j['version']} is now the {yr} budget baseline.")
+                    st.session_state.pop("bl_confirm", None)  # guard every use
+                    st.rerun()
             if ptr and b2.button("Clear the baseline", width="stretch",
                                  disabled=not _sure, key="bl_clear"):
                 collab.clear_budget(SCENARIO_DIR, yr)
                 st.success("Baseline cleared — the published version is untouched.")
+                st.session_state.pop("bl_confirm", None)
                 st.rerun()
 
     if not ptr:
@@ -7942,6 +8188,7 @@ def render_changelog_page():
 # Push the org-wide member spread into every LOB (sidebar edits, loaded
 # scenarios, or horizon changes) before anything computes.
 apply_global_members()
+refresh_acd_rollup()      # after the sidebar, so this run's edits are in it
 
 if page == "Executive View":
     render_executive_view()

@@ -161,7 +161,7 @@ def _read_concat(files) -> pd.DataFrame:
 def _week_start(d: pd.Series) -> pd.Series:
     """Monday of the week for a date-like series, as ISO 'YYYY-MM-DD'."""
     dt = pd.to_datetime(d, errors="coerce")
-    monday = dt - pd.to_timedelta(dt.dt.weekday, unit="D")
+    monday = dt - pd.to_timedelta(dt.dt.day_of_week, unit="D")
     return monday.dt.date.astype("string")
 
 
@@ -295,10 +295,78 @@ def peek_headers(files) -> list[str]:
     """Column headers of the export(s) — readable even when the import fails,
     so the planner can map columns by hand in the UI."""
     files = files if isinstance(files, (list, tuple)) else [files]
+    f = files[0]
+    # An upload is a stream: reading the header row leaves it past the header,
+    # so the real import that follows would see an empty file. Put it back.
+    pos = f.tell() if hasattr(f, "seek") else None
     try:
-        return list(pd.read_csv(files[0], encoding="utf-8-sig", nrows=0).columns)
+        return list(pd.read_csv(f, encoding="utf-8-sig", nrows=0).columns)
     except Exception:  # noqa: BLE001
         return []
+    finally:
+        if pos is not None:
+            f.seek(pos)
+
+
+def clean_split_codes(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Keep only rows whose `split` is a finite WHOLE number, as int64 — the
+    one rule for every reader of an ACD export (the Real Data import and the
+    ACD Shrinkage page). Returns (clean frame, warning or None).
+
+    Only finite whole numbers are split codes: "inf" would crash the int
+    cast, "1e30" would saturate, and 101.5 would silently land in split 101.
+    A report footer ("Grand Total") or a repeated header row is named in the
+    warning and set aside like any other row the mapping cannot place."""
+    codes = pd.to_numeric(df["split"], errors="coerce")
+    txt = df["split"].astype(str).str.strip()
+    arr = codes.to_numpy(dtype=float)
+    fin = np.where(np.isfinite(arr), arr, 0)
+    whole = np.isfinite(arr) & (arr == np.floor(fin)) & (np.abs(fin) < 1e12)
+    codes = codes.where(whole)
+    bad = codes.isna() & df["split"].notna() & (txt != "") & (txt.str.lower() != "nan")
+    warn = None
+    if bad.any():
+        ex = list(dict.fromkeys(txt[bad].tolist()))
+        warn = (f"{int(bad.sum()):,} row(s) with an invalid split code excluded — "
+                f"not a whole number (e.g. {', '.join(repr(x) for x in ex[:3])}); "
+                "usually a report total or a repeated header row in the export.")
+    out = df[codes.notna()].copy()
+    out["split"] = codes[codes.notna()].astype("int64")
+    return out, warn
+
+
+def drop_overlapping_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """One interval counted once (audit 2026-10-14 #21). A folder or pattern
+    that holds overlapping exports — a weekly pull beside the daily ones, or
+    the same day exported twice — used to be concatenated and SUMMED, so
+    those days read as double volume and double staffed time with no warning.
+
+    Rows that repeat EXACTLY are dropped. Rows that share an interval key but
+    DISAGREE (a re-pull with corrections) are kept and named, because which
+    one is right is the planner's call, not the parser's. Keyed on
+    (row_date, starttime, split) plus `acd` when present, so two ACD servers
+    reusing split numbers are never collapsed. The key check is cheap; the
+    full-row comparison only runs on the rows that collide."""
+    key = [c for c in ("row_date", "starttime", "acd", "split") if c in df.columns]
+    if not {"row_date", "starttime", "split"} <= set(key):
+        return df, None
+    collide = df.duplicated(key, keep=False)
+    if not collide.any():
+        return df, None
+    sub = df[collide]
+    exact = sub.duplicated(keep="first")
+    out = df.drop(index=sub.index[exact.to_numpy()])
+    clash = out.duplicated(key, keep=False)
+    msgs = []
+    if exact.any():
+        msgs.append(f"{int(exact.sum()):,} duplicate interval row(s) dropped — the "
+                    "same interval was in more than one file (overlapping exports "
+                    "in the folder or pattern); each is counted once.")
+    if clash.any():
+        msgs.append(f"{int(clash.sum()):,} interval row(s) appear in more than one "
+                    "file with DIFFERENT numbers (e.g. a re-pull) — both are still "
+                    "counted, so those intervals read high. Remove the older file.")
+    return out, " ".join(msgs) or None
 
 
 def resolve_columns(df: pd.DataFrame, feed: str, saved_map: dict | None = None
@@ -388,23 +456,12 @@ def load_split(files, mapping: Mapping, field_map: dict | None = None
     # and the boot-time autoload had nothing above it, so one cell crashed
     # every page for every planner (audit 2026-10-14). Non-numeric codes are
     # now named and set aside like any other row the mapping cannot place.
-    _codes = pd.to_numeric(df["split"], errors="coerce")
-    _txt = df["split"].astype(str).str.strip()
-    # Only finite WHOLE numbers are split codes: "inf" would crash the int
-    # cast, "1e30" would saturate, and 101.5 would silently land in split 101.
-    _arr = _codes.to_numpy(dtype=float)
-    _whole = np.isfinite(_arr) & (_arr == np.floor(np.where(np.isfinite(_arr), _arr, 0)))
-    _whole &= np.abs(np.where(np.isfinite(_arr), _arr, 0)) < 1e12
-    _codes = _codes.where(_whole)
-    _bad = _codes.isna() & df["split"].notna() & (_txt != "") & (_txt.str.lower() != "nan")
-    if _bad.any():
-        _ex = list(dict.fromkeys(_txt[_bad].tolist()))
-        rep.warnings.append(
-            f"{int(_bad.sum()):,} row(s) with an invalid split code excluded — "
-            f"not a whole number (e.g. {', '.join(repr(x) for x in _ex[:3])}); "
-            "usually a report total or a repeated header row in the export.")
-    df = df[_codes.notna()].copy()
-    df["split"] = _codes[_codes.notna()].astype("int64")
+    df, _warn = clean_split_codes(df)
+    if _warn:
+        rep.warnings.append(_warn)
+    df, _warn = drop_overlapping_rows(df)
+    if _warn:
+        rep.warnings.append(_warn)
     df["LOB"] = df["split"].map(mapping.lob_for_split)
     unmapped = sorted(set(df.loc[df["LOB"].isna(), "split"].dropna().unique()))
     if unmapped:
@@ -514,8 +571,13 @@ def split_weekly(df: pd.DataFrame, assumptions: dict | None = None
         # inclusion is what made this agree with the WFM feed on real data
         # (crosscheck_metrics.py). Divide by ANSWERED, not offered: an
         # abandoned contact consumed no handle time.
-        if pd.notna(talk) and pd.notna(answered) and answered > 0:
-            handle = float(talk) + float(hold or 0) + float(acw or 0)
+        # All three parts or no AHT at all. `hold or 0` read like a fallback
+        # but NaN is truthy, so it never fired — and a talk-only AHT would
+        # understate handle time (and Required) without saying so. An export
+        # without hold or ACW shows no measured AHT, honestly blank.
+        if (pd.notna(talk) and pd.notna(hold) and pd.notna(acw)
+                and pd.notna(answered) and answered > 0):
+            handle = float(talk) + float(hold) + float(acw)
             row["Actual AHT (sec)"] = round(handle / float(answered), 1)
         if pd.notna(accepted) and pd.notna(offered) and offered > 0:
             row["Actual SL %"] = round(float(accepted) / float(offered) * 100, 1)
