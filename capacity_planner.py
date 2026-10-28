@@ -29,7 +29,7 @@ brand.inject()
 # share path here: the launcher `pushd`es into the app folder on the share, so
 # this already resolves to the team's copy, and every local run and check
 # relies on it resolving against the working directory.
-SCENARIO_DIR = Path("scenarios")
+SCENARIO_DIR = collab.TEAM_DIR / "scenarios"
 if (Path(__file__).parent / "demo.flag").exists():
     if "_demo_scen_dir" not in st.session_state:
         import tempfile
@@ -1143,11 +1143,11 @@ def make_blank_lob(n_weeks: int, aht: float = 400.0) -> dict:
 
 
 def _mapped_blank_lobs(n_weeks: int) -> dict | None:
-    """Blank scaffolds named for the LOBs in Skill_Mapping.csv (app folder),
+    """Blank scaffolds named for the LOBs in Skill_Mapping.csv (see _autoload),
     seeding AHT from ACD measured AHT where the export is present. Returns
     None if the mapping file is absent or unreadable (caller falls back to demo)."""
-    mp_path = APP_DIR / "Skill_Mapping.csv"
-    if not mp_path.exists():
+    mp_path = _autoload("Skill_Mapping.csv")       # team folder, else beside the code
+    if mp_path is None:
         return None
     # Through the parse cache (defined later in the module; resolved at call
     # time from the boot block) — this seeding read must never re-parse an
@@ -1158,8 +1158,8 @@ def _mapped_blank_lobs(n_weeks: int) -> dict | None:
     if mapping is None:
         return None
     meas_aht: dict = {}
-    s_path = APP_DIR / "split.csv"
-    if s_path.exists():
+    s_path = _autoload("split.csv")
+    if s_path is not None:
         try:
             sdf, r, _secs, _mb = _cached_feed_raw(
                 "acd", _files_sig([s_path]), _msig,
@@ -1954,7 +1954,7 @@ HOLIDAYS_FILE_NAME = "holidays.json"
 
 
 def _holidays_path() -> Path:
-    return APP_DIR / HOLIDAYS_FILE_NAME
+    return collab.TEAM_DIR / HOLIDAYS_FILE_NAME      # team config: the share
 
 
 # The org's normal day: Mon-Fri 07:00-19:00 and Saturday 09:00-13:00 for every
@@ -3363,7 +3363,7 @@ FIELD_MAPS_FILE_NAME = "field_maps.json"   # {feed: {canonical: source column}}
 
 
 def _field_maps_path():
-    return APP_DIR / FIELD_MAPS_FILE_NAME
+    return collab.TEAM_DIR / FIELD_MAPS_FILE_NAME    # team config: the share
 
 
 def load_field_maps() -> dict:
@@ -3381,11 +3381,11 @@ def save_field_maps(maps: dict):
         {f: {k: v for k, v in m.items() if v} for f, m in maps.items()}, indent=2))
 
 
-ACD_MAPS_FILE_NAME = "acd_maps.json"   # lives next to the app (APP_DIR, defined below)
+ACD_MAPS_FILE_NAME = "acd_maps.json"   # team config: lives in collab.TEAM_DIR
 
 
 def _acd_maps_path():
-    return APP_DIR / ACD_MAPS_FILE_NAME
+    return collab.TEAM_DIR / ACD_MAPS_FILE_NAME
 
 
 def load_acd_maps() -> dict:
@@ -3672,19 +3672,24 @@ def render_shrinkage_page():
 # ----------------------------------------------------------------------
 # Real-data page — ACD actuals + calibration
 # ----------------------------------------------------------------------
-APP_DIR = Path(__file__).parent
+APP_DIR = Path(__file__).parent       # the CODE's folder — may be a local copy
 
 
 def _autoload(name: str):
-    """Return an app-folder file of this name if present (for zero-click demo)."""
-    p = APP_DIR / name
-    return p if p.exists() else None
+    """A file of this name dropped in the team folder, else shipped beside the
+    code (the zero-click samples). Team folder first, so a file placed on the
+    share still wins when the code runs from a local copy."""
+    for d in (collab.TEAM_DIR, APP_DIR):
+        p = d / name
+        if p.exists():
+            return p
+    return None
 
 
 # Remembered feed locations — the exports always live in the same place on the
-# share, so nobody should re-attach them. Stored next to the app (on the share
-# that means one config for the whole team), keys: mapping / acd.
-DATA_PATHS_FILE = APP_DIR / "data_paths.json"
+# share, so nobody should re-attach them. Stored in the TEAM folder (one config
+# for the whole team), keys: mapping / acd.
+DATA_PATHS_FILE = collab.TEAM_DIR / "data_paths.json"
 
 
 def load_data_paths() -> dict:
@@ -3694,9 +3699,29 @@ def load_data_paths() -> dict:
         return {}
 
 
+def _team_relative(spec: str) -> str:
+    """Store a location RELATIVE to the team folder when it is on the same
+    drive/share, so it works on every PC. `pushd` maps the share to whatever
+    drive letter is free, so a Z: path saved on one PC can be Y: on the next;
+    a path like ../exports is the same everywhere. Different drive or share
+    (relpath raises), or already relative: kept exactly as typed."""
+    spec = str(spec or "").strip()
+    p = Path(spec).expanduser()
+    if not spec or not p.is_absolute():
+        return spec
+    # abspath, NOT resolve(): on Windows resolve() turns the pushd drive
+    # letter back into its UNC (server/share) form, which would make every
+    # drive-letter path look like "another drive" and defeat the point.
+    try:
+        return os.path.relpath(os.path.abspath(p),
+                               os.path.abspath(collab.TEAM_DIR))
+    except ValueError:                     # another drive / UNC share
+        return spec
+
+
 def save_data_paths(paths: dict):
-    collab._atomic_write(DATA_PATHS_FILE,
-                         json.dumps({k: v for k, v in paths.items() if v}, indent=2))
+    collab._atomic_write(DATA_PATHS_FILE, json.dumps(
+        {k: _team_relative(v) for k, v in paths.items() if v}, indent=2))
 
 
 def resolve_data_path(key: str, saved: dict) -> list[Path]:
@@ -3709,10 +3734,10 @@ def resolve_data_path(key: str, saved: dict) -> list[Path]:
         return []
     p = Path(spec).expanduser()
     if not p.is_absolute():
-        # A remembered RELATIVE path means "next to the app" — resolving it
-        # against the CWD made it depend on where streamlit was launched from
-        # (a real bug: the same config worked or failed by accident of `cd`).
-        cand = (APP_DIR / p)
+        # A remembered RELATIVE path means "relative to the TEAM folder" (the
+        # share), the same folder data_paths.json itself lives in — so it
+        # works on every PC whatever drive letter pushd picked.
+        cand = (collab.TEAM_DIR / p)
         if cand.exists() or not p.exists():
             p = cand
     if p.is_dir():
@@ -3722,7 +3747,7 @@ def resolve_data_path(key: str, saved: dict) -> list[Path]:
     import glob
     hits = sorted(Path(h) for h in glob.glob(str(p)) if Path(h).is_file())
     if not hits and not Path(spec).expanduser().is_absolute():
-        hits = sorted(Path(h) for h in glob.glob(str(APP_DIR / spec))
+        hits = sorted(Path(h) for h in glob.glob(str(collab.TEAM_DIR / spec))
                       if Path(h).is_file())
     return hits
 
@@ -3739,10 +3764,14 @@ def resolve_data_path(key: str, saved: dict) -> list[Path]:
 # must treat them as immutable (apply_acd_toggles copies before mutating).
 # ----------------------------------------------------------------------
 def _files_sig(files) -> tuple:
-    """Hashable cache key for feed files: (path, mtime, size) each."""
+    """Hashable cache key for feed files: (path, mtime, size) each. ABSOLUTE
+    path: the team folder is "." unless CP_TEAM_DIR is set, so a relative
+    `split.csv` in two different folders would otherwise share one parse-cache
+    entry (caught 2026-10-28 by feed_boot_guard_check, whose per-leg copies
+    carry identical files)."""
     out = []
     for f in files:
-        fp = Path(f)
+        fp = Path(f).absolute()
         try:
             stt = fp.stat()
             out.append((str(fp), stt.st_mtime_ns, stt.st_size))

@@ -10,6 +10,11 @@ setlocal
 rem pushd maps a UNC share to a drive letter so relative paths
 rem (scenarios/, data_paths.json) resolve to the SHARED copies.
 pushd "%~dp0" || (echo Cannot access the app folder. & pause & exit /b 1)
+rem The TEAM folder: scenarios\ and the team config files (data_paths.json,
+rem holidays.json, field_maps.json, acd_maps.json, branding.json) live HERE,
+rem on the share. Named explicitly so the code itself could run from a local
+rem copy without the team state following it off the share.
+set "CP_TEAM_DIR=%CD%"
 
 set "VENVROOT=%LOCALAPPDATA%\CapacityPlanner"
 set "VENV=%VENVROOT%\venv"

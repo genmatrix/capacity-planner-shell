@@ -35,6 +35,20 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# ---------------------------------------------------------------- team folder
+# Where everything the TEAM shares lives: scenarios/ (plans, locks, drafts,
+# budget pointers) and the team config files (data_paths.json,
+# holidays.json, field_maps.json, acd_maps.json, branding.json).
+#
+# `CP_TEAM_DIR` names it; the launcher sets it to the share folder it pushd's
+# into. Unset, it is the launch folder (".") — exactly how scenarios/ always
+# resolved, so a dev run from the repo, the playground and every check
+# (which chdir into a tempdir first) behave as before. It is deliberately NOT
+# the code's own folder (2026-10-28): that is what lets the code run from a
+# local copy while the team state stays on the share. Kept RELATIVE when
+# unset, so it follows a chdir — the checks' isolation depends on that.
+TEAM_DIR = Path(os.environ.get("CP_TEAM_DIR", "").strip() or ".")
+
 LOCK_STALE_MIN = 5  # a lock older than this (no heartbeat) may be taken over
 # Refresh the heartbeat at most this often. Comfortably inside LOCK_STALE_MIN,
 # and it turns a per-rerun share WRITE into roughly one per minute.

@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 
+import collab
+
 import altair as alt
 import streamlit as st
 
@@ -34,7 +36,7 @@ import streamlit as st
 #     banned-term scan rejects the untransformed value — so computing them, or
 #     moving them into the JSON file as the source of truth, would silently
 #     take the scrubbing off the public build.
-IDENTITY_FILE = Path(__file__).resolve().parent / "branding.json"
+IDENTITY_FILE = collab.TEAM_DIR / "branding.json"   # team config (see collab.TEAM_DIR)
 DEFAULT_MARK = "WFM"
 DEFAULT_WORD = "WFM"
 DEFAULT_SUB = "Workforce Management"

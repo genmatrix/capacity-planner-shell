@@ -74,6 +74,28 @@ shortcut to the .bat is handy (right-click → Send to → Desktop).
   alone — deleting it or setting `PYTHONDONTWRITEBYTECODE` just makes every
   launch recompile those files over the network.
 
+## Testing the local-copy launcher (opt-in)
+
+`Launch Capacity Planner (local copy test).bat` sits beside the normal
+launcher. It runs the SAME app against the SAME shared plan, but copies the
+app's code to `%LOCALAPPDATA%\CapacityPlanner\app` on your PC and runs it
+from there. The plan, the edit locks, the drafts and the team settings stay on
+the share. Only the code moves.
+
+- **Why try it:** every click re-runs the app's main script, and Streamlit
+  checks that file several times per run. On the share, each check is a
+  network round trip; on a local copy it costs nothing.
+- **How to compare:** note the `⏱ script` line at the bottom of the sidebar
+  for the same clicks under each launcher. A nav click and a cell edit are
+  enough.
+- **First time on a PC:** run the normal launcher once, because it builds the
+  Python environment. The test launcher says so if you skip that step, and
+  again if the packages changed in an update.
+- **Updates:** it copies only changed files on each launch, so an update
+  reaches you on your next launch, the same as now.
+- **Nobody else is affected.** The normal launcher is unchanged. Use either
+  one, but not both at once.
+
 ## Updates
 
 - **App updates**: just edit the `.py` files on the share — everyone gets them
