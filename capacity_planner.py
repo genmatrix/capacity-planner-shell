@@ -2349,26 +2349,29 @@ def _bench_series_uncached(key: str, col: str, lob: str | None, weeks
     return aligned if aligned.notna().any() else None
 
 
-def demand_supply_available(lob_names: list[str], weeks: list[str],
-                            plans: dict | None = None) -> dict:
-    """Required and Staffing, planned and actual, all in FTE AVAILABLE TO TAKE
-    CALLS — logged in and not in AUX — summed over `lob_names`.
+def demand_supply_fte(lob_names: list[str], weeks: list[str],
+                      plans: dict | None = None) -> dict:
+    """Required and Staffing, planned and actual, summed over `lob_names` —
+    all in the PLAN'S OWN FTE, the numbers on the Capacity Plan grid.
 
-    Why this basis (decided 2026-10-14, with the director's chart): the plan's
-    Required FTE and Staffed FTE count people ON PAYROLL, but the ACD measures
-    people LOGGED IN, so plotting them together put actual staffing below plan
-    every week by the out-of-office share even when nothing was wrong. On the
-    "available" basis the actual side is MEASURED end to end — no assumption:
-        staffing actual  = ACD staffed time − AUX time, ÷ paid hours
-                         = Actual Staffed FTE × (1 − In-Office Shrink %)
-        staffing planned = Staffed FTE × (1 − that week's Shrinkage %)
-        required planned = Required FTE × (1 − that week's Shrinkage %)
-                         = workload ÷ (paid × occupancy) — the shrinkage
-                           gross-up taken back out (Erlang the same way)
-        required actual  = the same, with the plan recomputed on ACTUAL
+    Basis (changed 2026-11-12, user: "the values showing on the graph are
+    nowhere to be found on the capacity plan grid"). From 2026-10-14 this
+    chart showed every series × (1 − shrinkage), "FTE available to take
+    calls", so the measured ACD side needed no assumption. But nobody could
+    tie a point on the chart to a row on the grid, and it read as shrinkage
+    applied twice. Now the PLANNED series are the grid, untouched:
+        required planned = Required FTE
+        staffing planned = Staffed FTE
+        required actual  = Required FTE with the plan recomputed on ACTUAL
                            contacts and AHT, every other assumption unchanged
-    The plan's own Required/Staffed/Net FTE — the HIRING numbers, in payroll
-    heads — are untouched; available = payroll × (1 − shrinkage).
+        staffing actual  = (ACD staffed time − AUX time) ÷ paid hours
+                           ÷ (1 − that week's planned Shrinkage %)
+    The last line is the one conversion left: the ACD only sees people logged
+    in, so the measured on-the-phones FTE is grossed up by the PLANNED
+    shrinkage into the payroll heads it stands for — the same gross-up
+    Required FTE carries. Without it actual staffing sat below plan every
+    week by the out-of-office share even when nothing was wrong (the first
+    cut, 2026-10-14).
 
     A summed actual week needs EVERY LOB that plans demand that week to have
     its actual (else blank — a partial sum would read as good news). Partial
@@ -2394,8 +2397,8 @@ def demand_supply_available(lob_names: list[str], weeks: list[str],
         # zeroing it would drop the LOB from the summed line and let the
         # actual-coverage gate pass that week (auditor 2026-10-28).
         plan_gap |= ~np.isfinite(planned)
-        out["req_plan"] += np.nan_to_num(planned * avail)
-        out["stf_plan"] += np.nan_to_num(pf["Staffed FTE"].to_numpy(dtype=float) * avail)
+        out["req_plan"] += np.nan_to_num(planned)
+        out["stf_plan"] += np.nan_to_num(pf["Staffed FTE"].to_numpy(dtype=float))
         needs = (planned > 0) | ~np.isfinite(planned)
         c = _bench_series("acd_weekly", "Actual Contacts", name, weeks)
         h = _bench_series("acd_weekly", "Actual AHT (sec)", name, weeks)
@@ -2412,7 +2415,7 @@ def demand_supply_available(lob_names: list[str], weeks: list[str],
             dem.loc[have, "Fcst Override"] = c[have]
             dem.loc[have, "AHT (sec)"] = h[have]
             act = compute_plan({**d, "demand": dem})["Required FTE"].to_numpy(dtype=float)
-            out["req_act"] += np.where(have, act * avail, 0.0)
+            out["req_act"] += np.where(have, act, 0.0)
             any_req |= have
             req_ok &= have | ~needs
         else:
@@ -2420,7 +2423,11 @@ def demand_supply_available(lob_names: list[str], weeks: list[str],
         sa = _bench_series("acd_weekly", "Actual Staffed FTE", name, weeks)
         io = _bench_series("acd_weekly", "In-Office Shrink %", name, weeks)
         if sa is not None and io is not None:
-            av = sa.to_numpy(dtype=float) * (1 - io.to_numpy(dtype=float) / 100)
+            # Measured on-the-phones FTE, grossed up by the planned shrinkage
+            # into payroll heads. A week planned at 100% shrinkage has no
+            # payroll equivalent — blank, not infinity.
+            av = (sa.to_numpy(dtype=float) * (1 - io.to_numpy(dtype=float) / 100)
+                  / np.where(avail > 0, avail, np.nan))
             out["stf_act"] += np.nan_to_num(av, nan=0.0)
             any_stf |= np.isfinite(av)
             stf_ok &= np.isfinite(av) | ~needs
@@ -2432,25 +2439,25 @@ def demand_supply_available(lob_names: list[str], weeks: list[str],
     return out
 
 
-AVAILABLE_BASIS_NOTE = (
-    "**FTE available to take calls** — logged in and not in AUX. The plan's "
-    "Required and Staffed FTE count people on payroll; each is shown here × (1 − "
-    "that week's shrinkage), so 100 on payroll at 32% shrinkage is 68 available. "
-    "The actual side is measured by the ACD with no assumption: staffed time "
-    "minus AUX. **Required — actual** is the plan's own math on the calls and "
-    "handle time that actually arrived.")
+PLAN_BASIS_NOTE = (
+    "**Required — planned** and **Staffing — planned** are the Capacity Plan's "
+    "Required FTE and Staffed FTE rows, unchanged. **Required — actual** is the "
+    "plan's own math on the calls and handle time that actually arrived. "
+    "**Staffing — actual** is what the ACD measured on the phones (staffed time "
+    "minus AUX), divided by (1 − that week's planned shrinkage) so it is in the "
+    "same heads as the plan.")
 
 
 def render_demand_supply_chart(lob_names: list[str], weeks: list[str],
                                plans: dict | None = None) -> bool:
     """The director's demand-vs-supply chart (2026-10-14): Required as LINES
     (planned dashed, actual solid), Staffing as SHADED AREAS (planned pale,
-    actual deeper), all on the available basis above. Used by the Executive
+    actual deeper), all in the plan's own FTE (see `demand_supply_fte`). Used by the Executive
     View and the Capacity Plan so the two can never disagree. Planned vs
     actual is carried by ENCODING, not new colours — the validated DEMAND and
     SUPPLY hues stay. Returns True when any actual week was drawn."""
     import altair as alt
-    ser = demand_supply_available(lob_names, weeks, plans)
+    ser = demand_supply_fte(lob_names, weeks, plans)
     has_act = bool(np.isfinite(ser["req_act"]).any() or np.isfinite(ser["stf_act"]).any())
     wide = pd.DataFrame({
         "Week": weeks,
@@ -2489,7 +2496,7 @@ def render_demand_supply_chart(lob_names: list[str], weeks: list[str],
     layers = [
         base.mark_area(color=brand.SUPPLY, opacity=0.2, interpolate="monotone")
             .encode(x=x, y=alt.Y("Staffing — planned:Q",
-                                 title="FTE available to take calls")),
+                                 title="FTE")),
         base.mark_line(color=brand.SUPPLY, strokeWidth=1.5, opacity=0.85,
                        interpolate="monotone").encode(x=x, y="Staffing — planned:Q"),
     ]
@@ -2516,7 +2523,7 @@ def render_demand_supply_chart(lob_names: list[str], weeks: list[str],
     chart = alt.layer(*layers, data=wide)
     tr = _today_rule(weeks)
     brand.chart(chart + tr if tr is not None else chart, height=260)
-    st.caption(AVAILABLE_BASIS_NOTE + (
+    st.caption(PLAN_BASIS_NOTE + (
         " Actuals run to the last complete ACD week." if has_act else
         " Planned only — load the ACD export (Real Data) and the actual line "
         "and area appear for the weeks it covers."))
@@ -4253,7 +4260,8 @@ def render_real_data_page():
     # the plan's workload math applied to its forecast volume). What remains
     # is the comparison that was always the honest one — the plan's OWN
     # requirement against measured staffing.
-    # Compared in FTE AVAILABLE TO TAKE CALLS (see demand_supply_available):
+    # Compared in FTE AVAILABLE TO TAKE CALLS (this table only — the chart
+    # moved to the plan's own FTE on 2026-11-12, see demand_supply_fte):
     # the ACD's staffed time is logged-in time, the plan's Required FTE is
     # payroll heads, so a raw comparison read "short" by the out-of-office
     # share every week.
@@ -5992,7 +6000,8 @@ def build_reconciliation(plan: pd.DataFrame, lob_data: dict, lob: str) -> pd.Dat
     stf = _bench_series("acd_weekly", "Actual Staffed FTE", lob, weeks)
     shr = _bench_series("acd_weekly", "In-Office Shrink %", lob, weeks)
     if stf is not None and shr is not None:
-        # Both sides in FTE AVAILABLE TO TAKE CALLS (demand_supply_available):
+        # Both sides in FTE AVAILABLE TO TAKE CALLS (this row only — the
+        # chart is in the plan's own FTE, see demand_supply_fte):
         # payroll Required × (1 − planned shrinkage) vs logged-in time minus
         # AUX. Comparing payroll Required with logged-in time read "short" by
         # the out-of-office share every week.
